@@ -181,6 +181,15 @@ impl VirtualMachine {
                 self.set_register(dst, val1.wrapping_sub(val2))?;
             },
             
+            OpCode::Mul => {
+                let dst = self.read_u8()?;
+                let src1 = self.read_u8()?;
+                let src2 = self.read_u8()?;
+                let val1 = self.get_register(src1)?;
+                let val2 = self.get_register(src2)?;
+                self.set_register(dst, val1.wrapping_mul(val2))?;
+            },
+            
             OpCode::Xor => {
                 let dst = self.read_u8()?;
                 let src1 = self.read_u8()?;

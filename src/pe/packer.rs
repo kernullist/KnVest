@@ -1,4 +1,5 @@
 use super::parser::{PEFile, PEResult, PEError};
+use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode};
 use crate::vm::OpCode;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
@@ -15,22 +16,22 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec
     Ok(bytecode)
 }
 
-fn translate_to_vm_bytecode(_pe: &PEFile, _target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
-    let mut bytecode = Vec::new();
-
-    let hello_msg = b"Hello, World!\n";
-    let msg_offset_in_bytecode = 100u64;
+fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
+    let file_offset = pe.rva_to_file_offset(target_rva)?;
     
-    bytecode.push(OpCode::LoadImm as u8);
-    bytecode.push(0);
-    bytecode.extend_from_slice(&msg_offset_in_bytecode.to_le_bytes());
+    if file_offset + 200 > pe.data.len() {
+        return Err(PEError::InvalidPE("Code section too small".to_string()));
+    }
     
-    bytecode.push(OpCode::LoadImm as u8);
-    bytecode.push(1);
-    bytecode.extend_from_slice(&(hello_msg.len() as u64).to_le_bytes());
+    let code_slice = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
     
-    bytecode.push(OpCode::NativeCall as u8);
-    bytecode.extend_from_slice(&1u64.to_le_bytes());
+    let x64_instrs = disassemble_x64_simple(code_slice, 100);
+    
+    if x64_instrs.is_empty() {
+        return Err(PEError::InvalidPE("Failed to disassemble any instructions".to_string()));
+    }
+    
+    let mut bytecode = lift_to_vm_bytecode(&x64_instrs, target_rva);
     
     bytecode.push(OpCode::LoadImm as u8);
     bytecode.push(0);
@@ -38,12 +39,6 @@ fn translate_to_vm_bytecode(_pe: &PEFile, _target_rva: u32, _original_entry: u32
     
     bytecode.push(OpCode::Exit as u8);
     bytecode.push(0);
-    
-    while bytecode.len() < msg_offset_in_bytecode as usize {
-        bytecode.push(0x00);
-    }
-    
-    bytecode.extend_from_slice(hello_msg);
     
     Ok(bytecode)
 }
@@ -231,7 +226,214 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let load_imm_target = stub.len();
     stub[load_imm_jmp + 1] = (load_imm_target as i8).wrapping_sub((load_imm_jmp + 2) as i8) as u8;
     
+    stub.extend_from_slice(&[0x3C, 0x04]);
+    let move_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+    let dispatch_back_move = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
+    stub.extend_from_slice(&[0xEB, dispatch_back_move as u8]);
+    
+    let move_target = stub.len();
+    stub[move_jmp + 1] = (move_target as i8).wrapping_sub((move_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x05]);
+    let add_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x16]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x03, 0x44, 0xD5, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+    let dispatch_back_add = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
+    stub.extend_from_slice(&[0xEB, dispatch_back_add as u8]);
+    
+    let add_target = stub.len();
+    stub[add_jmp + 1] = (add_target as i8).wrapping_sub((add_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x06]);
+    let sub_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x16]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x2B, 0x44, 0xD5, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+    let dispatch_back_sub = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
+    stub.extend_from_slice(&[0xEB, dispatch_back_sub as u8]);
+    
+    let sub_target = stub.len();
+    stub[sub_jmp + 1] = (sub_target as i8).wrapping_sub((sub_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x07]);
+    let mul_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x16]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x0F, 0xAF, 0x44, 0xD5, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+    let dispatch_back_mul = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
+    stub.extend_from_slice(&[0xEB, dispatch_back_mul as u8]);
+    
+    let mul_target = stub.len();
+    stub[mul_jmp + 1] = (mul_target as i8).wrapping_sub((mul_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x09]);
+    let cmp_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x70, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
+    let cmp_eq_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x70, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00]);
+    let cmp_done1 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let cmp_eq_target = stub.len();
+    stub[cmp_eq_jmp + 1] = (cmp_eq_target as i8).wrapping_sub((cmp_eq_jmp + 2) as i8) as u8;
+    let cmp_gt_jmp = stub.len();
+    stub.extend_from_slice(&[0x7E, 0x00]);
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x70, 0xFF, 0xFF, 0xFF, 0x02, 0x00, 0x00, 0x00]);
+    let cmp_gt_target = stub.len();
+    stub[cmp_gt_jmp + 1] = (cmp_gt_target as i8).wrapping_sub((cmp_gt_jmp + 2) as i8) as u8;
+    let cmp_done1_target = stub.len();
+    stub[cmp_done1 + 1] = (cmp_done1_target as i8).wrapping_sub((cmp_done1 + 2) as i8) as u8;
+    let dispatch_back_cmp = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_cmp.to_le_bytes());
+    
+    let cmp_target = stub.len();
+    stub[cmp_jmp + 1] = (cmp_target as i8).wrapping_sub((cmp_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x0A]);
+    let jmp_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
+    let bc_base_lea_jmp = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    let dispatch_back_jmp = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_jmp.to_le_bytes());
+    
+    let jmp_target = stub.len();
+    stub[jmp_jmp + 1] = (jmp_target as i8).wrapping_sub((jmp_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x0B]);
+    let jmpif_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x01]);
+    let jmpif_eq_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x01]);
+    let jmpif_nottaken1 = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    let jmpif_taken1 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_eq_target = stub.len();
+    stub[jmpif_eq_jmp + 1] = (jmpif_eq_target as i8).wrapping_sub((jmpif_eq_jmp + 2) as i8) as u8;
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x02]);
+    let jmpif_ne_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x01]);
+    let jmpif_taken2 = stub.len();
+    stub.extend_from_slice(&[0x74, 0x00]);
+    let jmpif_nottaken2 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_ne_target = stub.len();
+    stub[jmpif_ne_jmp + 1] = (jmpif_ne_target as i8).wrapping_sub((jmpif_ne_jmp + 2) as i8) as u8;
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x03]);
+    let jmpif_nottaken3 = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x02]);
+    let jmpif_taken3 = stub.len();
+    stub.extend_from_slice(&[0x74, 0x00]);
+    let jmpif_nottaken_all = stub.len();
+    stub[jmpif_nottaken1 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken1 + 2) as i8) as u8;
+    stub[jmpif_nottaken2 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken2 + 2) as i8) as u8;
+    stub[jmpif_nottaken3 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken3 + 2) as i8) as u8;
+    let dispatch_back_jmpif_nottaken = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_jmpif_nottaken.to_le_bytes());
+    let jmpif_taken_all = stub.len();
+    stub[jmpif_taken1 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken1 + 2) as i8) as u8;
+    stub[jmpif_taken2 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken2 + 2) as i8) as u8;
+    stub[jmpif_taken3 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken3 + 2) as i8) as u8;
+    let bc_base_lea_jmpif = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    let dispatch_back_jmpif_taken = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_jmpif_taken.to_le_bytes());
+    
+    let jmpif_target = stub.len();
+    stub[jmpif_jmp + 1] = (jmpif_target as i8).wrapping_sub((jmpif_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x0C]);
+    let call_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x78, 0xFF, 0xFF, 0xFF]);
+    let bc_base_lea_call = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x29, 0xF6]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x28, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x78, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    let dispatch_back_call = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_call.to_le_bytes());
+    
+    let call_target = stub.len();
+    stub[call_jmp + 1] = (call_target as i8).wrapping_sub((call_jmp + 2) as i8) as u8;
+    
     stub.extend_from_slice(&[0x3C, 0x0D]);
+    let ret_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x28, 0xFF, 0xFF, 0xFF]);
+    let bc_base_lea_ret = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    let dispatch_back_ret = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_ret.to_le_bytes());
+    
+    let ret_target = stub.len();
+    stub[ret_jmp + 1] = (ret_target as i8).wrapping_sub((ret_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x0E]);
     let dispatch_back2 = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
     stub.extend_from_slice(&[0x75, dispatch_back2 as u8]);
     
@@ -295,6 +497,10 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((ep_lea + 3, format!("{}", ep_str_pos)));
     patches.push((bc_lea + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_jmp + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_jmpif + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
         let target = if target_str == "BYTECODE" {

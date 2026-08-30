@@ -84,7 +84,7 @@ impl Instruction {
                     }
                 },
                 
-                OpCode::Add | OpCode::Sub | OpCode::Xor => {
+                OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor => {
                     for _ in 0..3 {
                         if offset < bytecode.len() {
                             operands.push(Operand::Register(bytecode[offset]));
