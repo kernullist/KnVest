@@ -556,7 +556,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_jmpif_taken.to_le_bytes());
     
     let jmpif_target = stub.len();
-    stub[jmpif_jmp + 1] = (jmpif_target as i8).wrapping_sub((jmpif_jmp + 2) as i8) as u8;
+    let jmpif_offset = (jmpif_target as i32).wrapping_sub((jmpif_jmp + 6) as i32);
+    stub[jmpif_jmp + 2..jmpif_jmp + 6].copy_from_slice(&jmpif_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x0C]);
     let call_jmp = stub.len();
