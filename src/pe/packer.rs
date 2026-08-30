@@ -791,38 +791,70 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let native_call_func3_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je func3 (putchar)
     
-    // func2: integer printer (printf-style digits + newline from r2)
-    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]); // mov rax, [rbp-0x90] (r2)
-    stub.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
-    stub.extend_from_slice(&[0x4C, 0x8D, 0xBD, 0x10, 0xFF, 0xFF, 0xFF]); // lea r15, [rbp-0xF0]
-    stub.extend_from_slice(&[0x48, 0x8D, 0x7F, 0x0A]); // lea rdi, [r15+10]
+    // func2: integer printer (printf-style digit + newline from r2)
+    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
     
-    let digit_loop = stub.len();
+    stub.extend_from_slice(&[0x48, 0x3D, 0x64, 0x00, 0x00, 0x00]); // cmp rax, 100
+    let three_digit_jmp = stub.len();
+    stub.extend_from_slice(&[0x73, 0x00]); // jae three_digit
+    
+    stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x0A]);
+    let single_digit_jmp = stub.len();
+    stub.extend_from_slice(&[0x73, 0x00]);
+    
+    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
+    stub.extend_from_slice(&[0x88, 0x01]);
+    stub.extend_from_slice(&[0xC6, 0x41, 0x01, 0x0A]);
+    stub.extend_from_slice(&[0x41, 0xB8, 0x02, 0x00, 0x00, 0x00]);
+    let after_single_digit = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    
+    let two_digit_target = stub.len();
+    stub[single_digit_jmp + 1] = (two_digit_target as i8).wrapping_sub((single_digit_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x48, 0x89, 0xC2]);
+    stub.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xD3]);
+    stub.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC2, 0x30]);
+    stub.extend_from_slice(&[0x88, 0x51, 0x01]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
+    stub.extend_from_slice(&[0x88, 0x01]);
+    stub.extend_from_slice(&[0xC6, 0x41, 0x02, 0x0A]);
+    stub.extend_from_slice(&[0x41, 0xB8, 0x03, 0x00, 0x00, 0x00]);
+    let after_two_digit = stub.len();
+    stub[after_single_digit + 1] = (after_two_digit as i8).wrapping_sub((after_single_digit + 2) as i8) as u8;
+    let after_two_digit_jmp = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]); // skip three_digit after two_digit path
+    
+    let three_digit_target = stub.len();
+    stub[three_digit_jmp + 1] = (three_digit_target as i8).wrapping_sub((three_digit_jmp + 2) as i8) as u8;
+    
+    // hundreds = n/100, tens = (n/10)%10, ones = n%10; "XYZ\n" at [rbp-0xF0], length 4
     stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
-    stub.extend_from_slice(&[0x48, 0x89, 0xD8]); // mov rax, rbx
-    stub.extend_from_slice(&[0x49, 0xBA, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // mov r10, 10
-    stub.extend_from_slice(&[0x49, 0xF7, 0xF2]); // div r10
+    stub.extend_from_slice(&[0xBB, 0x64, 0x00, 0x00, 0x00]); // mov ebx, 100
+    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]); // div rbx
+    stub.extend_from_slice(&[0x04, 0x30]); // add al, 0x30
+    stub.extend_from_slice(&[0x88, 0x85, 0xF0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xF0], al
+    stub.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx (n%100)
+    stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    stub.extend_from_slice(&[0xBB, 0x0A, 0x00, 0x00, 0x00]); // mov ebx, 10
+    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]); // div rbx
+    stub.extend_from_slice(&[0x04, 0x30]); // add al, 0x30
+    stub.extend_from_slice(&[0x88, 0x85, 0xF1, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xF1], al
     stub.extend_from_slice(&[0x80, 0xC2, 0x30]); // add dl, 0x30
-    stub.extend_from_slice(&[0x88, 0x17]); // mov [rdi], dl
-    stub.extend_from_slice(&[0x49, 0x89, 0xFC]); // mov r12, rdi
-    stub.extend_from_slice(&[0x48, 0xFF, 0xCF]); // dec rdi
-    stub.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
-    stub.extend_from_slice(&[0x48, 0x85, 0xDB]); // test rbx, rbx
-    let digit_loop_back = (digit_loop as i32).wrapping_sub((stub.len() + 2) as i32);
-    stub.extend_from_slice(&[0x75, digit_loop_back as u8]); // jnz digit_loop
+    stub.extend_from_slice(&[0x88, 0x95, 0xF2, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xF2], dl
+    stub.extend_from_slice(&[0xC6, 0x85, 0xF3, 0xFF, 0xFF, 0xFF, 0x0A]); // mov byte [rbp-0xF3], 0x0A
+    stub.extend_from_slice(&[0x41, 0xB8, 0x04, 0x00, 0x00, 0x00]); // mov r8d, 4
     
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi (buffer start)
-    stub.extend_from_slice(&[0x4C, 0x89, 0xE1]); // mov rcx, r12
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
-    stub.extend_from_slice(&[0xC6, 0x01, 0x0A]); // mov byte [rcx], 0x0A
-    stub.extend_from_slice(&[0x48, 0x89, 0xFA]); // mov rdx, rdi
-    stub.extend_from_slice(&[0x4C, 0x89, 0xE0]); // mov rax, r12
-    stub.extend_from_slice(&[0x48, 0x29, 0xF8]); // sub rax, rdi
-    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x02]); // add rax, 2
-    stub.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
+    let write_common = stub.len();
+    stub[after_two_digit_jmp + 1] = (write_common as i8).wrapping_sub((after_two_digit_jmp + 2) as i8) as u8;
     
-    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]); // mov rcx, stdout
-    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]); // lea r9, bytes written
+    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x95, 0x10, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
     stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
