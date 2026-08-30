@@ -96,7 +96,13 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
     );
     
     let section_table_offset = pe.sections_offset + (pe.num_sections as usize * 40);
-    pe.data.splice(section_table_offset..section_table_offset, section_header.iter().cloned());
+    
+    if section_table_offset + 40 > pe.data.len() {
+        return Err(PEError::InvalidPE("No space for new section header".to_string()));
+    }
+    
+    pe.data[section_table_offset..section_table_offset + 40]
+        .copy_from_slice(&section_header);
     
     let coff_offset = pe.pe_header_offset + 4;
     let new_section_count = pe.num_sections + 1;
@@ -117,10 +123,6 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
     
     while pe.data.len() < new_pointer_to_raw as usize {
         pe.data.push(0x00);
-    }
-    
-    if pe.data.len() > new_pointer_to_raw as usize {
-        pe.data.truncate(new_pointer_to_raw as usize);
     }
     
     pe.data.extend_from_slice(&section_data);
@@ -346,5 +348,45 @@ mod tests {
         
         let bytecode = extract_bytecode_from_packed(&pe);
         assert!(bytecode.is_ok(), "Should extract bytecode from packed PE with overlay");
+    }
+
+    #[test]
+    fn test_pack_preserves_overlay_data() {
+        let pe_data = test_pe::create_pe64_with_overlay();
+        let original_data = pe_data.clone();
+        
+        let marker_offset = pe_data.len() - 100;
+        let original_marker = original_data[marker_offset..marker_offset + 10].to_vec();
+        
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let original_size = pe.data.len();
+        
+        pack_function(&mut pe, None).unwrap();
+        
+        let preserved_marker = &pe.data[marker_offset..marker_offset + 10];
+        assert_eq!(
+            &original_marker[..], preserved_marker,
+            "Overlay data should not be modified"
+        );
+        
+        for i in 0..original_size {
+            if i >= marker_offset && i < marker_offset + 10 {
+                continue;
+            }
+            let original = original_data[i];
+            let packed = pe.data[i];
+            
+            if packed != original {
+                let in_section_table = i >= pe.sections_offset 
+                    && i < pe.sections_offset + (20 * 40);
+                let in_optional_header = i >= pe.optional_header_offset 
+                    && i < pe.optional_header_offset + 240;
+                let in_coff_header = i >= pe.pe_header_offset + 4
+                    && i < pe.pe_header_offset + 24;
+                assert!(in_section_table || in_optional_header || in_coff_header, 
+                    "Only headers should be modified, but byte at {:#x} changed from {:#x} to {:#x}", 
+                    i, original, packed);
+            }
+        }
     }
 }
