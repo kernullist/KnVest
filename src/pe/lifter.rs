@@ -172,6 +172,15 @@ pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut 
                         return X64InstrKind::ImulRegReg { dst, src };
                     }
                 },
+                0x63 if bytes.len() > 2 => {
+                    // MOVSXD: 48 63 - sign extend dword to qword (treat as move for our purposes)
+                    instr_bytes.extend_from_slice(&bytes[0..3]);
+                    *offset += 3;
+                    let modrm = bytes[2];
+                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49);
+                    let src = decode_reg_from_modrm(modrm & 7, false);
+                    return X64InstrKind::MovRegReg { dst, src: to_32bit_reg(src) };
+                },
                 0x39 if bytes.len() > 2 => {
                     instr_bytes.extend_from_slice(&bytes[0..3]);
                     *offset += 3;
@@ -1286,10 +1295,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                         
                         if in_callee {
                             // Callees (print_digit, print_char) use putchar: native_call 3
-                            // But print_char receives arg in r1, needs to move it to r0
-                            bytecode.push(OpCode::Move as u8);
-                            bytecode.push(0); // r0
-                            bytecode.push(1); // r1
+                            // Argument is already in r0 from x64 code
                             bytecode.push(OpCode::NativeCall as u8);
                             bytecode.extend_from_slice(&3u64.to_le_bytes());
                         } else {
@@ -1299,27 +1305,11 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                         }
                     }
                 } else {
-                    // Internal call - save stack_map registers that might be clobbered
-                    // Check if there are active stack_map registers (r10, r11, ...)
-                    let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
-                    
-                    // Push all active stack registers before the call
-                    for &reg in &active_stack_regs {
-                        bytecode.push(OpCode::Push as u8);
-                        bytecode.push(reg);
-                    }
-                    
-                    // Internal call - emit VM Call instruction
+                    // Internal call - NO push/pop (Call/Ret depth stack handles return addresses)
                     bytecode.push(OpCode::Call as u8);
                     let placeholder_pos = bytecode.len();
                     bytecode.extend_from_slice(&0u64.to_le_bytes());
                     pending_jumps.push((placeholder_pos, target_x64_offset));
-                    
-                    // Pop stack registers in reverse order after the call
-                    for &reg in active_stack_regs.iter().rev() {
-                        bytecode.push(OpCode::Pop as u8);
-                        bytecode.push(reg);
-                    }
                 }
             },
             X64InstrKind::Ret => {
@@ -1489,15 +1479,12 @@ pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32
                     if external_call_count == 1 {
                         // Skip __main
                     } else {
-                        // All external calls in this legacy function: native_call 2
+                        // All external calls: native_call 2
                         bytecode_offset += 1 + 8;
                     }
                 } else {
-                    // Internal call with push/pop
-                    let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
-                    bytecode_offset += active_stack_regs.len() * 2; // Push each reg
-                    bytecode_offset += 1 + 8; // Call
-                    bytecode_offset += active_stack_regs.len() * 2; // Pop each reg
+                    // Internal call
+                    bytecode_offset += 1 + 8;
                 }
             },
             X64InstrKind::Ret => bytecode_offset += 1,
