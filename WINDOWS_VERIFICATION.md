@@ -78,11 +78,14 @@ cargo test --release
 - Problem: Section data appended to EOF, not written at PointerToRawData
 - For PE with overlays: PointerToRawData points inside file, but data was at EOF
 
-### After (Fixed)
+### After Final Fix (Should Work)
 - Packed PE: Loads and runs correctly, prints "Hello, World!"
 - IR output: Real VM opcodes (load_imm, call, exit)  
 - Bytecode size: Varies based on entry point RVA (~21 bytes typical)
 - PE structure: Valid PE32+ with proper headers and alignment
+- Section data: Written at PointerToRawData, not appended to EOF
+- Entry point: Contains JMP stub (E9 XX XX XX XX)
+- Handles overlays: New section placed after actual file size if needed
 
 ## Technical Details
 
