@@ -97,7 +97,7 @@ pub fn disassemble_x64_simple(code: &[u8], max_instrs: usize) -> Vec<X64Instruct
     instructions
 }
 
-fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut usize) -> X64InstrKind {
+pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut usize) -> X64InstrKind {
     if bytes.is_empty() {
         return X64InstrKind::Unknown;
     }
@@ -866,14 +866,15 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
     let min_x64_offset = instrs.iter().map(|i| i.offset).min().unwrap_or(0);
     let max_x64_offset = instrs.iter().map(|i| i.offset + i.bytes.len()).max().unwrap_or(0);
     
-    let mut is_in_main = false;
+    let main_end_offset = instrs.iter()
+        .filter(|i| i.offset >= main_x64_offset)
+        .find(|i| matches!(i.kind, X64InstrKind::Ret))
+        .map(|i| i.offset)
+        .unwrap_or(max_x64_offset);
+    
     let mut hit_main_ret = false;
     
     for (_idx, instr) in instrs.iter().enumerate() {
-        if instr.offset >= main_x64_offset {
-            is_in_main = true;
-        }
-        
         label_map.insert(instr.offset, bytecode.len());
         
         match &instr.kind {
@@ -1053,9 +1054,8 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
             X64InstrKind::Call { target_offset } => {
                 let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 
-                let is_internal = target_x64_offset >= min_x64_offset && 
-                                  target_x64_offset < max_x64_offset &&
-                                  (target_x64_offset as i32 - main_x64_offset as i32).abs() <= 512;
+                let is_internal = label_map.contains_key(&target_x64_offset) ||
+                                  instrs.iter().any(|i| i.offset == target_x64_offset);
                 
                 if !is_internal {
                     external_call_count += 1;
@@ -1074,7 +1074,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 }
             },
             X64InstrKind::Ret => {
-                if is_in_main && !hit_main_ret {
+                if instr.offset == main_end_offset && !hit_main_ret {
                     hit_main_ret = true;
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(0);

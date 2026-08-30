@@ -1,5 +1,5 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode_for_main, X64Instruction, X64InstrKind};
+use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode_for_main, decode_instruction, X64Instruction, X64InstrKind};
 use crate::vm::OpCode;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
@@ -83,25 +83,37 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
         return translate_hello_path();
     }
     
-    let lookback_start = if file_offset >= 512 { file_offset - 512 } else { 0 };
-    let code_slice_large = &pe.data[lookback_start..std::cmp::min(file_offset + 500, pe.data.len())];
-    let all_instrs = disassemble_x64_simple(code_slice_large, 500);
+    let main_code = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
+    let mut main_instrs = disassemble_until_ret(main_code, 100);
     
-    let main_start_offset = file_offset - lookback_start;
-    
-    let (main_instrs, callee_instrs): (Vec<_>, Vec<_>) = all_instrs.into_iter()
-        .partition(|instr| instr.offset >= main_start_offset);
-    
-    let mut x64_instrs = main_instrs;
-    x64_instrs.extend(callee_instrs);
-    
-    if x64_instrs.is_empty() {
-        return Err(PEError::InvalidPE("Failed to disassemble any instructions".to_string()));
+    if main_instrs.is_empty() {
+        return Err(PEError::InvalidPE("Failed to disassemble main".to_string()));
     }
     
-    let main_x64_offset = x64_instrs.first().unwrap().offset;
+    for instr in &mut main_instrs {
+        instr.offset += file_offset;
+    }
     
-    let bytecode = lift_to_vm_bytecode_for_main(&x64_instrs, target_rva, main_x64_offset);
+    let call_targets = find_internal_call_targets(&main_instrs, file_offset);
+    
+    let mut all_instrs = main_instrs;
+    
+    for target_file_offset in call_targets {
+        if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
+            if pe.data[target_file_offset] == 0x55 {
+                let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 200, pe.data.len())];
+                let mut callee_instrs = disassemble_until_ret(callee_code, 50);
+                
+                for instr in &mut callee_instrs {
+                    instr.offset += target_file_offset;
+                }
+                
+                all_instrs.extend(callee_instrs);
+            }
+        }
+    }
+    
+    let bytecode = lift_to_vm_bytecode_for_main(&all_instrs, target_rva, file_offset);
     
     Ok(bytecode)
 }
@@ -191,6 +203,55 @@ fn translate_hello_path() -> PEResult<Vec<u8>> {
     bytecode.extend_from_slice(hello_msg);
     
     Ok(bytecode)
+}
+
+fn disassemble_until_ret(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
+    let mut instructions = Vec::new();
+    let mut offset = 0;
+    
+    while offset < code.len() && instructions.len() < max_instrs {
+        let start_offset = offset;
+        let remaining = &code[offset..];
+        
+        if remaining.is_empty() {
+            break;
+        }
+        
+        let mut instr_bytes = Vec::new();
+        let kind = super::lifter::decode_instruction(remaining, &mut instr_bytes, &mut offset);
+        
+        instructions.push(X64Instruction {
+            offset: start_offset,
+            bytes: instr_bytes,
+            kind: kind.clone(),
+        });
+        
+        if matches!(kind, X64InstrKind::Ret) {
+            break;
+        }
+    }
+    
+    instructions
+}
+
+fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize) -> Vec<usize> {
+    let mut targets = Vec::new();
+    
+    for instr in instrs {
+        if let X64InstrKind::Call { target_offset } = instr.kind {
+            let instr_abs_offset = instr.offset;
+            let target_abs_offset = (instr_abs_offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            
+            if target_abs_offset < main_file_offset {
+                let distance = main_file_offset - target_abs_offset;
+                if distance < 0x20 {
+                    targets.push(target_abs_offset);
+                }
+            }
+        }
+    }
+    
+    targets
 }
 
 fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {

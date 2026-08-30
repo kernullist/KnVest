@@ -37,6 +37,7 @@ impl Instruction {
     pub fn disassemble(bytecode: &[u8]) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
+        let mut consecutive_invalid = 0;
 
         while offset < bytecode.len() {
             let start_offset = offset;
@@ -46,6 +47,10 @@ impl Instruction {
             let opcode = match OpCode::from_u8(opcode_byte) {
                 Some(op) => op,
                 None => {
+                    consecutive_invalid += 1;
+                    if consecutive_invalid >= 3 {
+                        break;
+                    }
                     instructions.push(Instruction {
                         offset: start_offset,
                         opcode: OpCode::Nop,
@@ -54,6 +59,8 @@ impl Instruction {
                     continue;
                 }
             };
+            
+            consecutive_invalid = 0;
 
             let mut operands = Vec::new();
 
