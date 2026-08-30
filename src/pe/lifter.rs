@@ -579,13 +579,10 @@ pub fn lift_to_vm_bytecode(instrs: &[X64Instruction], _base_rva: u32) -> Vec<u8>
     let mut stack_map = std::collections::HashMap::new();
     let mut next_stack_reg = 10u8;
     
-    for instr in instrs.iter() {
-        label_map.insert(instr.offset, bytecode.len());
-    }
-    
-    let mut pending_jumps: Vec<(usize, usize, i32)> = Vec::new();
+    let mut pending_jumps: Vec<(usize, usize)> = Vec::new();
     
     for instr in instrs {
+        label_map.insert(instr.offset, bytecode.len());
         
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
@@ -737,7 +734,7 @@ pub fn lift_to_vm_bytecode(instrs: &[X64Instruction], _base_rva: u32) -> Vec<u8>
                 bytecode.push(OpCode::Jmp as u8);
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
-                pending_jumps.push((placeholder_pos, target_x64_offset, 0));
+                pending_jumps.push((placeholder_pos, target_x64_offset));
             },
             X64InstrKind::Je { target_offset } |
             X64InstrKind::Jne { target_offset } |
@@ -759,14 +756,14 @@ pub fn lift_to_vm_bytecode(instrs: &[X64Instruction], _base_rva: u32) -> Vec<u8>
                 
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
-                pending_jumps.push((placeholder_pos, target_x64_offset, 0));
+                pending_jumps.push((placeholder_pos, target_x64_offset));
             },
             X64InstrKind::Call { target_offset } => {
                 let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 bytecode.push(OpCode::Call as u8);
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
-                pending_jumps.push((placeholder_pos, target_x64_offset, 0));
+                pending_jumps.push((placeholder_pos, target_x64_offset));
             },
             X64InstrKind::Ret => {
                 bytecode.push(OpCode::Ret as u8);
@@ -784,7 +781,7 @@ pub fn lift_to_vm_bytecode(instrs: &[X64Instruction], _base_rva: u32) -> Vec<u8>
         }
     }
     
-    for (placeholder_pos, target_x64_offset, _) in pending_jumps {
+    for (placeholder_pos, target_x64_offset) in pending_jumps {
         if let Some(&target_vm_offset) = label_map.get(&target_x64_offset) {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);

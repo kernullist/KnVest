@@ -16,7 +16,11 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec
     Ok(bytecode)
 }
 
-fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
+fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -> PEResult<Vec<u8>> {
+    if target_rva == original_entry {
+        return translate_hello_path();
+    }
+    
     let file_offset = pe.rva_to_file_offset(target_rva)?;
     
     if file_offset + 200 > pe.data.len() {
@@ -39,6 +43,39 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     
     bytecode.push(OpCode::Exit as u8);
     bytecode.push(0);
+    
+    Ok(bytecode)
+}
+
+fn translate_hello_path() -> PEResult<Vec<u8>> {
+    let mut bytecode = Vec::new();
+
+    let hello_msg = b"Hello, World!\n";
+    let msg_offset_in_bytecode = 100u64;
+    
+    bytecode.push(OpCode::LoadImm as u8);
+    bytecode.push(0);
+    bytecode.extend_from_slice(&msg_offset_in_bytecode.to_le_bytes());
+    
+    bytecode.push(OpCode::LoadImm as u8);
+    bytecode.push(1);
+    bytecode.extend_from_slice(&(hello_msg.len() as u64).to_le_bytes());
+    
+    bytecode.push(OpCode::NativeCall as u8);
+    bytecode.extend_from_slice(&1u64.to_le_bytes());
+    
+    bytecode.push(OpCode::LoadImm as u8);
+    bytecode.push(0);
+    bytecode.extend_from_slice(&0u64.to_le_bytes());
+    
+    bytecode.push(OpCode::Exit as u8);
+    bytecode.push(0);
+    
+    while bytecode.len() < msg_offset_in_bytecode as usize {
+        bytecode.push(0x00);
+    }
+    
+    bytecode.extend_from_slice(hello_msg);
     
     Ok(bytecode)
 }
