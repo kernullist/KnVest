@@ -301,8 +301,6 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xC8], 0
     // Initialize Push/Pop value stack depth to 0 at [rbp-0xE8]
     stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xE8], 0
-    // Initialize LoadByte bytecode base cache at [rbp-0x118]
-    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0xE8, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x118], 0
     
     stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
@@ -452,10 +450,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
     stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x60, 0xFF, 0xFF, 0xFF]);
     
-    // Dispatch prologue: load bytecode pointer and cache for LoadByte (not func1-only)
     let bc_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]); // lea rsi, [rip+bytecode]
-    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x118], rsi
     
     let dispatch_loop = stub.len();
     stub.extend_from_slice(&[0x0F, 0xB6, 0x06]);
@@ -959,8 +955,10 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);  // movzx edi, byte [rsi]  ; src register
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
-    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; bytecode offset
-    stub.extend_from_slice(&[0x48, 0x03, 0x85, 0xE8, 0xFE, 0xFF, 0xFF]);  // add rax, [rbp-0x118]  ; + opcode-0 base from bc_lea
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; VM src offset
+    let bc_base_lea_loadbyte = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);  // lea rdx, [rip+bytecode]
+    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);  // add rax, rdx
     stub.extend_from_slice(&[0x0F, 0xB6, 0x00]);  // movzx eax, byte [rax]
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp + rcx*8 - 0x80], rax  ; store to dst
     let dispatch_back_load_byte = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
@@ -1017,6 +1015,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_call2 + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_loadbyte + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
         let target = if target_str == "BYTECODE" {
@@ -1389,22 +1388,22 @@ mod tests {
     }
 
     #[test]
-    fn test_loadbyte_uses_cached_bytecode_base() {
+    fn test_loadbyte_uses_rip_rel_bytecode_base() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
         assert!(
-            stub.windows(cache_store.len()).any(|w| w == cache_store),
-            "bc_lea must cache bytecode base at [rbp-0x118]"
+            !stub.windows(cache_store.len()).any(|w| w == cache_store),
+            "LoadByte must not use [rbp-0x118] cache"
         );
-        let loadbyte_add = [0x48u8, 0x03, 0x85, 0xE8, 0xFE, 0xFF, 0xFF];
+        let loadbyte_add = [0x48u8, 0x01, 0xD0];
         assert!(
             stub.windows(loadbyte_add.len()).any(|w| w == loadbyte_add),
-            "LoadByte must add offset to cached bytecode base"
+            "LoadByte must add VM offset to rip-rel bytecode base"
         );
-        let lea_pattern = [0x48u8, 0x8D, 0x35];
-        let mut bc_lea_found = false;
+        let lea_pattern = [0x48u8, 0x8D, 0x15];
+        let mut loadbyte_lea_found = false;
         for i in 0..stub.len().saturating_sub(7) {
             if stub[i..i + 3] != lea_pattern {
                 continue;
@@ -1417,16 +1416,11 @@ mod tests {
             ]);
             let target = (i + 7) as i32 + disp;
             if target as usize == bytecode_offset {
-                bc_lea_found = true;
+                loadbyte_lea_found = true;
                 break;
             }
         }
-        assert!(bc_lea_found, "bc_lea must patch to opcode 0 (VMBC+4)");
-        let prologue_init = [0x48u8, 0xC7, 0x85, 0xE8, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
-        assert!(
-            stub.windows(prologue_init.len()).any(|w| w == prologue_init),
-            "prologue must zero-init bytecode base cache at [rbp-0x118]"
-        );
+        assert!(loadbyte_lea_found, "LoadByte lea rdx must patch to opcode 0 (VMBC+4)");
     }
 
     #[test]
