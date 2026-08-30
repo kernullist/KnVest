@@ -1489,14 +1489,8 @@ pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32
                     if external_call_count == 1 {
                         // Skip __main
                     } else {
-                        let in_callee = instr.offset < main_x64_offset;
-                        if in_callee {
-                            // move r0, r1; native_call 3
-                            bytecode_offset += 3 + 1 + 8;
-                        } else {
-                            // native_call 2
-                            bytecode_offset += 1 + 8;
-                        }
+                        // All external calls in this legacy function: native_call 2
+                        bytecode_offset += 1 + 8;
                     }
                 } else {
                     // Internal call with push/pop
