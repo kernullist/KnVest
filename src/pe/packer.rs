@@ -108,20 +108,28 @@ fn is_simple_hello_pattern(code: &[u8]) -> bool {
         return false;
     }
     
+    let check_len = std::cmp::min(code.len(), 100);
     let mut call_count = 0;
-    let mut ret_seen = false;
+    let mut has_ret = false;
+    let mut ret_offset = None;
     
-    for i in 0..std::cmp::min(code.len(), 100) {
-        if code[i] == 0xE8 && i + 5 <= code.len() {
+    for i in 0..check_len {
+        if i + 5 <= code.len() && code[i] == 0xE8 {
             call_count += 1;
         }
-        if code[i] == 0xC3 {
-            ret_seen = true;
-            break;
+        if code[i] == 0xC3 && ret_offset.is_none() {
+            ret_offset = Some(i);
+            has_ret = true;
         }
     }
     
-    call_count <= 2 && ret_seen && code.len() < 150
+    if let Some(ret_pos) = ret_offset {
+        if ret_pos > 60 {
+            return false;
+        }
+    }
+    
+    call_count <= 2 && has_ret
 }
 
 fn translate_hello_path() -> PEResult<Vec<u8>> {
@@ -548,11 +556,16 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub[ret_jmp + 1] = (ret_target as i8).wrapping_sub((ret_jmp + 2) as i8) as u8;
     
     stub.extend_from_slice(&[0x3C, 0x0E]);
-    let dispatch_back2 = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
-    stub.extend_from_slice(&[0x75, dispatch_back2 as u8]);
+    let native_call_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
     
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
     stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
+    
+    stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x01]);
+    let native_call_func1_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
     
     stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
     let bc_base_lea = stub.len();
@@ -571,6 +584,39 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let dispatch_back3 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back3.to_le_bytes());
+    
+    let native_call_func1_target = stub.len();
+    stub[native_call_func1_jmp + 1] = (native_call_func1_target as i8).wrapping_sub((native_call_func1_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xC2]);
+    stub.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xD0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xD3]);
+    stub.extend_from_slice(&[0x48, 0x31, 0xD2]);
+    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC2, 0x30]);
+    stub.extend_from_slice(&[0x88, 0x51, 0x01]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
+    stub.extend_from_slice(&[0x88, 0x01]);
+    stub.extend_from_slice(&[0xC6, 0x41, 0x02, 0x0A]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x95, 0x10, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x41, 0xB8, 0x03, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
+    let dispatch_back_func2 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_func2.to_le_bytes());
+    
+    let native_call_target = stub.len();
+    stub[native_call_jmp + 1] = (native_call_target as i8).wrapping_sub((native_call_jmp + 2) as i8) as u8;
     
     stub.extend_from_slice(&[0x3C, 0x0F]);
     let push_jmp = stub.len();
