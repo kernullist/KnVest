@@ -481,72 +481,50 @@ pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut 
                     return X64InstrKind::Jne { target_offset: rel };
                 },
                 0xAF if bytes.len() > 2 => {
-                    instr_bytes.extend_from_slice(&bytes[2..3]);
-                    *offset += 3;
+                    // IMUL: 0x0F 0xAF modrm [disp]
                     let modrm = bytes[2];
+                    let mod_field = (modrm & 0xC0) >> 6;
                     let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    let src = decode_reg_from_modrm(modrm & 7, false);
-                    return X64InstrKind::ImulRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-                },
-                _ => {
-                    *offset += 2;
-                }
-            }
-        },
-        0x0F if bytes.len() > 1 => {
-            instr_bytes.push(b0);
-            let b1 = bytes[1];
-            
-            match b1 {
-                0xB6 if bytes.len() > 2 => {
-                    // MOVZX without REX: 0F B6
-                    let modrm = bytes[2];
-                    let modrm_mod = (modrm & 0xC0) >> 6;
                     
-                    if modrm_mod == 0x00 {
-                        // [reg] with no displacement
-                        instr_bytes.extend_from_slice(&bytes[0..3]);
-                        *offset += 3;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                        let base = decode_reg_from_modrm(modrm & 7, false);
-                        return X64InstrKind::MovzxByte { dst, base, offset: 0 };
-                    } else if modrm_mod == 0x01 && bytes.len() > 3 {
-                        // [reg+disp8]
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                        let base = decode_reg_from_modrm(modrm & 7, false);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::MovzxByte { dst, base, offset: disp };
-                    } else if modrm_mod == 0xC0 {
-                        // reg, reg (not memory)
-                        instr_bytes.extend_from_slice(&bytes[0..3]);
-                        *offset += 3;
-                        return X64InstrKind::Unknown; // Not a memory load
-                    }
-                },
-                0xAF if bytes.len() > 2 => {
-                    // IMUL without REX prefix
-                    let modrm = bytes[2];
-                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    let modrm_mod = (modrm & 0xC0) >> 6;
-                    
-                    if modrm_mod == 0x01 && bytes.len() > 3 {
-                        // Memory operand with 8-bit displacement: imul dst, [base+disp8]
+                    if mod_field == 1 && bytes.len() > 3 {
+                        // mod=1: [reg+disp8] - memory operand
                         instr_bytes.extend_from_slice(&bytes[0..4]);
                         *offset += 4;
                         let base = decode_reg_from_modrm(modrm & 7, false);
                         let disp = bytes[3] as i8 as i32;
                         return X64InstrKind::ImulRegMem { dst: to_32bit_reg(dst), base: to_32bit_reg(base), offset: disp };
-                    } else if modrm_mod == 0xC0 {
-                        // Register operand: imul dst, src
+                    } else if mod_field == 3 {
+                        // mod=3: register operand
                         instr_bytes.extend_from_slice(&bytes[0..3]);
                         *offset += 3;
                         let src = decode_reg_from_modrm(modrm & 7, false);
                         return X64InstrKind::ImulRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
                     }
                 },
-                _ => {}
+                0xB6 if bytes.len() > 2 => {
+                    // MOVZX byte: 0x0F 0xB6 modrm [disp]
+                    let modrm = bytes[2];
+                    let mod_field = (modrm & 0xC0) >> 6;
+                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
+                    
+                    if mod_field == 0 {
+                        // mod=0: [reg] - direct memory operand
+                        instr_bytes.extend_from_slice(&bytes[0..3]);
+                        *offset += 3;
+                        let base = decode_reg_from_modrm(modrm & 7, false);
+                        return X64InstrKind::MovzxByte { dst, base, offset: 0 };
+                    } else if mod_field == 1 && bytes.len() > 3 {
+                        // mod=1: [reg+disp8] - memory with 8-bit displacement
+                        instr_bytes.extend_from_slice(&bytes[0..4]);
+                        *offset += 4;
+                        let base = decode_reg_from_modrm(modrm & 7, false);
+                        let disp = bytes[3] as i8 as i32;
+                        return X64InstrKind::MovzxByte { dst, base, offset: disp };
+                    }
+                },
+                _ => {
+                    *offset += 2;
+                }
             }
         },
         0x74 if bytes.len() >= 2 => {
@@ -1295,7 +1273,10 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                         
                         if in_callee {
                             // Callees (print_digit, print_char) use putchar: native_call 3
-                            // Argument is already in r0 from x64 code
+                            // Argument passed in r1, need to move to r0 for native_call
+                            bytecode.push(OpCode::Move as u8);
+                            bytecode.push(0); // r0
+                            bytecode.push(1); // r1
                             bytecode.push(OpCode::NativeCall as u8);
                             bytecode.extend_from_slice(&3u64.to_le_bytes());
                         } else {
