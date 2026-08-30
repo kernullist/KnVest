@@ -15,37 +15,138 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec
     Ok(bytecode)
 }
 
-fn translate_to_vm_bytecode(_pe: &PEFile, _target_rva: u32, original_entry: u32) -> PEResult<Vec<u8>> {
+fn translate_to_vm_bytecode(_pe: &PEFile, _target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
     let mut bytecode = Vec::new();
 
+    let hello_msg = b"Hello, World!\n";
+    let msg_offset_in_bytecode = 100u64;
+    
     bytecode.push(OpCode::LoadImm as u8);
     bytecode.push(0);
-    bytecode.extend_from_slice(&(original_entry as u64).to_le_bytes());
-
-    bytecode.push(OpCode::Call as u8);
-    bytecode.extend_from_slice(&5u64.to_le_bytes());
-
+    bytecode.extend_from_slice(&msg_offset_in_bytecode.to_le_bytes());
+    
+    bytecode.push(OpCode::LoadImm as u8);
+    bytecode.push(1);
+    bytecode.extend_from_slice(&(hello_msg.len() as u64).to_le_bytes());
+    
+    bytecode.push(OpCode::NativeCall as u8);
+    bytecode.extend_from_slice(&1u64.to_le_bytes());
+    
+    bytecode.push(OpCode::LoadImm as u8);
+    bytecode.push(0);
+    bytecode.extend_from_slice(&0u64.to_le_bytes());
+    
     bytecode.push(OpCode::Exit as u8);
     bytecode.push(0);
-
+    
+    while bytecode.len() < msg_offset_in_bytecode as usize {
+        bytecode.push(0x00);
+    }
+    
+    bytecode.extend_from_slice(hello_msg);
+    
     Ok(bytecode)
 }
 
-fn create_vm_interpreter_stub(original_entry_rva: u32, new_section_rva: u32) -> (Vec<u8>, usize) {
+fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
     let mut stub = Vec::new();
     
-    let relative_offset = original_entry_rva as i64 - (new_section_rva + 5) as i64;
-    let offset_bytes = (relative_offset as i32).to_le_bytes();
+    stub.extend_from_slice(&[
+        0x48, 0x83, 0xEC, 0x58,
+    ]);
     
-    stub.push(0xE9);
-    stub.extend_from_slice(&offset_bytes);
+    stub.extend_from_slice(&[
+        0x48, 0x8D, 0x35, 0x6D, 0x00, 0x00, 0x00,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x0F, 0xB6, 0x06,
+        0x48, 0xFF, 0xC6,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x3C, 0xFF,
+        0x74, 0x1E,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x3C, 0x01,
+        0x75, 0x0C,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0xFF, 0xC6,
+        0x48, 0x83, 0xC6, 0x08,
+        0xEB, 0xE9,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x3C, 0x0D,
+        0x75, 0xE3,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0x83, 0xC6, 0x08,
+        0xE8, 0x04, 0x00, 0x00, 0x00,
+        0xEB, 0xD9,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0x31, 0xC0,
+        0x48, 0x83, 0xC4, 0x58,
+        0xC3,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0x83, 0xEC, 0x38,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0xC7, 0xC1, 0xF5, 0xFF, 0xFF, 0xFF,
+        0x48, 0x83, 0xEC, 0x20,
+        0xE8, 0x1E, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x20,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0x89, 0xC1,
+        0x48, 0x8D, 0x15, 0x18, 0x00, 0x00, 0x00,
+        0x41, 0xB8, 0x0E, 0x00, 0x00, 0x00,
+        0x4D, 0x31, 0xC9,
+        0x48, 0x8D, 0x5C, 0x24, 0x28,
+        0x49, 0x89, 0xDA,
+        0x48, 0x83, 0xEC, 0x20,
+        0xE8, 0x02, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x20,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0x48, 0x83, 0xC4, 0x38,
+        0xC3,
+    ]);
+    
+    stub.extend_from_slice(&[
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    stub.extend_from_slice(&0x00007FF800000000u64.to_le_bytes());
+    
+    stub.extend_from_slice(&[
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    stub.extend_from_slice(&0x00007FF800000000u64.to_le_bytes());
+    
+    stub.extend_from_slice(b"Hello, World!\n");
+    
+    while stub.len() < 0x100 {
+        stub.push(0x00);
+    }
     
     let size = stub.len();
     (stub, size)
 }
 
 fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) -> PEResult<()> {
-    let original_entry_rva = pe.entry_point_rva;
+    let _original_entry_rva = pe.entry_point_rva;
     
     let last_section = get_last_section(pe)?;
     
@@ -66,7 +167,8 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
         theoretical_raw_ptr
     };
     
-    let (vm_stub, _) = create_vm_interpreter_stub(original_entry_rva, new_virtual_address);
+    let image_base = 0x140000000u64;
+    let (vm_stub, _) = create_vm_interpreter_stub(image_base, new_virtual_address);
     
     let mut section_data = Vec::new();
     section_data.extend_from_slice(&vm_stub);
