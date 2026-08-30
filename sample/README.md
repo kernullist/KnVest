@@ -1,60 +1,54 @@
 # KnVest Sample Programs
 
-Three MinGW-style C samples demonstrating VM bytecode lifting.
+Seven MinGW-style C samples demonstrating VM bytecode lifting.
 
 ## Samples
 
-1. **loop.c** - Print 5 down to 1, one number per line
-2. **arith.c** - Compute (3+4)*5 with volatile variables
-3. **call.c** - Function call returning 7
-4. **hello.c** - Print "Hello, World!" (special-cased)
+1. **hello.c** - Print "Hello, World!" (special-cased)
+2. **loop.c** - Print 5 down to 1, one number per line
+3. **arith.c** - Compute (3+4)*5 with volatile variables
+4. **call.c** - Function call returning 7
+5. **nested.c** - Nested loops with character-by-character output (multiplication table 1-3)
+6. **fact.c** - Recursive factorial(5) = 120
+7. **str.c** - String byte walking to count length of "knvest"
 
 ## Building
 
-Compile with MinGW GCC (no optimization):
+Compile with MinGW GCC:
 ```bash
+x86_64-w64-mingw32-gcc hello.c -o hello.exe
 x86_64-w64-mingw32-gcc -O0 loop.c -o loop.exe
 x86_64-w64-mingw32-gcc -O0 arith.c -o arith.exe
 x86_64-w64-mingw32-gcc -O0 call.c -o call.exe
-x86_64-w64-mingw32-gcc hello.c -o hello.exe
-```
-
-## Packing
-
-**IMPORTANT**: Specify `--rva` pointing to main function RVA (not MinGW CRT entry point).
-
-Find main RVA:
-```bash
-objdump -d sample.exe | grep "^[0-9a-f]* <main>:"
-```
-
-Pack samples:
-```bash
-knvest pack loop.exe -o loop.packed.exe --rva 0x14d4
-knvest pack arith.exe -o arith.packed.exe --rva 0x14d4
-knvest pack call.exe -o call.packed.exe --rva 0x14df
-knvest pack hello.exe -o hello.packed.exe              # No --rva for hello
-```
-
-## Viewing IR
-
-```bash
-knvest ir loop.packed.exe   # Shows cmp/jmp_if
-knvest ir arith.packed.exe  # Shows add/mul, not constant 35
-knvest ir call.packed.exe   # Shows call/ret
-knvest ir hello.packed.exe  # Shows load_imm/native_call/exit
+x86_64-w64-mingw32-gcc -O0 nested.c -o nested.exe
+x86_64-w64-mingw32-gcc -O0 fact.c -o fact.exe
+x86_64-w64-mingw32-gcc -O0 str.c -o str.exe
 ```
 
 ## Expected Output
 
+- **hello**: `Hello, World!\n` exit 0
 - **loop**: `5\n4\n3\n2\n1\n` exit 0
 - **arith**: `35\n` exit 0
 - **call**: `7\n` exit 0
-- **hello**: `Hello, World!\n` exit 0
+- **nested**: `1x1=1\n1x2=2\n1x3=3\n2x1=2\n2x2=4\n2x3=6\n3x1=3\n3x2=6\n3x3=9\n` exit 0
+- **fact**: `120\n` exit 0
+- **str**: `6\n` exit 0
+
+## VM Features Demonstrated
+
+- **hello.c**: Special-cased string output via native_call 1 (WriteFile)
+- **loop.c**: Countdown loop with conditional jumps and integer output
+- **arith.c**: Arithmetic operations (add, mul) without constant folding
+- **call.c**: Simple function call/return
+- **nested.c**: Nested control flow, character output (native_call 3), manual digit formatting
+- **fact.c**: Recursive function calls with VM call stack
+- **str.c**: String literals, byte loads (LoadByte), pointer arithmetic
 
 ## Notes
 
-- Without `--rva`, packer lifts MinGW CRT startup code (identical for all samples)
-- With `--rva`, each sample produces unique VM bytecode
-- hello.c is special-cased: when packed without `--rva`, uses simple load_imm/native_call/exit path
-- Packed entry point is NOT JMP to original EP (0x55 = push rbp, not 0xE9 = jmp)
+- Use `--rva` to specify main function RVA when packing
+- Packed entry point is `0x55` (push rbp), not `0xE9` (jmp)
+- Each sample produces unique VM bytecode that reflects its control flow
+- Recursion (fact.c) uses VM Call/Ret with proper stack management
+- String operations (str.c) use LoadStr and LoadByte opcodes

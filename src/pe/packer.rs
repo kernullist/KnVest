@@ -97,15 +97,47 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     let call_targets = find_internal_call_targets(&main_instrs, file_offset);
     
     let mut all_instrs = main_instrs;
+    let mut processed_targets = std::collections::HashSet::new();
     
+    // Only process callees BEFORE main (no CRT after main)
     for target_file_offset in call_targets {
+        if processed_targets.contains(&target_file_offset) {
+            continue;
+        }
+        processed_targets.insert(target_file_offset);
+        
         if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
+            // Must start with push rbp (0x55)
             if pe.data[target_file_offset] == 0x55 {
-                let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 200, pe.data.len())];
-                let mut callee_instrs = disassemble_until_ret(callee_code, 50);
+                let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 300, pe.data.len())];
+                let mut callee_instrs = disassemble_until_ret(callee_code, 100);
                 
                 for instr in &mut callee_instrs {
                     instr.offset += target_file_offset;
+                }
+                
+                // Check for recursive calls within this callee
+                let callee_targets = find_internal_call_targets(&callee_instrs, file_offset);
+                for nested_target in callee_targets {
+                    // For recursion, allow calling self
+                    if nested_target == target_file_offset {
+                        // Self-recursion is fine, already in all_instrs
+                        continue;
+                    }
+                    
+                    if !processed_targets.contains(&nested_target) && nested_target < file_offset {
+                        if nested_target + 100 <= pe.data.len() && pe.data[nested_target] == 0x55 {
+                            let nested_code = &pe.data[nested_target..std::cmp::min(nested_target + 300, pe.data.len())];
+                            let mut nested_instrs = disassemble_until_ret(nested_code, 100);
+                            
+                            for instr in &mut nested_instrs {
+                                instr.offset += nested_target;
+                            }
+                            
+                            all_instrs.extend(nested_instrs);
+                            processed_targets.insert(nested_target);
+                        }
+                    }
                 }
                 
                 all_instrs.extend(callee_instrs);
@@ -242,9 +274,11 @@ fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize
             let instr_abs_offset = instr.offset;
             let target_abs_offset = (instr_abs_offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
             
+            // Only include targets BEFORE main (no CRT functions after main)
             if target_abs_offset < main_file_offset {
                 let distance = main_file_offset - target_abs_offset;
-                if distance < 0x20 {
+                // Allow up to 512 bytes before main (for larger functions like factorial)
+                if distance < 0x200 {
                     targets.push(target_abs_offset);
                 }
             }
@@ -260,8 +294,13 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x55]);
     stub.extend_from_slice(&[0x48, 0x89, 0xE5]);
-    stub.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x03, 0x00, 0x00]); // sub rsp, 0x300 (increased for call stack)
     stub.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]);
+    
+    // Initialize call stack depth to 0 at [rbp-0xC8]
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xC8], 0
+    // Initialize Push/Pop value stack depth to 0 at [rbp-0xE8]
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xE8], 0
     
     stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
@@ -412,7 +451,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x60, 0xFF, 0xFF, 0xFF]);
     
     let bc_lea = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]); // lea rsi, [rip+bytecode]
     
     let dispatch_loop = stub.len();
     stub.extend_from_slice(&[0x0F, 0xB6, 0x06]);
@@ -568,11 +607,13 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0B]);
     let jmpif_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi] - read condition
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);  // mov rax, [rsi] - read target
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);  // add rsi, 8
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);  // mov rdx, [rbp-0x90] - flags
+    
+    // Check condition 1 (EQ): flags == 1
     stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x01]);
     let jmpif_eq_jmp = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
@@ -583,33 +624,87 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0xEB, 0x00]);
     let jmpif_eq_target = stub.len();
     stub[jmpif_eq_jmp + 1] = (jmpif_eq_target as i8).wrapping_sub((jmpif_eq_jmp + 2) as i8) as u8;
+    
+    // Check condition 2 (NE): flags != 1
     stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x02]);
     let jmpif_ne_jmp = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x01]);
     let jmpif_taken2 = stub.len();
-    stub.extend_from_slice(&[0x74, 0x00]);
+    stub.extend_from_slice(&[0x75, 0x00]); // jne taken when flags != 1 (NE)
     let jmpif_nottaken2 = stub.len();
     stub.extend_from_slice(&[0xEB, 0x00]);
     let jmpif_ne_target = stub.len();
     stub[jmpif_ne_jmp + 1] = (jmpif_ne_target as i8).wrapping_sub((jmpif_ne_jmp + 2) as i8) as u8;
+    
+    // Check condition 3 (GT): flags == 2
     stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x03]);
-    let jmpif_nottaken3 = stub.len();
+    let jmpif_gt_jmp = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x02]);
     let jmpif_taken3 = stub.len();
     stub.extend_from_slice(&[0x74, 0x00]);
+    let jmpif_nottaken3 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_gt_target = stub.len();
+    stub[jmpif_gt_jmp + 1] = (jmpif_gt_target as i8).wrapping_sub((jmpif_gt_jmp + 2) as i8) as u8;
+    
+    // Check condition 4 (LT): flags == 0
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x04]);
+    let jmpif_lt_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x00]);
+    let jmpif_taken4 = stub.len();
+    stub.extend_from_slice(&[0x74, 0x00]);
+    let jmpif_nottaken4 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_lt_target = stub.len();
+    stub[jmpif_lt_jmp + 1] = (jmpif_lt_target as i8).wrapping_sub((jmpif_lt_jmp + 2) as i8) as u8;
+    
+    // Check condition 5 (LE): flags != 2
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x05]);
+    let jmpif_le_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x02]);
+    let jmpif_taken5 = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    let jmpif_nottaken5 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_le_target = stub.len();
+    stub[jmpif_le_jmp + 1] = (jmpif_le_target as i8).wrapping_sub((jmpif_le_jmp + 2) as i8) as u8;
+    
+    // Check condition 6 (GE): flags != 0
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x06]);
+    let jmpif_ge_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x00]);
+    let jmpif_taken6 = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    let jmpif_nottaken6 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_ge_target = stub.len();
+    stub[jmpif_ge_jmp + 1] = (jmpif_ge_target as i8).wrapping_sub((jmpif_ge_jmp + 2) as i8) as u8;
+    
+    // Not taken - continue to next instruction
     let jmpif_nottaken_all = stub.len();
     stub[jmpif_nottaken1 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken1 + 2) as i8) as u8;
     stub[jmpif_nottaken2 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken2 + 2) as i8) as u8;
     stub[jmpif_nottaken3 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken3 + 2) as i8) as u8;
+    stub[jmpif_nottaken4 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken4 + 2) as i8) as u8;
+    stub[jmpif_nottaken5 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken5 + 2) as i8) as u8;
+    stub[jmpif_nottaken6 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken6 + 2) as i8) as u8;
     let dispatch_back_jmpif_nottaken = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_jmpif_nottaken.to_le_bytes());
+    
+    // Taken - jump to target
     let jmpif_taken_all = stub.len();
     stub[jmpif_taken1 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken1 + 2) as i8) as u8;
     stub[jmpif_taken2 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken2 + 2) as i8) as u8;
     stub[jmpif_taken3 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken3 + 2) as i8) as u8;
+    stub[jmpif_taken4 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken4 + 2) as i8) as u8;
+    stub[jmpif_taken5 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken5 + 2) as i8) as u8;
+    stub[jmpif_taken6 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken6 + 2) as i8) as u8;
     let bc_base_lea_jmpif = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
@@ -625,18 +720,28 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0C]);
     let call_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);
+    // Read 8-byte call target from bytecode
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);  // mov rax, [rsi]
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);  // add rsi, 8
+    // Save absolute IP temporarily
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0x98], rsi
+    // Calculate relative return offset
     let bc_base_lea_call = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x29, 0xCE]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x28, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]);  // lea rcx, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);  // mov rsi, [rbp-0x98]
+    stub.extend_from_slice(&[0x48, 0x29, 0xCE]);  // sub rsi, rcx (rsi = return offset)
+    // Load depth from [rbp-0xC8]
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);  // mov rdx, [rbp-0xC8]
+    // Store return offset at [rbp-0x200 + depth*8]
+    stub.extend_from_slice(&[0x48, 0x89, 0xB4, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]);  // mov [rbp + rdx*8 - 0x200], rsi
+    // Increment depth
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC2]);  // inc rdx
+    stub.extend_from_slice(&[0x48, 0x89, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0xC8], rdx
+    // Jump to target
     let bc_base_lea_call2 = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);  // lea rsi, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);  // add rax, rsi (rax = absolute target)
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);  // mov rsi, rax
     let dispatch_back_call = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_call.to_le_bytes());
@@ -648,11 +753,18 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0D]);
     let ret_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x28, 0xFF, 0xFF, 0xFF]);
+    // Load depth from [rbp-0xC8]
+    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);  // mov rax, [rbp-0xC8]
+    // Decrement depth
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC8]);  // dec rax
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0xC8], rax
+    // Load return offset from [rbp-0x200 + depth*8]
+    stub.extend_from_slice(&[0x48, 0x8B, 0x84, 0xC5, 0x00, 0xFE, 0xFF, 0xFF]);  // mov rax, [rbp + rax*8 - 0x200]
+    // Jump to return offset
     let bc_base_lea_ret = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);  // lea rsi, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);  // add rax, rsi (rax = absolute return address)
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);  // mov rsi, rax
     let dispatch_back_ret = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_ret.to_le_bytes());
@@ -671,32 +783,19 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x01]);
     let native_call_func1_jmp = stub.len();
-    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je func1 (string/WriteFile)
     
-    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
-    let bc_base_lea = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x80]);
-    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xC2]);
-    stub.extend_from_slice(&[0x4C, 0x8B, 0x45, 0x88]);
-    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
-    stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x03]);
+    let native_call_func3_jmp = stub.len();
+    stub.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je func3 (putchar)
     
-    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
-    let dispatch_back3 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
-    stub.extend_from_slice(&[0xE9]);
-    stub.extend_from_slice(&dispatch_back3.to_le_bytes());
-    
-    let native_call_func1_target = stub.len();
-    let native_call_func1_offset = (native_call_func1_target as i32).wrapping_sub((native_call_func1_jmp + 6) as i32);
-    stub[native_call_func1_jmp + 2..native_call_func1_jmp + 6].copy_from_slice(&native_call_func1_offset.to_le_bytes());
-    
+    // func2: integer printer (printf-style digit + newline from r2)
     stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
     stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
+    
+    stub.extend_from_slice(&[0x48, 0x3D, 0x64, 0x00, 0x00, 0x00]); // cmp rax, 100
+    let three_digit_jmp = stub.len();
+    stub.extend_from_slice(&[0x73, 0x00]); // jae three_digit
     
     stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x0A]);
     let single_digit_jmp = stub.len();
@@ -723,9 +822,33 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x88, 0x01]);
     stub.extend_from_slice(&[0xC6, 0x41, 0x02, 0x0A]);
     stub.extend_from_slice(&[0x41, 0xB8, 0x03, 0x00, 0x00, 0x00]);
-    
     let after_two_digit = stub.len();
     stub[after_single_digit + 1] = (after_two_digit as i8).wrapping_sub((after_single_digit + 2) as i8) as u8;
+    let after_two_digit_jmp = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]); // skip three_digit after two_digit path
+    
+    let three_digit_target = stub.len();
+    stub[three_digit_jmp + 1] = (three_digit_target as i8).wrapping_sub((three_digit_jmp + 2) as i8) as u8;
+    
+    // hundreds = n/100, tens = (n/10)%10, ones = n%10; "XYZ\n" via rcx (same buffer as 1/2-digit)
+    stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    stub.extend_from_slice(&[0xBB, 0x64, 0x00, 0x00, 0x00]); // mov ebx, 100
+    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]); // div rbx
+    stub.extend_from_slice(&[0x04, 0x30]); // add al, 0x30
+    stub.extend_from_slice(&[0x88, 0x01]); // mov [rcx], al
+    stub.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx (n%100)
+    stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    stub.extend_from_slice(&[0xBB, 0x0A, 0x00, 0x00, 0x00]); // mov ebx, 10
+    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]); // div rbx
+    stub.extend_from_slice(&[0x04, 0x30]); // add al, 0x30
+    stub.extend_from_slice(&[0x88, 0x41, 0x01]); // mov [rcx+1], al
+    stub.extend_from_slice(&[0x80, 0xC2, 0x30]); // add dl, 0x30
+    stub.extend_from_slice(&[0x88, 0x51, 0x02]); // mov [rcx+2], dl
+    stub.extend_from_slice(&[0xC6, 0x41, 0x03, 0x0A]); // mov byte [rcx+3], 0x0A
+    stub.extend_from_slice(&[0x41, 0xB8, 0x04, 0x00, 0x00, 0x00]); // mov r8d, 4
+    
+    let write_common = stub.len();
+    stub[after_two_digit_jmp + 1] = (write_common as i8).wrapping_sub((after_two_digit_jmp + 2) as i8) as u8;
     
     stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x8D, 0x95, 0x10, 0xFF, 0xFF, 0xFF]);
@@ -740,6 +863,50 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_func2.to_le_bytes());
     
+    // func1: WriteFile string from r0/r1
+    let native_call_func1_target = stub.len();
+    let native_call_func1_offset = (native_call_func1_target as i32).wrapping_sub((native_call_func1_jmp + 6) as i32);
+    stub[native_call_func1_jmp + 2..native_call_func1_jmp + 6].copy_from_slice(&native_call_func1_offset.to_le_bytes());
+    
+    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
+    let bc_base_lea = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xC2]);
+    stub.extend_from_slice(&[0x4C, 0x8B, 0x45, 0x88]);
+    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
+    let dispatch_back3 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back3.to_le_bytes());
+    
+    // func3: putchar — WriteFile 1 byte from r0, no newline
+    let native_call_func3_target = stub.len();
+    let native_call_func3_offset = (native_call_func3_target as i32).wrapping_sub((native_call_func3_jmp + 6) as i32);
+    stub[native_call_func3_jmp + 2..native_call_func3_jmp + 6].copy_from_slice(&native_call_func3_offset.to_le_bytes());
+    
+    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x80]);  // mov rax, [rbp-0x80] - register 0
+    stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);  // lea rcx, [rbp-0xF0] - buffer
+    stub.extend_from_slice(&[0x88, 0x01]);  // mov [rcx], al
+    stub.extend_from_slice(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]);  // mov r8d, 1
+    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);  // mov rcx, stdout
+    stub.extend_from_slice(&[0x48, 0x8D, 0x95, 0x10, 0xFF, 0xFF, 0xFF]);  // lea rdx, buffer
+    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);  // lea r9, bytes written
+    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
+    let dispatch_back_func3 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_func3.to_le_bytes());
+    
     let native_call_target = stub.len();
     let native_call_offset = (native_call_target as i32).wrapping_sub((native_call_jmp + 6) as i32);
     stub[native_call_jmp + 2..native_call_jmp + 6].copy_from_slice(&native_call_offset.to_le_bytes());
@@ -747,10 +914,13 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0F]);
     let push_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x20, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi] - src register
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);  // mov rax, [rbp+rcx*8-0x80] - value
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);  // mov rdx, [rbp-0xE8] - depth
+    stub.extend_from_slice(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFD, 0xFF, 0xFF]);  // mov [rbp+rdx*8-0x280], rax
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC2]);  // inc rdx
+    stub.extend_from_slice(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0xE8], rdx
     let dispatch_back_push = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_push.to_le_bytes());
@@ -762,10 +932,13 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x10]);
     let pop_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x20, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi] - dst register
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);  // mov rdx, [rbp-0xE8] - depth
+    stub.extend_from_slice(&[0x48, 0xFF, 0xCA]);  // dec rdx
+    stub.extend_from_slice(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0xE8], rdx
+    stub.extend_from_slice(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFD, 0xFF, 0xFF]);  // mov rax, [rbp+rdx*8-0x280]
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp+rcx*8-0x80], rax
     let dispatch_back_pop = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_pop.to_le_bytes());
@@ -773,6 +946,28 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let pop_target = stub.len();
     let pop_offset = (pop_target as i32).wrapping_sub((pop_jmp + 6) as i32);
     stub[pop_jmp + 2..pop_jmp + 6].copy_from_slice(&pop_offset.to_le_bytes());
+    
+    // LoadByte (0x11): read dst, src_reg; dst = byte at [src_reg]
+    stub.extend_from_slice(&[0x3C, 0x11]);
+    let load_byte_jmp = stub.len();
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi]  ; dst register
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);  // movzx edi, byte [rsi]  ; src register
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; VM src offset
+    let bc_base_lea_loadbyte = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);  // lea rdx, [rip+bytecode]
+    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);  // add rax, rdx
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x00]);  // movzx eax, byte [rax]
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp + rcx*8 - 0x80], rax  ; store to dst
+    let dispatch_back_load_byte = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_load_byte.to_le_bytes());
+    
+    let load_byte_target = stub.len();
+    let load_byte_offset = (load_byte_target as i32).wrapping_sub((load_byte_jmp + 6) as i32);
+    stub[load_byte_jmp + 2..load_byte_jmp + 6].copy_from_slice(&load_byte_offset.to_le_bytes());
     
     let exit_target = stub.len();
     let exit_offset = (exit_target as i32).wrapping_sub((exit_jmp + 6) as i32);
@@ -820,6 +1015,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_call2 + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_loadbyte + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
         let target = if target_str == "BYTECODE" {
@@ -1172,6 +1368,91 @@ mod tests {
             
             i += 1;
         }
+    }
+
+    #[test]
+    fn test_stub_does_not_clobber_writefile_slot() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
+        let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(clobber_pattern.len()).any(|w| w == clobber_pattern),
+            "stub must not store to [rbp-0xB0] (WriteFile pointer slot)"
+        );
+        // WriteFile pointer store uses mov [rbp-0xB0], rax
+        let writefile_store = [0x48u8, 0x89, 0x85, 0x50, 0xFF, 0xFF, 0xFF];
+        assert!(
+            stub.windows(writefile_store.len()).any(|w| w == writefile_store),
+            "stub must still store WriteFile pointer at [rbp-0xB0]"
+        );
+    }
+
+    #[test]
+    fn test_loadbyte_uses_rip_rel_bytecode_base() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
+        let bytecode_offset = vmbc + 4;
+        let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(cache_store.len()).any(|w| w == cache_store),
+            "LoadByte must not use [rbp-0x118] cache"
+        );
+        let loadbyte_add = [0x48u8, 0x01, 0xD0];
+        assert!(
+            stub.windows(loadbyte_add.len()).any(|w| w == loadbyte_add),
+            "LoadByte must add VM offset to rip-rel bytecode base"
+        );
+        let lea_pattern = [0x48u8, 0x8D, 0x15];
+        let mut loadbyte_lea_found = false;
+        for i in 0..stub.len().saturating_sub(7) {
+            if stub[i..i + 3] != lea_pattern {
+                continue;
+            }
+            let disp = i32::from_le_bytes([
+                stub[i + 3],
+                stub[i + 4],
+                stub[i + 5],
+                stub[i + 6],
+            ]);
+            let target = (i + 7) as i32 + disp;
+            if target as usize == bytecode_offset {
+                loadbyte_lea_found = true;
+                break;
+            }
+        }
+        assert!(loadbyte_lea_found, "LoadByte lea rdx must patch to opcode 0 (VMBC+4)");
+    }
+
+    #[test]
+    fn test_jmpif_ne_uses_jne_not_je() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        // cond 2 (NE): cmp rdx,1 must be followed by jne (75), not je (74)
+        let ne_cond = [0x48u8, 0x83, 0xF9, 0x02];
+        let mut found = false;
+        for i in 0..stub.len().saturating_sub(ne_cond.len() + 4) {
+            if stub[i..i + 4] != ne_cond {
+                continue;
+            }
+            assert_eq!(stub[i + 10], 0x75, "JmpIf NE must use jne (0x75), not je (0x74)");
+            found = true;
+            break;
+        }
+        assert!(found, "JmpIf NE (cond 2) handler must exist in stub");
+    }
+
+    #[test]
+    fn test_three_digit_printer_uses_rcx_buffer() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
+        let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(bad_hundreds.len()).any(|w| w == bad_hundreds),
+            "three_digit must not use mov [rbp+disp32], al with F0 FF FF FF (-0x10)"
+        );
+        assert!(stub.windows(2).any(|w| w == [0x88u8, 0x01]));
+        assert!(stub.windows(3).any(|w| w == [0x88u8, 0x41, 0x01]));
+        assert!(stub.windows(3).any(|w| w == [0x88u8, 0x51, 0x02]));
+        assert!(stub.windows(4).any(|w| w == [0xC6u8, 0x41, 0x03, 0x0A]));
     }
 
     #[test]

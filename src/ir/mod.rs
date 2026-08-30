@@ -148,6 +148,30 @@ impl Instruction {
                         offset += 1;
                     }
                 },
+                
+                OpCode::LoadByte => {
+                    if offset < bytecode.len() {
+                        operands.push(Operand::Register(bytecode[offset]));
+                        offset += 1;
+                    }
+                    if offset < bytecode.len() {
+                        operands.push(Operand::Register(bytecode[offset]));
+                        offset += 1;
+                    }
+                },
+                
+                OpCode::LoadStr => {
+                    if offset < bytecode.len() {
+                        operands.push(Operand::Register(bytecode[offset]));
+                        offset += 1;
+                    }
+                    if offset + 8 <= bytecode.len() {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
+                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
+                        offset += 8;
+                    }
+                },
             }
 
             instructions.push(Instruction {

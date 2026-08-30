@@ -38,6 +38,7 @@ pub struct VirtualMachine {
     bytecode: Vec<u8>,
     native_functions: HashMap<u64, fn(&mut VirtualMachine) -> VMResult<()>>,
     pub exit_code: Option<i32>,
+    pub data_section: Vec<u8>,
 }
 
 impl VirtualMachine {
@@ -52,6 +53,7 @@ impl VirtualMachine {
             bytecode,
             native_functions: HashMap::new(),
             exit_code: None,
+            data_section: Vec::new(),
         }
     }
 
@@ -262,6 +264,28 @@ impl VirtualMachine {
                 let reg = self.read_u8()?;
                 let value = self.pop_stack()?;
                 self.set_register(reg, value)?;
+            },
+            
+            OpCode::LoadByte => {
+                let dst = self.read_u8()?;
+                let addr_reg = self.read_u8()?;
+                let addr = self.get_register(addr_reg)? as usize;
+                
+                let byte_val = if addr < self.data_section.len() {
+                    self.data_section[addr]
+                } else if addr >= 0x10000 && addr < 0x10000 + self.memory.len() {
+                    self.memory[addr - 0x10000]
+                } else {
+                    0
+                };
+                
+                self.set_register(dst, byte_val as u64)?;
+            },
+            
+            OpCode::LoadStr => {
+                let dst = self.read_u8()?;
+                let offset = self.read_u64()? as usize;
+                self.set_register(dst, offset as u64)?;
             },
             
             OpCode::Exit => {
