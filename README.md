@@ -195,13 +195,28 @@ sample/
 
 ## How It Works
 
-1. **Parse PE**: Read the input PE64 file and locate the target function
-2. **Translate**: Convert native x64 code to VM bytecode (simplified translation)
-3. **Inject**: Embed VM bytecode and interpreter stub into the PE
-4. **Redirect**: Patch the entry point to jump to the VM interpreter
-5. **Execute**: At runtime, the VM interprets bytecode and produces the original behavior
+1. **Parse PE**: Read the input PE64 file and extract the original entry point RVA
+2. **Generate Bytecode**: Create VM bytecode that represents calling the original entry point
+3. **Create New Section**: Add a `.knvest` section containing:
+   - A small x64 stub that jumps to the original entry point
+   - A `VMBC` marker followed by the VM bytecode
+4. **Update Headers**: Properly update:
+   - Section count in COFF header
+   - Entry point RVA to point to the new section
+   - Image size in optional header
+5. **Execute**: At runtime, the stub redirects execution to the original entry point, so the program behaves identically
 
-The current implementation uses a toy translation for demonstration purposes. A real protector would perform full x64 instruction lifting.
+The VM bytecode is present and extractable (for IR viewing) but the current toy implementation uses a direct jump rather than full interpretation. A production protector would implement a complete VM interpreter that executes the bytecode instruction-by-instruction.
+
+### Why This Approach?
+
+This demonstrates the key concepts of VM-based protection:
+- Adding new PE sections with proper alignment
+- Redirecting control flow through a stub
+- Embedding bytecode that can be disassembled and viewed
+- Maintaining a valid, loadable PE structure
+
+The bytecode format is real and uses actual VM opcodes. Future enhancements could add a full interpreter loop in x64 assembly.
 
 ## License
 
