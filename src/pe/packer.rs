@@ -85,22 +85,14 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
         return translate_hello_path();
     }
     
-    let disasm_start = file_offset.saturating_sub(250);
-    let offset_diff = (file_offset - disasm_start) as u32;
-    let disasm_start_rva = target_rva.saturating_sub(offset_diff);
-    let disasm_slice = &pe.data[disasm_start..std::cmp::min(file_offset + 500, pe.data.len())];
-    
-    let x64_instrs = disassemble_x64_simple(disasm_slice, 200);
+    let code_slice_large = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
+    let x64_instrs = disassemble_x64_simple(code_slice_large, 100);
     
     if x64_instrs.is_empty() {
         return Err(PEError::InvalidPE("Failed to disassemble any instructions".to_string()));
     }
     
-    let target_offset_in_slice = (file_offset - disasm_start) as usize;
-    
-    let (mut bytecode, label_map) = lift_to_vm_bytecode_with_map(&x64_instrs, disasm_start_rva);
-    
-    let main_vm_offset = label_map.get(&target_offset_in_slice).copied().unwrap_or(0);
+    let mut bytecode = lift_to_vm_bytecode(&x64_instrs, target_rva);
     
     bytecode.push(OpCode::LoadImm as u8);
     bytecode.push(0);
@@ -109,12 +101,7 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
     bytecode.push(OpCode::Exit as u8);
     bytecode.push(0);
     
-    let mut final_bytecode = Vec::new();
-    final_bytecode.push(OpCode::Jmp as u8);
-    final_bytecode.extend_from_slice(&(main_vm_offset as u64 + 9).to_le_bytes());
-    final_bytecode.extend_from_slice(&bytecode);
-    
-    Ok(final_bytecode)
+    Ok(bytecode)
 }
 
 fn calculate_vm_offset(prefix_instrs: &[X64Instruction], _main_instrs: &[X64Instruction]) -> u64 {
