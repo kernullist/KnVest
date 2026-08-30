@@ -1,5 +1,5 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode, lift_to_vm_bytecode_with_map, X64Instruction, X64InstrKind};
+use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode_for_main, X64Instruction, X64InstrKind};
 use crate::vm::OpCode;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
@@ -71,35 +71,37 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     Ok(pe.entry_point_rva)
 }
 
-fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -> PEResult<Vec<u8>> {
+fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
     
     if file_offset + 200 > pe.data.len() {
         return Err(PEError::InvalidPE("Code section too small".to_string()));
     }
     
-    let code_slice = &pe.data[file_offset..std::cmp::min(file_offset + 100, pe.data.len())];
-    
     if is_simple_hello_pattern(pe, target_rva) {
         eprintln!("Detected hello.c, using special path");
         return translate_hello_path();
     }
     
-    let code_slice_large = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
-    let x64_instrs = disassemble_x64_simple(code_slice_large, 100);
+    let lookback_start = if file_offset >= 512 { file_offset - 512 } else { 0 };
+    let code_slice_large = &pe.data[lookback_start..std::cmp::min(file_offset + 500, pe.data.len())];
+    let all_instrs = disassemble_x64_simple(code_slice_large, 500);
+    
+    let main_start_offset = file_offset - lookback_start;
+    
+    let (main_instrs, callee_instrs): (Vec<_>, Vec<_>) = all_instrs.into_iter()
+        .partition(|instr| instr.offset >= main_start_offset);
+    
+    let mut x64_instrs = main_instrs;
+    x64_instrs.extend(callee_instrs);
     
     if x64_instrs.is_empty() {
         return Err(PEError::InvalidPE("Failed to disassemble any instructions".to_string()));
     }
     
-    let mut bytecode = lift_to_vm_bytecode(&x64_instrs, target_rva);
+    let main_x64_offset = x64_instrs.first().unwrap().offset;
     
-    bytecode.push(OpCode::LoadImm as u8);
-    bytecode.push(0);
-    bytecode.extend_from_slice(&0u64.to_le_bytes());
-    
-    bytecode.push(OpCode::Exit as u8);
-    bytecode.push(0);
+    let bytecode = lift_to_vm_bytecode_for_main(&x64_instrs, target_rva, main_x64_offset);
     
     Ok(bytecode)
 }
@@ -564,12 +566,14 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x78, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);
     let bc_base_lea_call = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x29, 0xF6]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x29, 0xCE]);
     stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x28, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x78, 0xFF, 0xFF, 0xFF]);
+    let bc_base_lea_call2 = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
     stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
     let dispatch_back_call = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
@@ -753,6 +757,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((bc_base_lea_jmp + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_jmpif + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_call2 + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
@@ -954,10 +959,13 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
                 let mut bytecode_end = bytecode_start;
                 
                 while bytecode_end < section_data.len() {
-                    if bytecode_end + 1 < section_data.len() 
-                        && section_data[bytecode_end] == OpCode::Exit as u8 {
-                        bytecode_end += 2;
-                        break;
+                    let byte = section_data[bytecode_end];
+                    if byte == 0xCC || byte == 0x00 {
+                        let rest_is_padding = section_data[bytecode_end..].iter()
+                            .all(|&b| b == 0xCC || b == 0x00);
+                        if rest_is_padding {
+                            break;
+                        }
                     }
                     bytecode_end += 1;
                 }
