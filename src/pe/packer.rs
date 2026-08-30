@@ -357,41 +357,45 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x3C, 0xFF]);
     let exit_jmp = stub.len();
-    stub.extend_from_slice(&[0x74, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     
     stub.extend_from_slice(&[0x3C, 0x01]);
     let load_imm_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-    let dispatch_back1 = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
-    stub.extend_from_slice(&[0xEB, dispatch_back1 as u8]);
+    let dispatch_back1 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back1.to_le_bytes());
     
     let load_imm_target = stub.len();
-    stub[load_imm_jmp + 1] = (load_imm_target as i8).wrapping_sub((load_imm_jmp + 2) as i8) as u8;
+    let load_imm_offset = (load_imm_target as i32).wrapping_sub((load_imm_jmp + 6) as i32);
+    stub[load_imm_jmp + 2..load_imm_jmp + 6].copy_from_slice(&load_imm_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x04]);
     let move_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-    let dispatch_back_move = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
-    stub.extend_from_slice(&[0xEB, dispatch_back_move as u8]);
+    let dispatch_back_move = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_move.to_le_bytes());
     
     let move_target = stub.len();
-    stub[move_jmp + 1] = (move_target as i8).wrapping_sub((move_jmp + 2) as i8) as u8;
+    let move_offset = (move_target as i32).wrapping_sub((move_jmp + 6) as i32);
+    stub[move_jmp + 2..move_jmp + 6].copy_from_slice(&move_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x05]);
     let add_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
@@ -401,15 +405,17 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
     stub.extend_from_slice(&[0x48, 0x03, 0x44, 0xD5, 0x80]);
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-    let dispatch_back_add = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
-    stub.extend_from_slice(&[0xEB, dispatch_back_add as u8]);
+    let dispatch_back_add = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_add.to_le_bytes());
     
     let add_target = stub.len();
-    stub[add_jmp + 1] = (add_target as i8).wrapping_sub((add_jmp + 2) as i8) as u8;
+    let add_offset = (add_target as i32).wrapping_sub((add_jmp + 6) as i32);
+    stub[add_jmp + 2..add_jmp + 6].copy_from_slice(&add_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x06]);
     let sub_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
@@ -419,15 +425,17 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
     stub.extend_from_slice(&[0x48, 0x2B, 0x44, 0xD5, 0x80]);
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-    let dispatch_back_sub = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
-    stub.extend_from_slice(&[0xEB, dispatch_back_sub as u8]);
+    let dispatch_back_sub = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_sub.to_le_bytes());
     
     let sub_target = stub.len();
-    stub[sub_jmp + 1] = (sub_target as i8).wrapping_sub((sub_jmp + 2) as i8) as u8;
+    let sub_offset = (sub_target as i32).wrapping_sub((sub_jmp + 6) as i32);
+    stub[sub_jmp + 2..sub_jmp + 6].copy_from_slice(&sub_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x07]);
     let mul_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
@@ -437,15 +445,17 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
     stub.extend_from_slice(&[0x48, 0x0F, 0xAF, 0x44, 0xD5, 0x80]);
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-    let dispatch_back_mul = (dispatch_loop as i8).wrapping_sub((stub.len() + 2) as i8);
-    stub.extend_from_slice(&[0xEB, dispatch_back_mul as u8]);
+    let dispatch_back_mul = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_mul.to_le_bytes());
     
     let mul_target = stub.len();
-    stub[mul_jmp + 1] = (mul_target as i8).wrapping_sub((mul_jmp + 2) as i8) as u8;
+    let mul_offset = (mul_target as i32).wrapping_sub((mul_jmp + 6) as i32);
+    stub[mul_jmp + 2..mul_jmp + 6].copy_from_slice(&mul_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x09]);
     let cmp_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);
@@ -472,11 +482,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_cmp.to_le_bytes());
     
     let cmp_target = stub.len();
-    stub[cmp_jmp + 1] = (cmp_target as i8).wrapping_sub((cmp_jmp + 2) as i8) as u8;
+    let cmp_offset = (cmp_target as i32).wrapping_sub((cmp_jmp + 6) as i32);
+    stub[cmp_jmp + 2..cmp_jmp + 6].copy_from_slice(&cmp_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x0A]);
     let jmp_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
     let bc_base_lea_jmp = stub.len();
@@ -488,11 +499,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_jmp.to_le_bytes());
     
     let jmp_target = stub.len();
-    stub[jmp_jmp + 1] = (jmp_target as i8).wrapping_sub((jmp_jmp + 2) as i8) as u8;
+    let jmp_offset = (jmp_target as i32).wrapping_sub((jmp_jmp + 6) as i32);
+    stub[jmp_jmp + 2..jmp_jmp + 6].copy_from_slice(&jmp_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x0B]);
     let jmpif_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
@@ -564,11 +576,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_call.to_le_bytes());
     
     let call_target = stub.len();
-    stub[call_jmp + 1] = (call_target as i8).wrapping_sub((call_jmp + 2) as i8) as u8;
+    let call_offset = (call_target as i32).wrapping_sub((call_jmp + 6) as i32);
+    stub[call_jmp + 2..call_jmp + 6].copy_from_slice(&call_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x0D]);
     let ret_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x28, 0xFF, 0xFF, 0xFF]);
     let bc_base_lea_ret = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
@@ -579,11 +592,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_ret.to_le_bytes());
     
     let ret_target = stub.len();
-    stub[ret_jmp + 1] = (ret_target as i8).wrapping_sub((ret_jmp + 2) as i8) as u8;
+    let ret_offset = (ret_target as i32).wrapping_sub((ret_jmp + 6) as i32);
+    stub[ret_jmp + 2..ret_jmp + 6].copy_from_slice(&ret_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x0E]);
     let native_call_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     
     stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
@@ -591,7 +605,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x01]);
     let native_call_func1_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     
     stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
     let bc_base_lea = stub.len();
@@ -612,7 +626,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back3.to_le_bytes());
     
     let native_call_func1_target = stub.len();
-    stub[native_call_func1_jmp + 1] = (native_call_func1_target as i8).wrapping_sub((native_call_func1_jmp + 2) as i8) as u8;
+    let native_call_func1_offset = (native_call_func1_target as i32).wrapping_sub((native_call_func1_jmp + 6) as i32);
+    stub[native_call_func1_jmp + 2..native_call_func1_jmp + 6].copy_from_slice(&native_call_func1_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
     stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
@@ -660,11 +675,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_func2.to_le_bytes());
     
     let native_call_target = stub.len();
-    stub[native_call_jmp + 1] = (native_call_target as i8).wrapping_sub((native_call_jmp + 2) as i8) as u8;
+    let native_call_offset = (native_call_target as i32).wrapping_sub((native_call_jmp + 6) as i32);
+    stub[native_call_jmp + 2..native_call_jmp + 6].copy_from_slice(&native_call_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x0F]);
     let push_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
@@ -674,11 +690,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_push.to_le_bytes());
     
     let push_target = stub.len();
-    stub[push_jmp + 1] = (push_target as i8).wrapping_sub((push_jmp + 2) as i8) as u8;
+    let push_offset = (push_target as i32).wrapping_sub((push_jmp + 6) as i32);
+    stub[push_jmp + 2..push_jmp + 6].copy_from_slice(&push_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x3C, 0x10]);
     let pop_jmp = stub.len();
-    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x20, 0xFF, 0xFF, 0xFF]);
@@ -688,10 +705,12 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&dispatch_back_pop.to_le_bytes());
     
     let pop_target = stub.len();
-    stub[pop_jmp + 1] = (pop_target as i8).wrapping_sub((pop_jmp + 2) as i8) as u8;
+    let pop_offset = (pop_target as i32).wrapping_sub((pop_jmp + 6) as i32);
+    stub[pop_jmp + 2..pop_jmp + 6].copy_from_slice(&pop_offset.to_le_bytes());
     
     let exit_target = stub.len();
-    stub[exit_jmp + 1] = (exit_target as i8).wrapping_sub((exit_jmp + 2) as i8) as u8;
+    let exit_offset = (exit_target as i32).wrapping_sub((exit_jmp + 6) as i32);
+    stub[exit_jmp + 2..exit_jmp + 6].copy_from_slice(&exit_offset.to_le_bytes());
     
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
