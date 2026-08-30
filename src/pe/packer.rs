@@ -452,6 +452,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     let bc_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    // Cache bytecode base (opcode 0) for LoadByte — free slot [rbp-0x118]
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x118], rsi
     
     let dispatch_loop = stub.len();
     stub.extend_from_slice(&[0x0F, 0xB6, 0x06]);
@@ -789,42 +791,38 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let native_call_func3_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]); // je func3 (putchar)
     
-    // func2: integer printer (printf-style digit + newline from r2)
-    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
-    stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
+    // func2: integer printer (printf-style digits + newline from r2)
+    stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]); // mov rax, [rbp-0x90] (r2)
+    stub.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    stub.extend_from_slice(&[0x4C, 0x8D, 0xBD, 0x10, 0xFF, 0xFF, 0xFF]); // lea r15, [rbp-0xF0]
+    stub.extend_from_slice(&[0x48, 0x8D, 0x7F, 0x0A]); // lea rdi, [r15+10]
     
-    stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x0A]);
-    let single_digit_jmp = stub.len();
-    stub.extend_from_slice(&[0x73, 0x00]);
+    let digit_loop = stub.len();
+    stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+    stub.extend_from_slice(&[0x48, 0x89, 0xD8]); // mov rax, rbx
+    stub.extend_from_slice(&[0x49, 0xBA, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // mov r10, 10
+    stub.extend_from_slice(&[0x49, 0xF7, 0xF2]); // div r10
+    stub.extend_from_slice(&[0x80, 0xC2, 0x30]); // add dl, 0x30
+    stub.extend_from_slice(&[0x88, 0x17]); // mov [rdi], dl
+    stub.extend_from_slice(&[0x49, 0x89, 0xFC]); // mov r12, rdi
+    stub.extend_from_slice(&[0x48, 0xFF, 0xCF]); // dec rdi
+    stub.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+    stub.extend_from_slice(&[0x48, 0x85, 0xDB]); // test rbx, rbx
+    let digit_loop_back = (digit_loop as i32).wrapping_sub((stub.len() + 2) as i32);
+    stub.extend_from_slice(&[0x75, digit_loop_back as u8]); // jnz digit_loop
     
-    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
-    stub.extend_from_slice(&[0x88, 0x01]);
-    stub.extend_from_slice(&[0xC6, 0x41, 0x01, 0x0A]);
-    stub.extend_from_slice(&[0x41, 0xB8, 0x02, 0x00, 0x00, 0x00]);
-    let after_single_digit = stub.len();
-    stub.extend_from_slice(&[0xEB, 0x00]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi (buffer start)
+    stub.extend_from_slice(&[0x4C, 0x89, 0xE1]); // mov rcx, r12
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    stub.extend_from_slice(&[0xC6, 0x01, 0x0A]); // mov byte [rcx], 0x0A
+    stub.extend_from_slice(&[0x48, 0x89, 0xFA]); // mov rdx, rdi
+    stub.extend_from_slice(&[0x4C, 0x89, 0xE0]); // mov rax, r12
+    stub.extend_from_slice(&[0x48, 0x29, 0xF8]); // sub rax, rdi
+    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x02]); // add rax, 2
+    stub.extend_from_slice(&[0x49, 0x89, 0xC0]); // mov r8, rax
     
-    let two_digit_target = stub.len();
-    stub[single_digit_jmp + 1] = (two_digit_target as i8).wrapping_sub((single_digit_jmp + 2) as i8) as u8;
-    
-    stub.extend_from_slice(&[0x48, 0x89, 0xC2]);
-    stub.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xD3]);
-    stub.extend_from_slice(&[0x48, 0x31, 0xD2]);
-    stub.extend_from_slice(&[0x48, 0xF7, 0xF3]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC2, 0x30]);
-    stub.extend_from_slice(&[0x88, 0x51, 0x01]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
-    stub.extend_from_slice(&[0x88, 0x01]);
-    stub.extend_from_slice(&[0xC6, 0x41, 0x02, 0x0A]);
-    stub.extend_from_slice(&[0x41, 0xB8, 0x03, 0x00, 0x00, 0x00]);
-    
-    let after_two_digit = stub.len();
-    stub[after_single_digit + 1] = (after_two_digit as i8).wrapping_sub((after_single_digit + 2) as i8) as u8;
-    
-    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x8D, 0x95, 0x10, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]); // mov rcx, stdout
+    stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]); // lea r9, bytes written
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
     stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
@@ -927,11 +925,9 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);  // movzx edi, byte [rsi]  ; src register
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
-    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; get src value
-    let bc_base_lea_loadbyte = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);  // lea rdx, [rip + bc_base]
-    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);  // add rax, rdx  ; rax = absolute address
-    stub.extend_from_slice(&[0x0F, 0xB6, 0x00]);  // movzx eax, byte [rax]  ; load the byte
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; bytecode offset
+    stub.extend_from_slice(&[0x48, 0x03, 0x85, 0xE8, 0xFE, 0xFF, 0xFF]);  // add rax, [rbp-0x118]  ; + opcode-0 base from bc_lea
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x00]);  // movzx eax, byte [rax]
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp + rcx*8 - 0x80], rax  ; store to dst
     let dispatch_back_load_byte = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
@@ -987,7 +983,6 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_call2 + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
-    patches.push((bc_base_lea_loadbyte + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
         let target = if target_str == "BYTECODE" {
@@ -1360,12 +1355,22 @@ mod tests {
     }
 
     #[test]
-    fn test_loadbyte_lea_patch_points_at_bytecode() {
+    fn test_loadbyte_uses_cached_bytecode_base() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
-        let lea_pattern = [0x48u8, 0x8D, 0x15];
-        let mut found = false;
+        let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
+        assert!(
+            stub.windows(cache_store.len()).any(|w| w == cache_store),
+            "bc_lea must cache bytecode base at [rbp-0x118]"
+        );
+        let loadbyte_add = [0x48u8, 0x03, 0x85, 0xE8, 0xFE, 0xFF, 0xFF];
+        assert!(
+            stub.windows(loadbyte_add.len()).any(|w| w == loadbyte_add),
+            "LoadByte must add offset to cached bytecode base"
+        );
+        let lea_pattern = [0x48u8, 0x8D, 0x35];
+        let mut bc_lea_found = false;
         for i in 0..stub.len().saturating_sub(7) {
             if stub[i..i + 3] != lea_pattern {
                 continue;
@@ -1378,11 +1383,11 @@ mod tests {
             ]);
             let target = (i + 7) as i32 + disp;
             if target as usize == bytecode_offset {
-                found = true;
+                bc_lea_found = true;
                 break;
             }
         }
-        assert!(found, "LoadByte lea rdx,[rip+bytecode] must patch to VMBC+4");
+        assert!(bc_lea_found, "bc_lea must patch to opcode 0 (VMBC+4)");
     }
 
     #[test]
