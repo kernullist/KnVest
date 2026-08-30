@@ -59,10 +59,66 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x40, 0x10]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x58, 0x30]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x48, 0x10]);
+    
+    let k32_str_lea = stub.len();
+    stub.extend_from_slice(&[0x4C, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
+    
+    let module_loop = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8B, 0x09]);
+    stub.extend_from_slice(&[0x48, 0x39, 0xC8]);
+    let module_fail_jmp = stub.len();
+    stub.extend_from_slice(&[0x74, 0x00]);
+    
+    stub.extend_from_slice(&[0x48, 0x8B, 0x71, 0x60]);
+    stub.extend_from_slice(&[0x4D, 0x89, 0xD0]);
+    stub.extend_from_slice(&[0xB2, 0x0D]);
+    
+    let name_cmp_loop = stub.len();
+    stub.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB7, 0x16]);
+    stub.extend_from_slice(&[0x83, 0xF8, 0x41]);
+    let lowercase1_skip = stub.len();
+    stub.extend_from_slice(&[0x72, 0x00]);
+    stub.extend_from_slice(&[0x83, 0xF8, 0x5A]);
+    let lowercase1_skip2 = stub.len();
+    stub.extend_from_slice(&[0x77, 0x00]);
+    stub.extend_from_slice(&[0x83, 0xC8, 0x20]);
+    let lowercase1_done = stub.len();
+    stub[lowercase1_skip + 1] = (lowercase1_done as i8).wrapping_sub((lowercase1_skip + 2) as i8) as u8;
+    stub[lowercase1_skip2 + 1] = (lowercase1_done as i8).wrapping_sub((lowercase1_skip2 + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x83, 0xFA, 0x41]);
+    let lowercase2_skip = stub.len();
+    stub.extend_from_slice(&[0x72, 0x00]);
+    stub.extend_from_slice(&[0x83, 0xFA, 0x5A]);
+    let lowercase2_skip2 = stub.len();
+    stub.extend_from_slice(&[0x77, 0x00]);
+    stub.extend_from_slice(&[0x83, 0xCA, 0x20]);
+    let lowercase2_done = stub.len();
+    stub[lowercase2_skip + 1] = (lowercase2_done as i8).wrapping_sub((lowercase2_skip + 2) as i8) as u8;
+    stub[lowercase2_skip2 + 1] = (lowercase2_done as i8).wrapping_sub((lowercase2_skip2 + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x39, 0xD0]);
+    let name_cmp_fail = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x85, 0xC0]);
+    let name_cmp_done = stub.len();
+    stub.extend_from_slice(&[0x74, 0x00]);
+    stub.extend_from_slice(&[0x49, 0x83, 0xC0, 0x02]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x02]);
+    stub.extend_from_slice(&[0xFE, 0xCA]);
+    let name_cmp_back = (name_cmp_loop as i8).wrapping_sub((stub.len() + 2) as i8);
+    stub.extend_from_slice(&[0x75, name_cmp_back as u8]);
+    
+    let name_cmp_fail_target = stub.len();
+    stub[name_cmp_fail + 1] = (name_cmp_fail_target as i8).wrapping_sub((name_cmp_fail + 2) as i8) as u8;
+    let module_back = (module_loop as i8).wrapping_sub((stub.len() + 2) as i8);
+    stub.extend_from_slice(&[0xEB, module_back as u8]);
+    
+    let name_cmp_done_target = stub.len();
+    stub[name_cmp_done + 1] = (name_cmp_done_target as i8).wrapping_sub((name_cmp_done + 2) as i8) as u8;
+    stub.extend_from_slice(&[0x48, 0x8B, 0x59, 0x30]);
     
     stub.extend_from_slice(&[0x8B, 0x43, 0x3C]);
     stub.extend_from_slice(&[0x8B, 0x84, 0x18, 0x88, 0x00, 0x00, 0x00]);
@@ -110,6 +166,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     let search_fail_target = stub.len();
     stub[search_fail_jmp + 1] = (search_fail_target as i8).wrapping_sub((search_fail_jmp + 2) as i8) as u8;
+    stub[module_fail_jmp + 1] = (search_fail_target as i8).wrapping_sub((module_fail_jmp + 2) as i8) as u8;
     stub.extend_from_slice(&[0xCC]);
     
     stub.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x71]);
@@ -206,6 +263,14 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
     stub.extend_from_slice(&[0xFF, 0x95, 0x58, 0xFF, 0xFF, 0xFF]);
     
+    let k32_str_pos = stub.len();
+    stub.extend_from_slice(&[
+        0x6B, 0x00, 0x65, 0x00, 0x72, 0x00, 0x6E, 0x00,
+        0x65, 0x00, 0x6C, 0x00, 0x33, 0x00, 0x32, 0x00,
+        0x2E, 0x00, 0x64, 0x00, 0x6C, 0x00, 0x6C, 0x00,
+        0x00, 0x00,
+    ]);
+    
     let gpa_str_pos = stub.len();
     stub.extend_from_slice(b"GetProcAddress\0");
     let gsth_str_pos = stub.len();
@@ -222,6 +287,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(b"VMBC");
     let bytecode_offset = stub.len();
     
+    patches.push((k32_str_lea + 3, format!("{}", k32_str_pos)));
     patches.push((gpa_str_lea + 3, format!("{}", gpa_str_pos)));
     patches.push((gsth_lea + 3, format!("{}", gsth_str_pos)));
     patches.push((wf_lea + 3, format!("{}", wf_str_pos)));
