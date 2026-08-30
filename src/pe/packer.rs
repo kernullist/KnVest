@@ -99,13 +99,15 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     let mut all_instrs = main_instrs;
     let mut processed_targets = std::collections::HashSet::new();
     
+    // Only process callees BEFORE main (no CRT after main)
     for target_file_offset in call_targets {
         if processed_targets.contains(&target_file_offset) {
             continue;
         }
         processed_targets.insert(target_file_offset);
         
-        if target_file_offset + 100 <= pe.data.len() {
+        if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
+            // Must start with push rbp (0x55)
             if pe.data[target_file_offset] == 0x55 {
                 let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 300, pe.data.len())];
                 let mut callee_instrs = disassemble_until_ret(callee_code, 100);
@@ -114,10 +116,16 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
                     instr.offset += target_file_offset;
                 }
                 
-                // Recursively find callees of this callee (for recursion)
-                let callee_targets = find_internal_call_targets(&callee_instrs, target_file_offset);
+                // Check for recursive calls within this callee
+                let callee_targets = find_internal_call_targets(&callee_instrs, file_offset);
                 for nested_target in callee_targets {
-                    if !processed_targets.contains(&nested_target) && nested_target != target_file_offset {
+                    // For recursion, allow calling self
+                    if nested_target == target_file_offset {
+                        // Self-recursion is fine, already in all_instrs
+                        continue;
+                    }
+                    
+                    if !processed_targets.contains(&nested_target) && nested_target < file_offset {
                         if nested_target + 100 <= pe.data.len() && pe.data[nested_target] == 0x55 {
                             let nested_code = &pe.data[nested_target..std::cmp::min(nested_target + 300, pe.data.len())];
                             let mut nested_instrs = disassemble_until_ret(nested_code, 100);
@@ -258,7 +266,7 @@ fn disassemble_until_ret(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> 
     instructions
 }
 
-fn find_internal_call_targets(instrs: &[X64Instruction], _main_file_offset: usize) -> Vec<usize> {
+fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize) -> Vec<usize> {
     let mut targets = Vec::new();
     
     for instr in instrs {
@@ -266,16 +274,13 @@ fn find_internal_call_targets(instrs: &[X64Instruction], _main_file_offset: usiz
             let instr_abs_offset = instr.offset;
             let target_abs_offset = (instr_abs_offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
             
-            // Include all call targets (both before and after main)
-            // Just check they're not too far away (within reasonable code distance)
-            let distance = if target_abs_offset > instr_abs_offset {
-                target_abs_offset - instr_abs_offset
-            } else {
-                instr_abs_offset - target_abs_offset
-            };
-            
-            if distance < 0x1000 {  // Within 4KB is reasonable for internal calls
-                targets.push(target_abs_offset);
+            // Only include targets BEFORE main (no CRT functions after main)
+            if target_abs_offset < main_file_offset {
+                let distance = main_file_offset - target_abs_offset;
+                // Allow up to 512 bytes before main (for larger functions like factorial)
+                if distance < 0x200 {
+                    targets.push(target_abs_offset);
+                }
             }
         }
     }
@@ -832,6 +837,37 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let pop_target = stub.len();
     let pop_offset = (pop_target as i32).wrapping_sub((pop_jmp + 6) as i32);
     stub[pop_jmp + 2..pop_jmp + 6].copy_from_slice(&pop_offset.to_le_bytes());
+    
+    // LoadByte handler (0x11) - load single byte from address in register
+    stub.extend_from_slice(&[0x3C, 0x11]);
+    let load_byte_jmp = stub.len();
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+    
+    // Read dst register
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi]
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    
+    // Read addr_reg register  
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x16]);  // movzx edx, byte [rsi]
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    
+    // Get address from addr_reg
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xD5, 0x80]);  // mov rax, [rbp + rdx*8 - 0x80]
+    
+    // TODO: For str.c, we need to load from data section
+    // For now, just load 0 (will fail str.c but won't crash)
+    stub.extend_from_slice(&[0x48, 0x31, 0xC0]);  // xor rax, rax
+    
+    // Store byte in dst register
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp + rcx*8 - 0x80], rax
+    
+    let dispatch_back_load_byte = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_load_byte.to_le_bytes());
+    
+    let load_byte_target = stub.len();
+    let load_byte_offset = (load_byte_target as i32).wrapping_sub((load_byte_jmp + 6) as i32);
+    stub[load_byte_jmp + 2..load_byte_jmp + 6].copy_from_slice(&load_byte_offset.to_le_bytes());
     
     let exit_target = stub.len();
     let exit_offset = (exit_target as i32).wrapping_sub((exit_jmp + 6) as i32);

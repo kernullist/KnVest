@@ -1233,8 +1233,8 @@ pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32
             },
             X64InstrKind::Ret => bytecode_offset += 1,
             X64InstrKind::Push { .. } | X64InstrKind::Pop { .. } => bytecode_offset += 2,
+            X64InstrKind::MovzxByte { .. } => bytecode_offset += 1 + 1 + 1,
             X64InstrKind::LeaRipRel { .. } |
-            X64InstrKind::MovzxByte { .. } |
             X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
                 // Don't add to bytecode offset - these are ignored
             },
