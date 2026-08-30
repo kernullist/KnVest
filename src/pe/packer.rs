@@ -112,37 +112,37 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x71]);
     stub.extend_from_slice(&[0x8B, 0x04, 0x82]);
     stub.extend_from_slice(&[0x48, 0x01, 0xD8]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xC0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x40, 0xFF, 0xFF, 0xFF]);
     
     stub.extend_from_slice(&[0x48, 0x89, 0xD9]);
     let gsth_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
-    stub.extend_from_slice(&[0xFF, 0x55, 0xC0]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xB8]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x48, 0xFF, 0xFF, 0xFF]);
     
     stub.extend_from_slice(&[0x48, 0x89, 0xD9]);
     let wf_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
-    stub.extend_from_slice(&[0xFF, 0x55, 0xC0]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xB0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x50, 0xFF, 0xFF, 0xFF]);
     
     stub.extend_from_slice(&[0x48, 0x89, 0xD9]);
     let ep_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
-    stub.extend_from_slice(&[0xFF, 0x55, 0xC0]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xA8]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x58, 0xFF, 0xFF, 0xFF]);
     
     stub.extend_from_slice(&[0x48, 0xC7, 0xC1, 0xF5, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
-    stub.extend_from_slice(&[0xFF, 0x55, 0xB8]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x48, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xA0]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x60, 0xFF, 0xFF, 0xFF]);
     
     let bc_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
@@ -175,9 +175,9 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x75, dispatch_back2 as u8]);
     
     stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
-    stub.extend_from_slice(&[0x48, 0x89, 0x75, 0xA8]);
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
     
-    stub.extend_from_slice(&[0x48, 0x8B, 0x4D, 0xA0]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
     let bc_base_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x80]);
@@ -187,11 +187,11 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
     stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0xFF, 0x55, 0xB0]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x50, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
     
-    stub.extend_from_slice(&[0x48, 0x8B, 0x75, 0xA8]);
-    let dispatch_back3 = (dispatch_loop as i16).wrapping_sub((stub.len() + 2) as i16);
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
+    let dispatch_back3 = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back3.to_le_bytes());
     
@@ -201,7 +201,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
-    stub.extend_from_slice(&[0xFF, 0x55, 0xA8]);
+    stub.extend_from_slice(&[0xFF, 0x95, 0x58, 0xFF, 0xFF, 0xFF]);
     
     let gpa_str_pos = stub.len();
     stub.extend_from_slice(b"GetProcAddress\0");
@@ -538,6 +538,41 @@ mod tests {
         
         let bytecode = extract_bytecode_from_packed(&pe);
         assert!(bytecode.is_ok(), "Should extract bytecode from packed PE with overlay");
+    }
+    
+    #[test]
+    fn test_stub_encoding_correctness() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        
+        let mut i = 0;
+        while i < stub.len() {
+            if stub[i] == 0xE9 {
+                assert!(i + 5 <= stub.len(), "E9 (jmp rel32) at offset {} must have 4 bytes following", i);
+                i += 1;
+                continue;
+            }
+            
+            if i + 3 < stub.len() {
+                let b0 = stub[i];
+                let b1 = stub[i + 1];
+                let b2 = stub[i + 2];
+                let disp8 = stub[i + 3];
+                
+                if (b0 == 0x48 || b0 == 0x4C) && 
+                   (b1 == 0x89 || b1 == 0x8B || b1 == 0x8D || b1 == 0xFF) &&
+                   (b2 == 0x45 || b2 == 0x4D || b2 == 0x55 || b2 == 0x5D) {
+                    let known_api_offsets = [0xC0, 0xB8, 0xB0, 0xA8, 0xA0, 0xD0];
+                    if known_api_offsets.contains(&disp8) {
+                        panic!(
+                            "Invalid disp8 encoding at offset {}: {:02X} {:02X} {:02X} {:02X} (API offset 0x{:02X} requires disp32)",
+                            i, b0, b1, b2, disp8, disp8
+                        );
+                    }
+                }
+            }
+            
+            i += 1;
+        }
     }
 
     #[test]
