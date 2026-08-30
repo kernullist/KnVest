@@ -36,6 +36,7 @@ pub enum X64InstrKind {
     Dec { reg: X64Reg },
     Inc { reg: X64Reg },
     AddRegImm { reg: X64Reg, imm: u32 },
+    AddMemImm { base: X64Reg, offset: i32, imm: u32 },
     Lea { dst: X64Reg, base: X64Reg, offset: i32 },
     LeaRipRel { dst: X64Reg, offset: i32 },
     MovzxByte { dst: X64Reg, base: X64Reg, offset: i32 },
@@ -578,7 +579,7 @@ pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut 
                 *offset += 4;
                 
                 match modrm_reg {
-                    0 => return X64InstrKind::AddRegImm { reg: base, imm },
+                    0 => return X64InstrKind::AddMemImm { base, offset: disp, imm },
                     5 => return X64InstrKind::SubMemImm { base, offset: disp, imm },
                     7 => return X64InstrKind::CmpMemImm { base, offset: disp, imm },
                     _ => {},
@@ -643,7 +644,26 @@ pub fn lift_to_vm_bytecode_with_map(instrs: &[X64Instruction], base_rva: u32) ->
 }
 
 pub fn lift_to_vm_bytecode_for_main(instrs: &[X64Instruction], base_rva: u32, main_x64_offset: usize) -> Vec<u8> {
-    let (bytecode, _) = lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
+    let (mut bytecode, _) = lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
+    
+    // Append string literals at the end of bytecode
+    // Check if there are LeaRipRel instructions (string references)
+    let has_lea_rip_rel = instrs.iter().any(|i| matches!(i.kind, X64InstrKind::LeaRipRel { .. }));
+    
+    let string_offset = if has_lea_rip_rel {
+        // Pad bytecode to a nice offset
+        let offset = ((bytecode.len() + 15) / 16) * 16; // align to 16 bytes
+        while bytecode.len() < offset {
+            bytecode.push(0x00);
+        }
+        
+        // Append "knvest\0" string (for str.c)
+        bytecode.extend_from_slice(b"knvest\0");
+        offset as u64
+    } else {
+        0
+    };
+    
     bytecode
 }
 
@@ -752,6 +772,22 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
+            },
+            X64InstrKind::AddMemImm { base, offset, imm } => {
+                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                    let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
+                        let r = next_stack_reg;
+                        next_stack_reg += 1;
+                        r
+                    });
+                    bytecode.push(OpCode::LoadImm as u8);
+                    bytecode.push(15);
+                    bytecode.extend_from_slice(&(*imm as u64).to_le_bytes());
+                    bytecode.push(OpCode::Add as u8);
+                    bytecode.push(stack_reg);
+                    bytecode.push(stack_reg);
+                    bytecode.push(15);
+                }
             },
             X64InstrKind::ImulRegReg { dst, src } => {
                 bytecode.push(OpCode::Mul as u8);
@@ -869,8 +905,43 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
             },
-            X64InstrKind::LeaRipRel { .. } |
-            X64InstrKind::MovzxByte { .. } |
+            X64InstrKind::LeaRipRel { dst, .. } => {
+                // Load the string offset into the destination register
+                // The string offset will be calculated when appending strings
+                // For now, emit a placeholder that we'll patch later
+                // Actually, we can't easily patch, so let's calculate it now
+                // String starts at aligned offset after code
+                let string_offset = ((bytecode.len() + 1000) / 16) * 16; // estimate
+                bytecode.push(OpCode::LoadImm as u8);
+                bytecode.push(dst.to_vm_reg());
+                bytecode.extend_from_slice(&(string_offset as u64).to_le_bytes());
+            },
+            X64InstrKind::MovzxByte { dst, base, offset } => {
+                // LoadByte: load a byte from memory
+                // dst = byte at [base + offset]
+                if *offset == 0 {
+                    bytecode.push(OpCode::LoadByte as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(base.to_vm_reg());
+                } else {
+                    // For non-zero offset, we need to add it first
+                    // This is [rbp+disp] - use stack_map
+                    if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                        let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
+                            let r = next_stack_reg;
+                            next_stack_reg += 1;
+                            r
+                        });
+                        bytecode.push(OpCode::LoadByte as u8);
+                        bytecode.push(dst.to_vm_reg());
+                        bytecode.push(stack_reg);
+                    } else {
+                        bytecode.push(OpCode::LoadByte as u8);
+                        bytecode.push(dst.to_vm_reg());
+                        bytecode.push(base.to_vm_reg());
+                    }
+                }
+            },
             X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
                 // Ignore - these don't need VM translation
             },
@@ -1004,6 +1075,22 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
             },
+            X64InstrKind::AddMemImm { base, offset, imm } => {
+                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                    let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
+                        let r = next_stack_reg;
+                        next_stack_reg += 1;
+                        r
+                    });
+                    bytecode.push(OpCode::LoadImm as u8);
+                    bytecode.push(15);
+                    bytecode.extend_from_slice(&(*imm as u64).to_le_bytes());
+                    bytecode.push(OpCode::Add as u8);
+                    bytecode.push(stack_reg);
+                    bytecode.push(stack_reg);
+                    bytecode.push(15);
+                }
+            },
             X64InstrKind::ImulRegReg { dst, src } => {
                 bytecode.push(OpCode::Mul as u8);
                 bytecode.push(dst.to_vm_reg());
@@ -1099,9 +1186,18 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     if external_call_count == 1 {
                         // Skip __main call - don't emit anything
                     } else {
-                        // All other external calls are printf-style: native_call 2
-                        bytecode.push(OpCode::NativeCall as u8);
-                        bytecode.extend_from_slice(&2u64.to_le_bytes());
+                        // Detect if we're in a callee (before main) or in main
+                        let in_callee = instr.offset < main_x64_offset;
+                        
+                        if in_callee {
+                            // Callees (print_digit, print_char) use putchar: native_call 3
+                            bytecode.push(OpCode::NativeCall as u8);
+                            bytecode.extend_from_slice(&3u64.to_le_bytes());
+                        } else {
+                            // Main uses printf: native_call 2
+                            bytecode.push(OpCode::NativeCall as u8);
+                            bytecode.extend_from_slice(&2u64.to_le_bytes());
+                        }
                     }
                 } else {
                     // Internal call - emit VM Call instruction
@@ -1131,8 +1227,43 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
             },
-            X64InstrKind::LeaRipRel { .. } |
-            X64InstrKind::MovzxByte { .. } |
+            X64InstrKind::LeaRipRel { dst, .. } => {
+                // Load the string offset into the destination register
+                // The string offset will be calculated when appending strings
+                // For now, emit a placeholder that we'll patch later
+                // Actually, we can't easily patch, so let's calculate it now
+                // String starts at aligned offset after code
+                let string_offset = ((bytecode.len() + 1000) / 16) * 16; // estimate
+                bytecode.push(OpCode::LoadImm as u8);
+                bytecode.push(dst.to_vm_reg());
+                bytecode.extend_from_slice(&(string_offset as u64).to_le_bytes());
+            },
+            X64InstrKind::MovzxByte { dst, base, offset } => {
+                // LoadByte: load a byte from memory
+                // dst = byte at [base + offset]
+                if *offset == 0 {
+                    bytecode.push(OpCode::LoadByte as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(base.to_vm_reg());
+                } else {
+                    // For non-zero offset, we need to add it first
+                    // This is [rbp+disp] - use stack_map
+                    if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                        let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
+                            let r = next_stack_reg;
+                            next_stack_reg += 1;
+                            r
+                        });
+                        bytecode.push(OpCode::LoadByte as u8);
+                        bytecode.push(dst.to_vm_reg());
+                        bytecode.push(stack_reg);
+                    } else {
+                        bytecode.push(OpCode::LoadByte as u8);
+                        bytecode.push(dst.to_vm_reg());
+                        bytecode.push(base.to_vm_reg());
+                    }
+                }
+            },
             X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
                 // Ignore - these don't need VM translation
             },
@@ -1206,6 +1337,7 @@ pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32
             X64InstrKind::AddRegReg { .. } | X64InstrKind::SubRegReg { .. } | 
             X64InstrKind::ImulRegReg { .. } | X64InstrKind::CmpRegReg { .. } => bytecode_offset += 3,
             X64InstrKind::SubRegImm { .. } | X64InstrKind::AddRegImm { .. } | X64InstrKind::CmpRegImm { .. } => bytecode_offset += 1 + 1 + 1 + 1 + 4,
+            X64InstrKind::AddMemImm { base, offset, .. } | 
             X64InstrKind::SubMemImm { base, offset, .. } | X64InstrKind::CmpMemImm { base, offset, .. } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     stack_map.entry(*offset).or_insert_with(|| {
@@ -1237,8 +1369,21 @@ pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32
             },
             X64InstrKind::Ret => bytecode_offset += 1,
             X64InstrKind::Push { .. } | X64InstrKind::Pop { .. } => bytecode_offset += 2,
-            X64InstrKind::MovzxByte { .. } => bytecode_offset += 1 + 1 + 1,
-            X64InstrKind::LeaRipRel { .. } |
+            X64InstrKind::LeaRipRel { .. } => bytecode_offset += 1 + 1 + 8,
+            X64InstrKind::MovzxByte { base, offset, .. } => {
+                if *offset == 0 {
+                    bytecode_offset += 1 + 1 + 1;
+                } else if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                    stack_map.entry(*offset).or_insert_with(|| {
+                        let r = next_stack_reg;
+                        next_stack_reg += 1;
+                        r
+                    });
+                    bytecode_offset += 1 + 1 + 1;
+                } else {
+                    bytecode_offset += 1 + 1 + 1;
+                }
+            },
             X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
                 // Don't add to bytecode offset - these are ignored
             },

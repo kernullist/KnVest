@@ -294,8 +294,11 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x55]);
     stub.extend_from_slice(&[0x48, 0x89, 0xE5]);
-    stub.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x81, 0xEC, 0x00, 0x03, 0x00, 0x00]); // sub rsp, 0x300 (increased for call stack)
     stub.extend_from_slice(&[0x48, 0x83, 0xE4, 0xF0]);
+    
+    // Initialize call stack depth to 0 at [rbp-0xC8]
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xC8], 0
     
     stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
@@ -715,18 +718,28 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0C]);
     let call_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);
+    // Read 8-byte call target from bytecode
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);  // mov rax, [rsi]
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);  // add rsi, 8
+    // Save absolute IP temporarily
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0x98], rsi
+    // Calculate relative return offset
     let bc_base_lea_call = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x48, 0x29, 0xCE]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x28, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00]);  // lea rcx, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x8B, 0xB5, 0x98, 0xFF, 0xFF, 0xFF]);  // mov rsi, [rbp-0x98]
+    stub.extend_from_slice(&[0x48, 0x29, 0xCE]);  // sub rsi, rcx (rsi = return offset)
+    // Load depth from [rbp-0xC8]
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);  // mov rdx, [rbp-0xC8]
+    // Store return offset at [rbp-0x200 + depth*8]
+    stub.extend_from_slice(&[0x48, 0x89, 0xB4, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]);  // mov [rbp + rdx*8 - 0x200], rsi
+    // Increment depth
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC2]);  // inc rdx
+    stub.extend_from_slice(&[0x48, 0x89, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0xC8], rdx
+    // Jump to target
     let bc_base_lea_call2 = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);  // lea rsi, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);  // add rax, rsi (rax = absolute target)
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);  // mov rsi, rax
     let dispatch_back_call = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_call.to_le_bytes());
@@ -738,11 +751,18 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0D]);
     let ret_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x28, 0xFF, 0xFF, 0xFF]);
+    // Load depth from [rbp-0xC8]
+    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);  // mov rax, [rbp-0xC8]
+    // Decrement depth
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC8]);  // dec rax
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);  // mov [rbp-0xC8], rax
+    // Load return offset from [rbp-0x200 + depth*8]
+    stub.extend_from_slice(&[0x48, 0x8B, 0x84, 0xC5, 0x00, 0xFE, 0xFF, 0xFF]);  // mov rax, [rbp + rax*8 - 0x200]
+    // Jump to return offset
     let bc_base_lea_ret = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);  // lea rsi, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x01, 0xF0]);  // add rax, rsi (rax = absolute return address)
+    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);  // mov rsi, rax
     let dispatch_back_ret = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_ret.to_le_bytes());
@@ -894,6 +914,30 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let pop_offset = (pop_target as i32).wrapping_sub((pop_jmp + 6) as i32);
     stub[pop_jmp + 2..pop_jmp + 6].copy_from_slice(&pop_offset.to_le_bytes());
     
+    // LoadByte (0x11): read dst, src_reg; dst = byte at [src_reg]
+    stub.extend_from_slice(&[0x3C, 0x11]);
+    let load_byte_jmp = stub.len();
+    stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi]  ; dst register
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);  // movzx edi, byte [rsi]  ; src register
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; get src value
+    // rax now contains the address to read from
+    // Check if it's in bytecode range or data section
+    let bc_base_lea_loadbyte = stub.len();
+    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);  // lea rdx, [rip + bc_base]
+    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);  // add rax, rdx  ; rax = absolute address
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x00]);  // movzx eax, byte [rax]  ; load the byte
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp + rcx*8 - 0x80], rax  ; store to dst
+    let dispatch_back_load_byte = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_load_byte.to_le_bytes());
+    
+    let load_byte_target = stub.len();
+    let load_byte_offset = (load_byte_target as i32).wrapping_sub((load_byte_jmp + 6) as i32);
+    stub[load_byte_jmp + 2..load_byte_jmp + 6].copy_from_slice(&load_byte_offset.to_le_bytes());
+    
     // LoadByte handler (0x11) - load single byte from address in register
     stub.extend_from_slice(&[0x3C, 0x11]);
     let load_byte_jmp = stub.len();
@@ -971,6 +1015,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_call2 + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea_loadbyte + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
         let target = if target_str == "BYTECODE" {
