@@ -631,7 +631,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x75, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x01]);
     let jmpif_taken2 = stub.len();
-    stub.extend_from_slice(&[0x74, 0x00]);
+    stub.extend_from_slice(&[0x75, 0x00]); // jne taken when flags != 1 (NE)
     let jmpif_nottaken2 = stub.len();
     stub.extend_from_slice(&[0xEB, 0x00]);
     let jmpif_ne_target = stub.len();
@@ -1421,6 +1421,23 @@ mod tests {
             }
         }
         assert!(loadbyte_lea_found, "LoadByte lea rdx must patch to opcode 0 (VMBC+4)");
+    }
+
+    #[test]
+    fn test_jmpif_ne_uses_jne_not_je() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        // cond 2 (NE): cmp rdx,1 must be followed by jne (75), not je (74)
+        let ne_cond = [0x48u8, 0x83, 0xF9, 0x02];
+        let mut found = false;
+        for i in 0..stub.len().saturating_sub(ne_cond.len() + 4) {
+            if stub[i..i + 4] != ne_cond {
+                continue;
+            }
+            assert_eq!(stub[i + 10], 0x75, "JmpIf NE must use jne (0x75), not je (0x74)");
+            found = true;
+            break;
+        }
+        assert!(found, "JmpIf NE (cond 2) handler must exist in stub");
     }
 
     #[test]
