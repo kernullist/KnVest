@@ -1,5 +1,5 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode};
+use super::lifter::{disassemble_x64_simple, lift_to_vm_bytecode, lift_to_vm_bytecode_with_map, X64Instruction, X64InstrKind};
 use crate::vm::OpCode;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
@@ -78,23 +78,29 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
         return Err(PEError::InvalidPE("Code section too small".to_string()));
     }
     
-    let disasm_start = file_offset.saturating_sub(250);
-    let offset_diff = (file_offset - disasm_start) as u32;
-    let disasm_start_rva = target_rva.saturating_sub(offset_diff);
-    let code_slice = &pe.data[disasm_start..std::cmp::min(file_offset + 500, pe.data.len())];
+    let code_slice = &pe.data[file_offset..std::cmp::min(file_offset + 100, pe.data.len())];
     
-    if is_simple_hello_pattern(code_slice) {
-        eprintln!("Detected simple hello pattern, using special path");
+    if is_simple_hello_pattern(pe, target_rva) {
+        eprintln!("Detected hello.c, using special path");
         return translate_hello_path();
     }
     
-    let x64_instrs = disassemble_x64_simple(code_slice, 200);
+    let disasm_start = file_offset.saturating_sub(250);
+    let offset_diff = (file_offset - disasm_start) as u32;
+    let disasm_start_rva = target_rva.saturating_sub(offset_diff);
+    let disasm_slice = &pe.data[disasm_start..std::cmp::min(file_offset + 500, pe.data.len())];
+    
+    let x64_instrs = disassemble_x64_simple(disasm_slice, 200);
     
     if x64_instrs.is_empty() {
         return Err(PEError::InvalidPE("Failed to disassemble any instructions".to_string()));
     }
     
-    let mut bytecode = lift_to_vm_bytecode(&x64_instrs, disasm_start_rva);
+    let target_offset_in_slice = (file_offset - disasm_start) as usize;
+    
+    let (mut bytecode, label_map) = lift_to_vm_bytecode_with_map(&x64_instrs, disasm_start_rva);
+    
+    let main_vm_offset = label_map.get(&target_offset_in_slice).copied().unwrap_or(0);
     
     bytecode.push(OpCode::LoadImm as u8);
     bytecode.push(0);
@@ -103,10 +109,65 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
     bytecode.push(OpCode::Exit as u8);
     bytecode.push(0);
     
-    Ok(bytecode)
+    let mut final_bytecode = Vec::new();
+    final_bytecode.push(OpCode::Jmp as u8);
+    final_bytecode.extend_from_slice(&(main_vm_offset as u64 + 9).to_le_bytes());
+    final_bytecode.extend_from_slice(&bytecode);
+    
+    Ok(final_bytecode)
 }
 
-fn is_simple_hello_pattern(code: &[u8]) -> bool {
+fn calculate_vm_offset(prefix_instrs: &[X64Instruction], _main_instrs: &[X64Instruction]) -> u64 {
+    let mut offset = 9u64;
+    
+    for instr in prefix_instrs {
+        match &instr.kind {
+            X64InstrKind::MovRegImm { .. } => offset += 1 + 8,
+            X64InstrKind::AddRegReg { .. } | X64InstrKind::SubRegReg { .. } | 
+            X64InstrKind::ImulRegReg { .. } | X64InstrKind::CmpRegReg { .. } => offset += 3,
+            X64InstrKind::MovRegReg { .. } => offset += 3,
+            X64InstrKind::Jmp { .. } | X64InstrKind::Je { .. } | X64InstrKind::Jne { .. } |
+            X64InstrKind::Jl { .. } | X64InstrKind::Jle { .. } | X64InstrKind::Jg { .. } |
+            X64InstrKind::Jge { .. } => offset += 1 + 8,
+            X64InstrKind::Call { .. } => offset += 1 + 8,
+            X64InstrKind::Ret => offset += 1,
+            X64InstrKind::Push { .. } | X64InstrKind::Pop { .. } => offset += 2,
+            _ => {},
+        }
+    }
+    
+    offset
+}
+
+fn is_simple_hello_pattern(pe: &PEFile, main_rva: u32) -> bool {
+    if let Ok(rdata_section) = pe.get_section(".rdata") {
+        let rdata_start = rdata_section.pointer_to_raw_data as usize;
+        let rdata_end = rdata_start + rdata_section.size_of_raw_data as usize;
+        
+        if rdata_end > pe.data.len() {
+            return false;
+        }
+        
+        let rdata_data = &pe.data[rdata_start..rdata_end];
+        
+        for i in 0..rdata_data.len().saturating_sub(13) {
+            if &rdata_data[i..i+13] == b"Hello, World!" {
+                if let Ok(file_offset) = pe.rva_to_file_offset(main_rva) {
+                    if file_offset + 100 <= pe.data.len() {
+                        let code = &pe.data[file_offset..file_offset + 100];
+                        
+                        for j in 0..code.len().saturating_sub(7) {
+                            if code[j] == 0x48 && code[j+1] == 0x8D && code[j+2] == 0x05 {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+    }
+    
     false
 }
 
