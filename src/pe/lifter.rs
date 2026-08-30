@@ -1128,8 +1128,19 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
             }
         }
     }
-    // First external call in main is __main; printf is the second
-    let main_has_printf = main_external_calls > 1;
+    let has_putchar_callees = instrs.iter().any(|instr| {
+        if instr.offset >= main_x64_offset {
+            return false;
+        }
+        if let X64InstrKind::Call { target_offset } = instr.kind {
+            let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset)
+        } else {
+            false
+        }
+    });
+    // nested: putchar callees, no printf -> zero native_call 2
+    let main_has_printf = !has_putchar_callees && main_external_calls > 1;
     
     let mut hit_main_ret = false;
     
