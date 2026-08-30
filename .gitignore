@@ -1,0 +1,17 @@
+/target/
+/test_output/
+*.exe
+*.pdb
+*.obj
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
