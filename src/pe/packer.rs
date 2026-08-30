@@ -602,11 +602,13 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x3C, 0x0B]);
     let jmpif_jmp = stub.len();
     stub.extend_from_slice(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);
-    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);
-    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);  // movzx ecx, byte [rsi] - read condition
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
+    stub.extend_from_slice(&[0x48, 0x8B, 0x06]);  // mov rax, [rsi] - read target
+    stub.extend_from_slice(&[0x48, 0x83, 0xC6, 0x08]);  // add rsi, 8
+    stub.extend_from_slice(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);  // mov rdx, [rbp-0x90] - flags
+    
+    // Check condition 1 (EQ): flags == 1
     stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x01]);
     let jmpif_eq_jmp = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
@@ -617,6 +619,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0xEB, 0x00]);
     let jmpif_eq_target = stub.len();
     stub[jmpif_eq_jmp + 1] = (jmpif_eq_target as i8).wrapping_sub((jmpif_eq_jmp + 2) as i8) as u8;
+    
+    // Check condition 2 (NE): flags != 1
     stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x02]);
     let jmpif_ne_jmp = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
@@ -627,23 +631,75 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0xEB, 0x00]);
     let jmpif_ne_target = stub.len();
     stub[jmpif_ne_jmp + 1] = (jmpif_ne_target as i8).wrapping_sub((jmpif_ne_jmp + 2) as i8) as u8;
+    
+    // Check condition 3 (GT): flags == 2
     stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x03]);
-    let jmpif_nottaken3 = stub.len();
+    let jmpif_gt_jmp = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
     stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x02]);
     let jmpif_taken3 = stub.len();
     stub.extend_from_slice(&[0x74, 0x00]);
+    let jmpif_nottaken3 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_gt_target = stub.len();
+    stub[jmpif_gt_jmp + 1] = (jmpif_gt_target as i8).wrapping_sub((jmpif_gt_jmp + 2) as i8) as u8;
+    
+    // Check condition 4 (LT): flags == 0
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x04]);
+    let jmpif_lt_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x00]);
+    let jmpif_taken4 = stub.len();
+    stub.extend_from_slice(&[0x74, 0x00]);
+    let jmpif_nottaken4 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_lt_target = stub.len();
+    stub[jmpif_lt_jmp + 1] = (jmpif_lt_target as i8).wrapping_sub((jmpif_lt_jmp + 2) as i8) as u8;
+    
+    // Check condition 5 (LE): flags != 2
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x05]);
+    let jmpif_le_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x02]);
+    let jmpif_taken5 = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    let jmpif_nottaken5 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_le_target = stub.len();
+    stub[jmpif_le_jmp + 1] = (jmpif_le_target as i8).wrapping_sub((jmpif_le_jmp + 2) as i8) as u8;
+    
+    // Check condition 6 (GE): flags != 0
+    stub.extend_from_slice(&[0x48, 0x83, 0xF9, 0x06]);
+    let jmpif_ge_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xFA, 0x00]);
+    let jmpif_taken6 = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    let jmpif_nottaken6 = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    let jmpif_ge_target = stub.len();
+    stub[jmpif_ge_jmp + 1] = (jmpif_ge_target as i8).wrapping_sub((jmpif_ge_jmp + 2) as i8) as u8;
+    
+    // Not taken - continue to next instruction
     let jmpif_nottaken_all = stub.len();
     stub[jmpif_nottaken1 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken1 + 2) as i8) as u8;
     stub[jmpif_nottaken2 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken2 + 2) as i8) as u8;
     stub[jmpif_nottaken3 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken3 + 2) as i8) as u8;
+    stub[jmpif_nottaken4 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken4 + 2) as i8) as u8;
+    stub[jmpif_nottaken5 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken5 + 2) as i8) as u8;
+    stub[jmpif_nottaken6 + 1] = (jmpif_nottaken_all as i8).wrapping_sub((jmpif_nottaken6 + 2) as i8) as u8;
     let dispatch_back_jmpif_nottaken = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back_jmpif_nottaken.to_le_bytes());
+    
+    // Taken - jump to target
     let jmpif_taken_all = stub.len();
     stub[jmpif_taken1 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken1 + 2) as i8) as u8;
     stub[jmpif_taken2 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken2 + 2) as i8) as u8;
     stub[jmpif_taken3 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken3 + 2) as i8) as u8;
+    stub[jmpif_taken4 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken4 + 2) as i8) as u8;
+    stub[jmpif_taken5 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken5 + 2) as i8) as u8;
+    stub[jmpif_taken6 + 1] = (jmpif_taken_all as i8).wrapping_sub((jmpif_taken6 + 2) as i8) as u8;
     let bc_base_lea_jmpif = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x01, 0xF0]);

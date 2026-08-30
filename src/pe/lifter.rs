@@ -822,10 +822,12 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(OpCode::JmpIf as u8);
                 
                 let condition_code = match instr.kind {
-                    X64InstrKind::Je { .. } => 1,
-                    X64InstrKind::Jne { .. } => 2,
-                    X64InstrKind::Jg { .. } => 3,
-                    X64InstrKind::Jle { .. } => 2,
+                    X64InstrKind::Je { .. } => 1,     // flags == 1 (EQ)
+                    X64InstrKind::Jne { .. } => 2,    // flags != 1 (NE)
+                    X64InstrKind::Jl { .. } => 4,     // flags == 0 (LT)
+                    X64InstrKind::Jle { .. } => 5,    // flags != 2 (LE, not GT)
+                    X64InstrKind::Jg { .. } => 3,     // flags == 2 (GT)
+                    X64InstrKind::Jge { .. } => 6,    // flags != 0 (GE, not LT)
                     _ => 2,
                 };
                 bytecode.push(condition_code);
@@ -1071,10 +1073,12 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(OpCode::JmpIf as u8);
                 
                 let condition_code = match instr.kind {
-                    X64InstrKind::Je { .. } => 1,
-                    X64InstrKind::Jne { .. } => 2,
-                    X64InstrKind::Jg { .. } => 3,
-                    X64InstrKind::Jle { .. } => 2,
+                    X64InstrKind::Je { .. } => 1,     // flags == 1 (EQ)
+                    X64InstrKind::Jne { .. } => 2,    // flags != 1 (NE)
+                    X64InstrKind::Jl { .. } => 4,     // flags == 0 (LT)
+                    X64InstrKind::Jle { .. } => 5,    // flags != 2 (LE, not GT)
+                    X64InstrKind::Jg { .. } => 3,     // flags == 2 (GT)
+                    X64InstrKind::Jge { .. } => 6,    // flags != 0 (GE, not LT)
                     _ => 2,
                 };
                 bytecode.push(condition_code);
