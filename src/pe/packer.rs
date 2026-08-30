@@ -78,20 +78,23 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
         return Err(PEError::InvalidPE("Code section too small".to_string()));
     }
     
-    let code_slice = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
+    let disasm_start = file_offset.saturating_sub(250);
+    let offset_diff = (file_offset - disasm_start) as u32;
+    let disasm_start_rva = target_rva.saturating_sub(offset_diff);
+    let code_slice = &pe.data[disasm_start..std::cmp::min(file_offset + 500, pe.data.len())];
     
     if is_simple_hello_pattern(code_slice) {
         eprintln!("Detected simple hello pattern, using special path");
         return translate_hello_path();
     }
     
-    let x64_instrs = disassemble_x64_simple(code_slice, 100);
+    let x64_instrs = disassemble_x64_simple(code_slice, 200);
     
     if x64_instrs.is_empty() {
         return Err(PEError::InvalidPE("Failed to disassemble any instructions".to_string()));
     }
     
-    let mut bytecode = lift_to_vm_bytecode(&x64_instrs, target_rva);
+    let mut bytecode = lift_to_vm_bytecode(&x64_instrs, disasm_start_rva);
     
     bytecode.push(OpCode::LoadImm as u8);
     bytecode.push(0);
@@ -104,32 +107,7 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
 }
 
 fn is_simple_hello_pattern(code: &[u8]) -> bool {
-    if code.len() < 30 {
-        return false;
-    }
-    
-    let check_len = std::cmp::min(code.len(), 100);
-    let mut call_count = 0;
-    let mut has_ret = false;
-    let mut ret_offset = None;
-    
-    for i in 0..check_len {
-        if i + 5 <= code.len() && code[i] == 0xE8 {
-            call_count += 1;
-        }
-        if code[i] == 0xC3 && ret_offset.is_none() {
-            ret_offset = Some(i);
-            has_ret = true;
-        }
-    }
-    
-    if let Some(ret_pos) = ret_offset {
-        if ret_pos > 60 {
-            return false;
-        }
-    }
-    
-    call_count <= 2 && has_ret
+    false
 }
 
 fn translate_hello_path() -> PEResult<Vec<u8>> {
@@ -590,9 +568,23 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     stub.extend_from_slice(&[0x48, 0x8B, 0x45, 0x90]);
     stub.extend_from_slice(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
+    
+    stub.extend_from_slice(&[0x48, 0x83, 0xF8, 0x0A]);
+    let single_digit_jmp = stub.len();
+    stub.extend_from_slice(&[0x73, 0x00]);
+    
+    stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
+    stub.extend_from_slice(&[0x88, 0x01]);
+    stub.extend_from_slice(&[0xC6, 0x41, 0x01, 0x0A]);
+    stub.extend_from_slice(&[0x41, 0xB8, 0x02, 0x00, 0x00, 0x00]);
+    let after_single_digit = stub.len();
+    stub.extend_from_slice(&[0xEB, 0x00]);
+    
+    let two_digit_target = stub.len();
+    stub[single_digit_jmp + 1] = (two_digit_target as i8).wrapping_sub((single_digit_jmp + 2) as i8) as u8;
+    
     stub.extend_from_slice(&[0x48, 0x89, 0xC2]);
     stub.extend_from_slice(&[0xBA, 0x0A, 0x00, 0x00, 0x00]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xD0]);
     stub.extend_from_slice(&[0x48, 0x89, 0xD3]);
     stub.extend_from_slice(&[0x48, 0x31, 0xD2]);
     stub.extend_from_slice(&[0x48, 0xF7, 0xF3]);
@@ -601,9 +593,13 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x83, 0xC0, 0x30]);
     stub.extend_from_slice(&[0x88, 0x01]);
     stub.extend_from_slice(&[0xC6, 0x41, 0x02, 0x0A]);
+    stub.extend_from_slice(&[0x41, 0xB8, 0x03, 0x00, 0x00, 0x00]);
+    
+    let after_two_digit = stub.len();
+    stub[after_single_digit + 1] = (after_two_digit as i8).wrapping_sub((after_single_digit + 2) as i8) as u8;
+    
     stub.extend_from_slice(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x8D, 0x95, 0x10, 0xFF, 0xFF, 0xFF]);
-    stub.extend_from_slice(&[0x41, 0xB8, 0x03, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
     stub.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
