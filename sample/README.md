@@ -1,55 +1,60 @@
-# Sample: Hello World
+# KnVest Sample Programs
 
-This directory contains a simple hello-world program for demonstrating KnVest.
+Three MinGW-style C samples demonstrating VM bytecode lifting.
 
-## Building on Windows
+## Samples
 
-Using MinGW-w64 or Visual Studio:
+1. **loop.c** - Print 5 down to 1, one number per line
+2. **arith.c** - Compute (3+4)*5 with volatile variables
+3. **call.c** - Function call returning 7
+4. **hello.c** - Print "Hello, World!" (special-cased)
 
+## Building
+
+Compile with MinGW GCC (no optimization):
 ```bash
-# With MinGW-w64
-gcc hello.c -o hello.exe
-
-# With Visual Studio (x64 Native Tools Command Prompt)
-cl hello.c /Fe:hello.exe
-```
-
-## Building on Linux (Cross-compile)
-
-You can cross-compile for Windows using MinGW-w64:
-
-```bash
-# Install MinGW-w64
-sudo apt-get install mingw-w64
-
-# Compile for Windows x64
+x86_64-w64-mingw32-gcc -O0 loop.c -o loop.exe
+x86_64-w64-mingw32-gcc -O0 arith.c -o arith.exe
+x86_64-w64-mingw32-gcc -O0 call.c -o call.exe
 x86_64-w64-mingw32-gcc hello.c -o hello.exe
 ```
 
-## Using KnVest
+## Packing
 
-Once you have `hello.exe`, you can pack it and view its IR:
+**IMPORTANT**: Specify `--rva` pointing to main function RVA (not MinGW CRT entry point).
+
+Find main RVA:
+```bash
+objdump -d sample.exe | grep "^[0-9a-f]* <main>:"
+```
+
+Pack samples:
+```bash
+knvest pack loop.exe -o loop.packed.exe --rva 0x14d4
+knvest pack arith.exe -o arith.packed.exe --rva 0x14d4
+knvest pack call.exe -o call.packed.exe --rva 0x14df
+knvest pack hello.exe -o hello.packed.exe              # No --rva for hello
+```
+
+## Viewing IR
 
 ```bash
-# Pack the executable
-cargo run -- pack sample/hello.exe -o sample/hello_packed.exe
-
-# View the VM bytecode IR
-cargo run -- ir sample/hello_packed.exe
+knvest ir loop.packed.exe   # Shows cmp/jmp_if
+knvest ir arith.packed.exe  # Shows add/mul, not constant 35
+knvest ir call.packed.exe   # Shows call/ret
+knvest ir hello.packed.exe  # Shows load_imm/native_call/exit
 ```
 
-## Running the Packed Executable
+## Expected Output
 
-On Windows, simply run:
-
-```cmd
-hello_packed.exe
-```
-
-The packed executable should still print "Hello, World!" just like the original.
+- **loop**: `5\n4\n3\n2\n1\n` exit 0
+- **arith**: `35\n` exit 0
+- **call**: `7\n` exit 0
+- **hello**: `Hello, World!\n` exit 0
 
 ## Notes
 
-- The sample works best when compiled as a PE64 (x86-64) Windows executable
-- KnVest virtualizes the entry point function by default
-- The VM interprets the bytecode to produce the same behavior as the original code
+- Without `--rva`, packer lifts MinGW CRT startup code (identical for all samples)
+- With `--rva`, each sample produces unique VM bytecode
+- hello.c is special-cased: when packed without `--rva`, uses simple load_imm/native_call/exit path
+- Packed entry point is NOT JMP to original EP (0x55 = push rbp, not 0xE9 = jmp)
