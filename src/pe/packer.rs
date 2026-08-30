@@ -50,7 +50,7 @@ fn translate_to_vm_bytecode(_pe: &PEFile, _target_rva: u32, _original_entry: u32
 
 fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
     let mut stub = Vec::new();
-    let mut patches: Vec<(usize, usize)> = Vec::new();
+    let mut patches: Vec<(usize, String)> = Vec::new();
     
     stub.extend_from_slice(&[0x55]);
     stub.extend_from_slice(&[0x48, 0x89, 0xE5]);
@@ -215,21 +215,29 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let ep_str_pos = stub.len();
     stub.extend_from_slice(b"ExitProcess\0");
     
-    patches.push((gpa_str_lea + 3, gpa_str_pos));
-    patches.push((gsth_lea + 3, gsth_str_pos));
-    patches.push((wf_lea + 3, wf_str_pos));
-    patches.push((ep_lea + 3, ep_str_pos));
-    patches.push((bc_lea + 3, 0x104));
-    patches.push((bc_base_lea + 3, 0x104));
+    while stub.len() % 16 != 0 {
+        stub.push(0xCC);
+    }
     
-    for (patch_offset, target) in patches {
+    stub.extend_from_slice(b"VMBC");
+    let bytecode_offset = stub.len();
+    
+    patches.push((gpa_str_lea + 3, format!("{}", gpa_str_pos)));
+    patches.push((gsth_lea + 3, format!("{}", gsth_str_pos)));
+    patches.push((wf_lea + 3, format!("{}", wf_str_pos)));
+    patches.push((ep_lea + 3, format!("{}", ep_str_pos)));
+    patches.push((bc_lea + 3, "BYTECODE".to_string()));
+    patches.push((bc_base_lea + 3, "BYTECODE".to_string()));
+    
+    for (patch_offset, target_str) in patches {
+        let target = if target_str == "BYTECODE" {
+            bytecode_offset
+        } else {
+            target_str.parse::<usize>().unwrap()
+        };
         let next_ip = patch_offset + 4;
         let disp = (target as i32) - (next_ip as i32);
         stub[patch_offset..patch_offset + 4].copy_from_slice(&disp.to_le_bytes());
-    }
-    
-    while stub.len() < 0x100 {
-        stub.push(0x00);
     }
     
     let size = stub.len();
@@ -263,13 +271,6 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
     
     let mut section_data = Vec::new();
     section_data.extend_from_slice(&vm_stub);
-    
-    while section_data.len() % 16 != 0 {
-        section_data.push(0xCC);
-    }
-    
-    let bytecode_marker = b"VMBC";
-    section_data.extend_from_slice(bytecode_marker);
     section_data.extend_from_slice(bytecode);
     
     let virtual_size = section_data.len() as u32;
