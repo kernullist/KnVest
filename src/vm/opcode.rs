@@ -20,6 +20,8 @@ pub enum OpCode {
     NativeCall = 0x0E,
     Push = 0x0F,
     Pop = 0x10,
+    LoadByte = 0x11,
+    LoadStr = 0x12,
     Exit = 0xFF,
 }
 
@@ -43,6 +45,8 @@ impl OpCode {
             0x0E => Some(OpCode::NativeCall),
             0x0F => Some(OpCode::Push),
             0x10 => Some(OpCode::Pop),
+            0x11 => Some(OpCode::LoadByte),
+            0x12 => Some(OpCode::LoadStr),
             0xFF => Some(OpCode::Exit),
             _ => None,
         }
@@ -67,6 +71,8 @@ impl OpCode {
             OpCode::NativeCall => "native_call",
             OpCode::Push => "push",
             OpCode::Pop => "pop",
+            OpCode::LoadByte => "load_byte",
+            OpCode::LoadStr => "load_str",
             OpCode::Exit => "exit",
         }
     }
