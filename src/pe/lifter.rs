@@ -539,6 +539,18 @@ pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut 
             let rel = bytes[1] as i8 as i32;
             return X64InstrKind::Jne { target_offset: rel };
         },
+        0x84 if bytes.len() >= 2 && bytes[1] == 0xC0 => {
+            // test al, al (no REX)
+            instr_bytes.extend_from_slice(&bytes[0..2]);
+            *offset += 2;
+            return X64InstrKind::Test { reg1: X64Reg::Eax, reg2: X64Reg::Eax };
+        },
+        0x85 if bytes.len() >= 2 && bytes[1] == 0xC0 => {
+            // test eax, eax (no REX)
+            instr_bytes.extend_from_slice(&bytes[0..2]);
+            *offset += 2;
+            return X64InstrKind::Test { reg1: X64Reg::Eax, reg2: X64Reg::Eax };
+        },
         0x7C if bytes.len() >= 2 => {
             instr_bytes.extend_from_slice(&bytes[0..2]);
             *offset += 2;
@@ -700,25 +712,21 @@ pub fn lift_to_vm_bytecode_with_map(instrs: &[X64Instruction], base_rva: u32) ->
 }
 
 pub fn lift_to_vm_bytecode_for_main(instrs: &[X64Instruction], base_rva: u32, main_x64_offset: usize) -> Vec<u8> {
-    let (mut bytecode, _) = lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
+    let (mut bytecode, _, string_patch_positions) = lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
     
-    // Append string literals at the end of bytecode
-    // Check if there are LeaRipRel instructions (string references)
-    let has_lea_rip_rel = instrs.iter().any(|i| matches!(i.kind, X64InstrKind::LeaRipRel { .. }));
-    
-    let _string_offset = if has_lea_rip_rel {
-        // Pad bytecode to a nice offset
-        let offset = ((bytecode.len() + 15) / 16) * 16; // align to 16 bytes
+    if !string_patch_positions.is_empty() {
+        let offset = ((bytecode.len() + 15) / 16) * 16;
         while bytecode.len() < offset {
             bytecode.push(0x00);
         }
         
-        // Append "knvest\0" string (for str.c)
         bytecode.extend_from_slice(b"knvest\0");
-        offset as u64
-    } else {
-        0
-    };
+        
+        let string_offset = offset as u64;
+        for patch_pos in string_patch_positions {
+            bytecode[patch_pos..patch_pos + 8].copy_from_slice(&string_offset.to_le_bytes());
+        }
+    }
     
     bytecode
 }
@@ -1036,11 +1044,12 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
     (bytecode, label_map)
 }
 
-fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: u32, main_x64_offset: usize) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
+fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: u32, main_x64_offset: usize) -> (Vec<u8>, std::collections::HashMap<usize, usize>, Vec<usize>) {
     let mut bytecode = Vec::new();
     let mut label_map = std::collections::HashMap::new();
     let mut stack_map = std::collections::HashMap::new();
     let mut next_stack_reg = 10u8;
+    let mut string_patch_positions = Vec::new();
     
     let mut pending_jumps: Vec<(usize, usize)> = Vec::new();
     
@@ -1055,6 +1064,22 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
         .map(|i| i.offset)
         .unwrap_or(max_x64_offset);
     
+    let mut main_external_calls = 0u32;
+    for instr in instrs {
+        if instr.offset < main_x64_offset {
+            continue;
+        }
+        if let X64InstrKind::Call { target_offset } = instr.kind {
+            let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            let is_internal = instrs.iter().any(|i| i.offset == target_x64_offset);
+            if !is_internal {
+                main_external_calls += 1;
+            }
+        }
+    }
+    // First external call in main is __main; printf is the second
+    let main_has_printf = main_external_calls > 1;
+    
     let mut hit_main_ret = false;
     
     for (_idx, instr) in instrs.iter().enumerate() {
@@ -1067,9 +1092,18 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.extend_from_slice(&imm.to_le_bytes());
             },
             X64InstrKind::MovRegReg { dst, src } => {
-                bytecode.push(OpCode::Move as u8);
-                bytecode.push(dst.to_vm_reg());
-                bytecode.push(src.to_vm_reg());
+                let in_callee = instr.offset < main_x64_offset;
+                let is_redundant_putchar_setup = matches!(
+                    (dst, src),
+                    (X64Reg::Rcx | X64Reg::Ecx, X64Reg::Rax | X64Reg::Eax)
+                );
+                if in_callee && is_redundant_putchar_setup {
+                    // Skip mov ecx, eax before putchar wrapper moves r0 <- r1
+                } else {
+                    bytecode.push(OpCode::Move as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(src.to_vm_reg());
+                }
             },
             X64InstrKind::MovMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
@@ -1282,13 +1316,12 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                         
                         if in_callee {
                             // Callees (print_digit, print_char) use putchar: native_call 3
-                            // Argument passed in r1, need to move to r0 for native_call
                             bytecode.push(OpCode::Move as u8);
                             bytecode.push(0); // r0
                             bytecode.push(1); // r1
                             bytecode.push(OpCode::NativeCall as u8);
                             bytecode.extend_from_slice(&3u64.to_le_bytes());
-                        } else {
+                        } else if main_has_printf {
                             // Main uses printf: native_call 2
                             bytecode.push(OpCode::NativeCall as u8);
                             bytecode.extend_from_slice(&2u64.to_le_bytes());
@@ -1335,12 +1368,10 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(reg.to_vm_reg());
             },
             X64InstrKind::LeaRipRel { dst, .. } => {
-                // Load the string offset into the destination register
-                // Use a high placeholder that will be patched later
-                let placeholder_offset = 0x3f0; // Will be patched in lift_to_vm_bytecode_for_main
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(dst.to_vm_reg());
-                bytecode.extend_from_slice(&(placeholder_offset as u64).to_le_bytes());
+                string_patch_positions.push(bytecode.len());
+                bytecode.extend_from_slice(&0u64.to_le_bytes());
             },
             X64InstrKind::MovzxByte { dst, base, offset } => {
                 // LoadByte: load a byte from memory
@@ -1402,7 +1433,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
         }
     }
     
-    (bytecode, label_map)
+    (bytecode, label_map, string_patch_positions)
 }
 
 pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
