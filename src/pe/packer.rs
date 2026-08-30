@@ -77,7 +77,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     let search_loop = stub.len();
     stub.extend_from_slice(&[0x85, 0xF6]);
-    let search_done_jmp = stub.len();
+    let search_fail_jmp = stub.len();
     stub.extend_from_slice(&[0x74, 0x00]);
     stub.extend_from_slice(&[0x48, 0xFF, 0xCE]);
     stub.extend_from_slice(&[0x8B, 0x04, 0xB7]);
@@ -107,7 +107,10 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     let strcmp_done_target = stub.len();
     stub[strcmp_done + 1] = (strcmp_done_target as i8).wrapping_sub((strcmp_done + 2) as i8) as u8;
-    stub[search_done_jmp + 1] = (strcmp_done_target as i8).wrapping_sub((search_done_jmp + 2) as i8) as u8;
+    
+    let search_fail_target = stub.len();
+    stub[search_fail_jmp + 1] = (search_fail_target as i8).wrapping_sub((search_fail_jmp + 2) as i8) as u8;
+    stub.extend_from_slice(&[0xCC]);
     
     stub.extend_from_slice(&[0x0F, 0xB7, 0x04, 0x71]);
     stub.extend_from_slice(&[0x8B, 0x04, 0x82]);
