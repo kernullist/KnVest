@@ -842,32 +842,14 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     external_call_count += 1;
                     
                     if external_call_count == 1 {
-                        // Skip __main call
+                        // Skip __main call - don't emit anything
                     } else {
-                        // For now, check previous instruction to guess call type
-                        // If previous was loading a small immediate (< 256), likely putchar
-                        let is_putchar = if let Some(prev_instr) = instrs.iter()
-                            .rev()
-                            .skip_while(|i| i.offset >= instr.offset)
-                            .take(5)
-                            .find(|i| matches!(i.kind, X64InstrKind::MovRegImm { .. })) {
-                            if let X64InstrKind::MovRegImm { imm, .. } = prev_instr.kind {
-                                imm < 256 && imm > 0
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        
+                        // All other external calls are printf-style: native_call 2
                         bytecode.push(OpCode::NativeCall as u8);
-                        if is_putchar {
-                            bytecode.extend_from_slice(&3u64.to_le_bytes());
-                        } else {
-                            bytecode.extend_from_slice(&2u64.to_le_bytes());
-                        }
+                        bytecode.extend_from_slice(&2u64.to_le_bytes());
                     }
                 } else {
+                    // Internal call - emit VM Call instruction
                     bytecode.push(OpCode::Call as u8);
                     let placeholder_pos = bytecode.len();
                     bytecode.extend_from_slice(&0u64.to_le_bytes());
@@ -885,20 +867,10 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
             },
-            X64InstrKind::LeaRipRel { dst, offset } => {
-                let next_instr_offset = instr.offset + instr.bytes.len();
-                let target_offset = (next_instr_offset as i32 + offset) as usize;
-                
-                bytecode.push(OpCode::LoadStr as u8);
-                bytecode.push(dst.to_vm_reg());
-                bytecode.extend_from_slice(&(target_offset as u64).to_le_bytes());
-            },
-            X64InstrKind::MovzxByte { dst, base, offset: _ } => {
-                bytecode.push(OpCode::LoadByte as u8);
-                bytecode.push(dst.to_vm_reg());
-                bytecode.push(base.to_vm_reg());
-            },
+            X64InstrKind::LeaRipRel { .. } |
+            X64InstrKind::MovzxByte { .. } |
             X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
+                // Ignore - these don't need VM translation
             },
         }
     }
@@ -1121,31 +1093,14 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     external_call_count += 1;
                     
                     if external_call_count == 1 {
-                        // Skip __main call
+                        // Skip __main call - don't emit anything
                     } else {
-                        // Check if this looks like a putchar call (small immediate in previous instructions)
-                        let is_putchar = if let Some(prev_instr) = instrs.iter()
-                            .rev()
-                            .skip_while(|i| i.offset >= instr.offset)
-                            .take(5)
-                            .find(|i| matches!(i.kind, X64InstrKind::MovRegImm { .. })) {
-                            if let X64InstrKind::MovRegImm { imm, .. } = prev_instr.kind {
-                                imm < 256 && imm > 0
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        
+                        // All other external calls are printf-style: native_call 2
                         bytecode.push(OpCode::NativeCall as u8);
-                        if is_putchar {
-                            bytecode.extend_from_slice(&3u64.to_le_bytes());
-                        } else {
-                            bytecode.extend_from_slice(&2u64.to_le_bytes());
-                        }
+                        bytecode.extend_from_slice(&2u64.to_le_bytes());
                     }
                 } else {
+                    // Internal call - emit VM Call instruction
                     bytecode.push(OpCode::Call as u8);
                     let placeholder_pos = bytecode.len();
                     bytecode.extend_from_slice(&0u64.to_le_bytes());
@@ -1172,20 +1127,10 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
             },
-            X64InstrKind::LeaRipRel { dst, offset } => {
-                let next_instr_offset = instr.offset + instr.bytes.len();
-                let target_offset = (next_instr_offset as i32 + offset) as usize;
-                
-                bytecode.push(OpCode::LoadStr as u8);
-                bytecode.push(dst.to_vm_reg());
-                bytecode.extend_from_slice(&(target_offset as u64).to_le_bytes());
-            },
-            X64InstrKind::MovzxByte { dst, base, offset: _ } => {
-                bytecode.push(OpCode::LoadByte as u8);
-                bytecode.push(dst.to_vm_reg());
-                bytecode.push(base.to_vm_reg());
-            },
+            X64InstrKind::LeaRipRel { .. } |
+            X64InstrKind::MovzxByte { .. } |
             X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
+                // Ignore - these don't need VM translation
             },
         }
     }
@@ -1288,9 +1233,11 @@ pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32
             },
             X64InstrKind::Ret => bytecode_offset += 1,
             X64InstrKind::Push { .. } | X64InstrKind::Pop { .. } => bytecode_offset += 2,
-            X64InstrKind::LeaRipRel { .. } => bytecode_offset += 1 + 1 + 8,
-            X64InstrKind::MovzxByte { .. } => bytecode_offset += 1 + 1 + 1,
-            X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {},
+            X64InstrKind::LeaRipRel { .. } |
+            X64InstrKind::MovzxByte { .. } |
+            X64InstrKind::Lea { .. } | X64InstrKind::Test { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
+                // Don't add to bytecode offset - these are ignored
+            },
         }
     }
     

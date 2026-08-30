@@ -97,15 +97,39 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     let call_targets = find_internal_call_targets(&main_instrs, file_offset);
     
     let mut all_instrs = main_instrs;
+    let mut processed_targets = std::collections::HashSet::new();
     
     for target_file_offset in call_targets {
-        if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
+        if processed_targets.contains(&target_file_offset) {
+            continue;
+        }
+        processed_targets.insert(target_file_offset);
+        
+        if target_file_offset + 100 <= pe.data.len() {
             if pe.data[target_file_offset] == 0x55 {
-                let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 200, pe.data.len())];
-                let mut callee_instrs = disassemble_until_ret(callee_code, 50);
+                let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 300, pe.data.len())];
+                let mut callee_instrs = disassemble_until_ret(callee_code, 100);
                 
                 for instr in &mut callee_instrs {
                     instr.offset += target_file_offset;
+                }
+                
+                // Recursively find callees of this callee (for recursion)
+                let callee_targets = find_internal_call_targets(&callee_instrs, target_file_offset);
+                for nested_target in callee_targets {
+                    if !processed_targets.contains(&nested_target) && nested_target != target_file_offset {
+                        if nested_target + 100 <= pe.data.len() && pe.data[nested_target] == 0x55 {
+                            let nested_code = &pe.data[nested_target..std::cmp::min(nested_target + 300, pe.data.len())];
+                            let mut nested_instrs = disassemble_until_ret(nested_code, 100);
+                            
+                            for instr in &mut nested_instrs {
+                                instr.offset += nested_target;
+                            }
+                            
+                            all_instrs.extend(nested_instrs);
+                            processed_targets.insert(nested_target);
+                        }
+                    }
                 }
                 
                 all_instrs.extend(callee_instrs);
@@ -234,7 +258,7 @@ fn disassemble_until_ret(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> 
     instructions
 }
 
-fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize) -> Vec<usize> {
+fn find_internal_call_targets(instrs: &[X64Instruction], _main_file_offset: usize) -> Vec<usize> {
     let mut targets = Vec::new();
     
     for instr in instrs {
@@ -242,11 +266,16 @@ fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize
             let instr_abs_offset = instr.offset;
             let target_abs_offset = (instr_abs_offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
             
-            if target_abs_offset < main_file_offset {
-                let distance = main_file_offset - target_abs_offset;
-                if distance < 0x20 {
-                    targets.push(target_abs_offset);
-                }
+            // Include all call targets (both before and after main)
+            // Just check they're not too far away (within reasonable code distance)
+            let distance = if target_abs_offset > instr_abs_offset {
+                target_abs_offset - instr_abs_offset
+            } else {
+                instr_abs_offset - target_abs_offset
+            };
+            
+            if distance < 0x1000 {  // Within 4KB is reasonable for internal calls
+                targets.push(target_abs_offset);
             }
         }
     }
