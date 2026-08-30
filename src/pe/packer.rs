@@ -54,10 +54,17 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
         SECTION_ALIGNMENT
     );
     
-    let new_pointer_to_raw = align_up(
+    let theoretical_raw_ptr = align_up(
         last_section.pointer_to_raw_data + last_section.size_of_raw_data,
         FILE_ALIGNMENT
     );
+    
+    let actual_file_size = pe.data.len();
+    let new_pointer_to_raw = if theoretical_raw_ptr < actual_file_size as u32 {
+        align_up(actual_file_size as u32, FILE_ALIGNMENT)
+    } else {
+        theoretical_raw_ptr
+    };
     
     let (vm_stub, _) = create_vm_interpreter_stub(original_entry_rva, new_virtual_address);
     
@@ -107,6 +114,14 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
     let new_image_size = align_up(new_virtual_address + virtual_size, SECTION_ALIGNMENT);
     pe.data[image_size_offset..image_size_offset + 4]
         .copy_from_slice(&new_image_size.to_le_bytes());
+    
+    while pe.data.len() < new_pointer_to_raw as usize {
+        pe.data.push(0x00);
+    }
+    
+    if pe.data.len() > new_pointer_to_raw as usize {
+        pe.data.truncate(new_pointer_to_raw as usize);
+    }
     
     pe.data.extend_from_slice(&section_data);
     
@@ -309,5 +324,27 @@ mod tests {
         assert!(has_load_imm, "Bytecode should contain LoadImm");
         assert!(has_call, "Bytecode should contain Call");
         assert!(has_exit, "Bytecode should contain Exit");
+    }
+
+    #[test]
+    fn test_pack_pe_with_overlay() {
+        let pe_data = test_pe::create_pe64_with_overlay();
+        let original_size = pe_data.len();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        
+        pack_function(&mut pe, None).unwrap();
+        
+        let section = pe.get_section(".knvest").unwrap();
+        let ptr = section.pointer_to_raw_data as usize;
+        
+        assert!(ptr >= original_size, "New section should be after original file");
+        
+        assert!(ptr < pe.data.len(), "PointerToRawData should be within file");
+        
+        let stub_byte = pe.data[ptr];
+        assert_eq!(stub_byte, 0xE9, "Entry point should have JMP instruction (0xE9)");
+        
+        let bytecode = extract_bytecode_from_packed(&pe);
+        assert!(bytecode.is_ok(), "Should extract bytecode from packed PE with overlay");
     }
 }

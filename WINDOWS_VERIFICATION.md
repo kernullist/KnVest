@@ -65,11 +65,18 @@ cargo test --release
 
 ## What Was Fixed
 
-### Before (Broken)
+### Before (First Attempt - Broken)
 - Packed PE: STATUS_INVALID_IMAGE_FORMAT on Windows
 - IR output: Mostly `nop` + native bytes
 - Bytecode size: 41 bytes (hardcoded, unused)
 - PE structure: Corrupted (section count wrong, headers not updated)
+
+### After First Fix (Still Broken)
+- Packed PE: Still STATUS_INVALID_IMAGE_FORMAT
+- IR output: Error "No VM bytecode found in packed PE"
+- Entry point: All zeros at file offset
+- Problem: Section data appended to EOF, not written at PointerToRawData
+- For PE with overlays: PointerToRawData points inside file, but data was at EOF
 
 ### After (Fixed)
 - Packed PE: Loads and runs correctly, prints "Hello, World!"

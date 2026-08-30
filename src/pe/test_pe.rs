@@ -46,6 +46,60 @@ pub fn create_minimal_pe64() -> Vec<u8> {
     pe
 }
 
+pub fn create_pe64_with_overlay() -> Vec<u8> {
+    let mut pe = Vec::new();
+
+    let dos_header = create_dos_header(0x80);
+    pe.extend_from_slice(&dos_header);
+
+    let dos_stub = vec![0u8; 0x80 - dos_header.len()];
+    pe.extend_from_slice(&dos_stub);
+
+    let pe_signature = b"PE\0\0";
+    pe.extend_from_slice(pe_signature);
+
+    let coff_header = create_coff_header(2);
+    pe.extend_from_slice(&coff_header);
+
+    let optional_header = create_optional_header_pe32plus();
+    pe.extend_from_slice(&optional_header);
+
+    let text_section_header = create_section_header(
+        b".text\0\0\0",
+        0x100,
+        0x1000,
+        0x200,
+        0x400,
+    );
+    pe.extend_from_slice(&text_section_header);
+
+    let data_section_header = create_section_header(
+        b".data\0\0\0",
+        0x100,
+        0x2000,
+        0x200,
+        0x600,
+    );
+    pe.extend_from_slice(&data_section_header);
+
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    let text_data = vec![0x90; 0x200];
+    pe.extend_from_slice(&text_data);
+
+    let data_data = vec![0x00; 0x200];
+    pe.extend_from_slice(&data_data);
+
+    let overlay = b"DEBUG_DATA_OVERLAY";
+    pe.extend_from_slice(overlay);
+    
+    pe.extend_from_slice(&vec![0xAA; 512]);
+
+    pe
+}
+
 fn create_dos_header(pe_offset: u32) -> Vec<u8> {
     let mut header = vec![0u8; 64];
     header[0] = b'M';
@@ -142,5 +196,14 @@ mod tests {
         let pe = PEFile::from_bytes(pe_data).unwrap();
         let section = pe.get_section(".text");
         assert!(section.is_ok());
+    }
+
+    #[test]
+    fn test_pe_with_overlay_is_valid() {
+        let pe_data = create_pe64_with_overlay();
+        let result = PEFile::from_bytes(pe_data);
+        assert!(result.is_ok());
+        let pe = result.unwrap();
+        assert_eq!(pe.num_sections, 2);
     }
 }
