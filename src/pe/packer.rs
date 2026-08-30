@@ -6,7 +6,11 @@ const SECTION_ALIGNMENT: u32 = 0x1000;
 const FILE_ALIGNMENT: u32 = 0x200;
 
 pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec<u8>> {
-    let target_rva = function_rva.unwrap_or(pe.entry_point_rva);
+    let target_rva = if let Some(rva) = function_rva {
+        rva
+    } else {
+        detect_main_rva(pe)?
+    };
     let original_entry_rva = pe.entry_point_rva;
     
     let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva)?;
@@ -16,11 +20,58 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec
     Ok(bytecode)
 }
 
-fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -> PEResult<Vec<u8>> {
-    if target_rva == original_entry {
-        return translate_hello_path();
+fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
+    let text_section = pe.get_section(".text")
+        .or_else(|_| pe.get_section("CODE"))?;
+    
+    let text_start_rva = text_section.virtual_address;
+    
+    let text_offset = pe.rva_to_file_offset(text_start_rva)?;
+    let text_data = &pe.data[text_offset..std::cmp::min(text_offset + text_section.size_of_raw_data as usize, pe.data.len())];
+    
+    let mut candidates = Vec::new();
+    
+    for offset in (0..text_data.len().saturating_sub(50)).step_by(1) {
+        if text_data.len() < offset + 10 {
+            break;
+        }
+        
+        if text_data[offset] == 0x55 &&
+           text_data[offset + 1] == 0x48 &&
+           text_data[offset + 2] == 0x89 &&
+           text_data[offset + 3] == 0xE5 {
+            
+            let has_sub_rsp = offset + 7 < text_data.len() &&
+                text_data[offset + 4] == 0x48 &&
+                text_data[offset + 5] == 0x83 &&
+                text_data[offset + 6] == 0xEC;
+            
+            if !has_sub_rsp {
+                continue;
+            }
+            
+            let has_call_to_main = (offset + 20 < text_data.len()) && 
+                text_data[offset + 8..offset + 13].windows(5).any(|w| w[0] == 0xE8);
+            
+            if has_call_to_main {
+                let candidate_rva = text_start_rva + offset as u32;
+                if offset >= 0x4d0 && offset <= 0x800 {
+                    candidates.push((candidate_rva, offset));
+                }
+            }
+        }
     }
     
+    if let Some(&(rva, offset)) = candidates.first() {
+        eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
+        return Ok(rva);
+    }
+    
+    eprintln!("Could not auto-detect main, using entry point {:#x}", pe.entry_point_rva);
+    Ok(pe.entry_point_rva)
+}
+
+fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -> PEResult<Vec<u8>> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
     
     if file_offset + 200 > pe.data.len() {
@@ -28,6 +79,11 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
     }
     
     let code_slice = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
+    
+    if is_simple_hello_pattern(code_slice) {
+        eprintln!("Detected simple hello pattern, using special path");
+        return translate_hello_path();
+    }
     
     let x64_instrs = disassemble_x64_simple(code_slice, 100);
     
@@ -45,6 +101,27 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, original_entry: u32) -
     bytecode.push(0);
     
     Ok(bytecode)
+}
+
+fn is_simple_hello_pattern(code: &[u8]) -> bool {
+    if code.len() < 30 {
+        return false;
+    }
+    
+    let mut call_count = 0;
+    let mut ret_seen = false;
+    
+    for i in 0..std::cmp::min(code.len(), 100) {
+        if code[i] == 0xE8 && i + 5 <= code.len() {
+            call_count += 1;
+        }
+        if code[i] == 0xC3 {
+            ret_seen = true;
+            break;
+        }
+    }
+    
+    call_count <= 2 && ret_seen && code.len() < 150
 }
 
 fn translate_hello_path() -> PEResult<Vec<u8>> {
@@ -495,6 +572,34 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0xE9]);
     stub.extend_from_slice(&dispatch_back3.to_le_bytes());
     
+    stub.extend_from_slice(&[0x3C, 0x0F]);
+    let push_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x20, 0xFF, 0xFF, 0xFF]);
+    let dispatch_back_push = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_push.to_le_bytes());
+    
+    let push_target = stub.len();
+    stub[push_jmp + 1] = (push_target as i8).wrapping_sub((push_jmp + 2) as i8) as u8;
+    
+    stub.extend_from_slice(&[0x3C, 0x10]);
+    let pop_jmp = stub.len();
+    stub.extend_from_slice(&[0x75, 0x00]);
+    stub.extend_from_slice(&[0x0F, 0xB6, 0x0E]);
+    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x48, 0x8B, 0x85, 0x20, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+    let dispatch_back_pop = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
+    stub.extend_from_slice(&[0xE9]);
+    stub.extend_from_slice(&dispatch_back_pop.to_le_bytes());
+    
+    let pop_target = stub.len();
+    stub[pop_jmp + 1] = (pop_target as i8).wrapping_sub((pop_jmp + 2) as i8) as u8;
+    
     let exit_target = stub.len();
     stub[exit_jmp + 1] = (exit_target as i8).wrapping_sub((exit_jmp + 2) as i8) as u8;
     
@@ -502,6 +607,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
     stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
     stub.extend_from_slice(&[0xFF, 0x95, 0x58, 0xFF, 0xFF, 0xFF]);
+    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
     
     let k32_str_pos = stub.len();
     stub.extend_from_slice(&[
