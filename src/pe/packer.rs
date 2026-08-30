@@ -82,21 +82,21 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0xFF, 0xCE]);
     stub.extend_from_slice(&[0x8B, 0x04, 0xB7]);
     stub.extend_from_slice(&[0x48, 0x01, 0xD8]);
-    stub.extend_from_slice(&[0x48, 0x89, 0xC6]);
+    stub.extend_from_slice(&[0x49, 0x89, 0xC1]);
     
     let gpa_str_lea = stub.len();
     stub.extend_from_slice(&[0x4C, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]);
     
     let strcmp_loop = stub.len();
     stub.extend_from_slice(&[0x41, 0x8A, 0x00]);
-    stub.extend_from_slice(&[0x3A, 0x06]);
+    stub.extend_from_slice(&[0x41, 0x3A, 0x01]);
     let strcmp_fail = stub.len();
     stub.extend_from_slice(&[0x75, 0x00]);
     stub.extend_from_slice(&[0x84, 0xC0]);
     let strcmp_done = stub.len();
     stub.extend_from_slice(&[0x74, 0x00]);
     stub.extend_from_slice(&[0x49, 0xFF, 0xC0]);
-    stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);
+    stub.extend_from_slice(&[0x49, 0xFF, 0xC1]);
     let strcmp_back = (strcmp_loop as i8).wrapping_sub((stub.len() + 2) as i8);
     stub.extend_from_slice(&[0xEB, strcmp_back as u8]);
     
