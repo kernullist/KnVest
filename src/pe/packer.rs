@@ -301,6 +301,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xC8], 0
     // Initialize Push/Pop value stack depth to 0 at [rbp-0xE8]
     stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0xE8], 0
+    // Initialize LoadByte bytecode base cache at [rbp-0x118]
+    stub.extend_from_slice(&[0x48, 0xC7, 0x85, 0xE8, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]); // mov qword [rbp-0x118], 0
     
     stub.extend_from_slice(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
     stub.extend_from_slice(&[0x48, 0x8B, 0x40, 0x18]);
@@ -450,9 +452,9 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
     stub.extend_from_slice(&[0x48, 0x89, 0x85, 0x60, 0xFF, 0xFF, 0xFF]);
     
+    // Dispatch prologue: load bytecode pointer and cache for LoadByte (not func1-only)
     let bc_lea = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-    // Cache bytecode base (opcode 0) for LoadByte — free slot [rbp-0x118]
+    stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]); // lea rsi, [rip+bytecode]
     stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x118], rsi
     
     let dispatch_loop = stub.len();
@@ -832,21 +834,21 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     let three_digit_target = stub.len();
     stub[three_digit_jmp + 1] = (three_digit_target as i8).wrapping_sub((three_digit_jmp + 2) as i8) as u8;
     
-    // hundreds = n/100, tens = (n/10)%10, ones = n%10; "XYZ\n" at [rbp-0xF0], length 4
+    // hundreds = n/100, tens = (n/10)%10, ones = n%10; "XYZ\n" via rcx (same buffer as 1/2-digit)
     stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
     stub.extend_from_slice(&[0xBB, 0x64, 0x00, 0x00, 0x00]); // mov ebx, 100
     stub.extend_from_slice(&[0x48, 0xF7, 0xF3]); // div rbx
     stub.extend_from_slice(&[0x04, 0x30]); // add al, 0x30
-    stub.extend_from_slice(&[0x88, 0x85, 0xF0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xF0], al
+    stub.extend_from_slice(&[0x88, 0x01]); // mov [rcx], al
     stub.extend_from_slice(&[0x48, 0x89, 0xD0]); // mov rax, rdx (n%100)
     stub.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
     stub.extend_from_slice(&[0xBB, 0x0A, 0x00, 0x00, 0x00]); // mov ebx, 10
     stub.extend_from_slice(&[0x48, 0xF7, 0xF3]); // div rbx
     stub.extend_from_slice(&[0x04, 0x30]); // add al, 0x30
-    stub.extend_from_slice(&[0x88, 0x85, 0xF1, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xF1], al
+    stub.extend_from_slice(&[0x88, 0x41, 0x01]); // mov [rcx+1], al
     stub.extend_from_slice(&[0x80, 0xC2, 0x30]); // add dl, 0x30
-    stub.extend_from_slice(&[0x88, 0x95, 0xF2, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xF2], dl
-    stub.extend_from_slice(&[0xC6, 0x85, 0xF3, 0xFF, 0xFF, 0xFF, 0x0A]); // mov byte [rbp-0xF3], 0x0A
+    stub.extend_from_slice(&[0x88, 0x51, 0x02]); // mov [rcx+2], dl
+    stub.extend_from_slice(&[0xC6, 0x41, 0x03, 0x0A]); // mov byte [rcx+3], 0x0A
     stub.extend_from_slice(&[0x41, 0xB8, 0x04, 0x00, 0x00, 0x00]); // mov r8d, 4
     
     let write_common = stub.len();
@@ -1420,6 +1422,26 @@ mod tests {
             }
         }
         assert!(bc_lea_found, "bc_lea must patch to opcode 0 (VMBC+4)");
+        let prologue_init = [0x48u8, 0xC7, 0x85, 0xE8, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        assert!(
+            stub.windows(prologue_init.len()).any(|w| w == prologue_init),
+            "prologue must zero-init bytecode base cache at [rbp-0x118]"
+        );
+    }
+
+    #[test]
+    fn test_three_digit_printer_uses_rcx_buffer() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
+        let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(bad_hundreds.len()).any(|w| w == bad_hundreds),
+            "three_digit must not use mov [rbp+disp32], al with F0 FF FF FF (-0x10)"
+        );
+        assert!(stub.windows(2).any(|w| w == [0x88u8, 0x01]));
+        assert!(stub.windows(3).any(|w| w == [0x88u8, 0x41, 0x01]));
+        assert!(stub.windows(3).any(|w| w == [0x88u8, 0x51, 0x02]));
+        assert!(stub.windows(4).any(|w| w == [0xC6u8, 0x41, 0x03, 0x0A]));
     }
 
     #[test]
