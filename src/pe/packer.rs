@@ -452,6 +452,8 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     
     let bc_lea = stub.len();
     stub.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
+    // Save bytecode base (same address bc_lea resolves to) for LoadByte
+    stub.extend_from_slice(&[0x48, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xB0], rsi
     
     let dispatch_loop = stub.len();
     stub.extend_from_slice(&[0x0F, 0xB6, 0x06]);
@@ -931,11 +933,7 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     stub.extend_from_slice(&[0x0F, 0xB6, 0x3E]);  // movzx edi, byte [rsi]  ; src register
     stub.extend_from_slice(&[0x48, 0xFF, 0xC6]);  // inc rsi
     stub.extend_from_slice(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);  // mov rax, [rbp + rdi*8 - 0x80]  ; get src value
-    // rax now contains the address to read from
-    // Check if it's in bytecode range or data section
-    let bc_base_lea_loadbyte = stub.len();
-    stub.extend_from_slice(&[0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00]);  // lea rdx, [rip + bc_base]
-    stub.extend_from_slice(&[0x48, 0x01, 0xD0]);  // add rax, rdx  ; rax = absolute address
+    stub.extend_from_slice(&[0x48, 0x03, 0x85, 0x50, 0xFF, 0xFF, 0xFF]);  // add rax, [rbp-0xB0]  ; bytecode base from bc_lea
     stub.extend_from_slice(&[0x0F, 0xB6, 0x00]);  // movzx eax, byte [rax]  ; load the byte
     stub.extend_from_slice(&[0x48, 0x89, 0x44, 0xCD, 0x80]);  // mov [rbp + rcx*8 - 0x80], rax  ; store to dst
     let dispatch_back_load_byte = (dispatch_loop as i32).wrapping_sub((stub.len() + 5) as i32);
@@ -992,7 +990,6 @@ fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, 
     patches.push((bc_base_lea_call + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_call2 + 3, "BYTECODE".to_string()));
     patches.push((bc_base_lea_ret + 3, "BYTECODE".to_string()));
-    patches.push((bc_base_lea_loadbyte + 3, "BYTECODE".to_string()));
     
     for (patch_offset, target_str) in patches {
         let target = if target_str == "BYTECODE" {

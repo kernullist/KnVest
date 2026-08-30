@@ -702,6 +702,58 @@ fn to_32bit_reg(reg: X64Reg) -> X64Reg {
     }
 }
 
+fn is_lifted_internal_target(target: usize, min_x64_offset: usize, max_x64_offset: usize) -> bool {
+    target >= min_x64_offset && target < max_x64_offset
+}
+
+fn callee_entry_for(instrs: &[X64Instruction], offset: usize, main_x64_offset: usize) -> usize {
+    instrs.iter()
+        .filter(|i| i.offset < main_x64_offset && i.offset <= offset)
+        .filter(|i| i.bytes.first() == Some(&0x55))
+        .map(|i| i.offset)
+        .max()
+        .unwrap_or(offset)
+}
+
+fn callee_end_for(instrs: &[X64Instruction], entry: usize, main_x64_offset: usize) -> usize {
+    instrs.iter()
+        .filter(|i| i.offset > entry && i.offset < main_x64_offset)
+        .find(|i| i.bytes.first() == Some(&0x55))
+        .map(|i| i.offset)
+        .unwrap_or(main_x64_offset)
+}
+
+fn callee_has_add_30(instrs: &[X64Instruction], entry: usize, end: usize) -> bool {
+    instrs.iter().any(|i| {
+        if i.offset < entry || i.offset >= end {
+            return false;
+        }
+        matches!(&i.kind, X64InstrKind::AddRegImm { imm: 0x30, .. })
+    })
+}
+
+fn callee_has_recursive_internal_call(
+    instrs: &[X64Instruction],
+    entry: usize,
+    end: usize,
+    min_x64_offset: usize,
+    max_x64_offset: usize,
+) -> bool {
+    instrs.iter().any(|i| {
+        if i.offset < entry || i.offset >= end {
+            return false;
+        }
+        if let X64InstrKind::Call { target_offset } = i.kind {
+            let target = (i.offset as i32 + i.bytes.len() as i32 + target_offset) as usize;
+            is_lifted_internal_target(target, min_x64_offset, max_x64_offset)
+                && target >= entry
+                && target < end
+        } else {
+            false
+        }
+    })
+}
+
 pub fn lift_to_vm_bytecode(instrs: &[X64Instruction], _base_rva: u32) -> Vec<u8> {
     let (bytecode, _) = lift_to_vm_bytecode_internal(instrs, _base_rva, false);
     bytecode
@@ -1071,8 +1123,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
         }
         if let X64InstrKind::Call { target_offset } = instr.kind {
             let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-            let is_internal = instrs.iter().any(|i| i.offset == target_x64_offset);
-            if !is_internal {
+            if !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset) {
                 main_external_calls += 1;
             }
         }
@@ -1093,12 +1144,24 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
             },
             X64InstrKind::MovRegReg { dst, src } => {
                 let in_callee = instr.offset < main_x64_offset;
-                let is_redundant_putchar_setup = matches!(
+                let is_ecx_from_eax = matches!(
                     (dst, src),
                     (X64Reg::Rcx | X64Reg::Ecx, X64Reg::Rax | X64Reg::Eax)
                 );
-                if in_callee && is_redundant_putchar_setup {
-                    // Skip mov ecx, eax before putchar wrapper moves r0 <- r1
+                if in_callee && is_ecx_from_eax {
+                    let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+                    let end = callee_end_for(instrs, entry, main_x64_offset);
+                    let is_print_char_setup = !callee_has_add_30(instrs, entry, end)
+                        && !callee_has_recursive_internal_call(
+                            instrs, entry, end, min_x64_offset, max_x64_offset,
+                        );
+                    if is_print_char_setup {
+                        // print_char only: arg already in r1, skip mov ecx, eax
+                    } else {
+                        bytecode.push(OpCode::Move as u8);
+                        bytecode.push(dst.to_vm_reg());
+                        bytecode.push(src.to_vm_reg());
+                    }
                 } else {
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -1302,8 +1365,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
             X64InstrKind::Call { target_offset } => {
                 let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 
-                let is_internal = label_map.contains_key(&target_x64_offset) ||
-                                  instrs.iter().any(|i| i.offset == target_x64_offset);
+                let is_internal = is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset);
                 
                 if !is_internal {
                     external_call_count += 1;
@@ -1311,18 +1373,24 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     if external_call_count == 1 {
                         // Skip __main call - don't emit anything
                     } else {
-                        // Detect if we're in a callee (before main) or in main
                         let in_callee = instr.offset < main_x64_offset;
                         
                         if in_callee {
-                            // Callees (print_digit, print_char) use putchar: native_call 3
-                            bytecode.push(OpCode::Move as u8);
-                            bytecode.push(0); // r0
-                            bytecode.push(1); // r1
-                            bytecode.push(OpCode::NativeCall as u8);
-                            bytecode.extend_from_slice(&3u64.to_le_bytes());
+                            let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+                            let end = callee_end_for(instrs, entry, main_x64_offset);
+                            if callee_has_add_30(instrs, entry, end) {
+                                // print_digit: r0 already holds '0'+n after add 0x30
+                                bytecode.push(OpCode::NativeCall as u8);
+                                bytecode.extend_from_slice(&3u64.to_le_bytes());
+                            } else {
+                                // print_char: arg in r1
+                                bytecode.push(OpCode::Move as u8);
+                                bytecode.push(0);
+                                bytecode.push(1);
+                                bytecode.push(OpCode::NativeCall as u8);
+                                bytecode.extend_from_slice(&3u64.to_le_bytes());
+                            }
                         } else if main_has_printf {
-                            // Main uses printf: native_call 2
                             bytecode.push(OpCode::NativeCall as u8);
                             bytecode.extend_from_slice(&2u64.to_le_bytes());
                         }
