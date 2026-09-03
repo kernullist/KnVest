@@ -108,45 +108,28 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     
     let mut all_instrs = main_instrs;
     let mut processed_targets = std::collections::HashSet::new();
+    let mut pending_targets: std::collections::VecDeque<usize> =
+        call_targets.into_iter().collect();
     
-    // Only process callees BEFORE main (no CRT after main)
-    for target_file_offset in call_targets {
+    while let Some(target_file_offset) = pending_targets.pop_front() {
         if processed_targets.contains(&target_file_offset) {
             continue;
         }
         processed_targets.insert(target_file_offset);
         
         if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
-            // Must start with push rbp (0x55)
-            if pe.data[target_file_offset] == 0x55 {
-                let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 300, pe.data.len())];
+            let entry = resolve_callee_entry(&pe.data, target_file_offset, file_offset);
+            if let Some(entry) = entry {
+                let callee_code = &pe.data[entry..std::cmp::min(entry + 300, pe.data.len())];
                 let mut callee_instrs = disassemble_callee(callee_code, 100);
                 
                 for instr in &mut callee_instrs {
-                    instr.offset += target_file_offset;
+                    instr.offset += entry;
                 }
                 
-                // Check for recursive calls within this callee
-                let callee_targets = find_internal_call_targets(&callee_instrs, file_offset);
-                for nested_target in callee_targets {
-                    // For recursion, allow calling self
-                    if nested_target == target_file_offset {
-                        // Self-recursion is fine, already in all_instrs
-                        continue;
-                    }
-                    
-                    if !processed_targets.contains(&nested_target) && nested_target < file_offset {
-                        if nested_target + 100 <= pe.data.len() && pe.data[nested_target] == 0x55 {
-                            let nested_code = &pe.data[nested_target..std::cmp::min(nested_target + 300, pe.data.len())];
-                            let mut nested_instrs = disassemble_callee(nested_code, 100);
-                            
-                            for instr in &mut nested_instrs {
-                                instr.offset += nested_target;
-                            }
-                            
-                            all_instrs.extend(nested_instrs);
-                            processed_targets.insert(nested_target);
-                        }
+                for nested_target in find_internal_call_targets(&callee_instrs, file_offset) {
+                    if nested_target < file_offset && !processed_targets.contains(&nested_target) {
+                        pending_targets.push_back(nested_target);
                     }
                 }
                 
@@ -210,6 +193,26 @@ fn disassemble_window(code: &[u8], max_instrs: usize, stop_at_first_ret: bool) -
     }
 
     instructions
+}
+
+fn resolve_callee_entry(pe_data: &[u8], target: usize, main_file_offset: usize) -> Option<usize> {
+    if target >= main_file_offset || main_file_offset - target >= 0x800 {
+        return None;
+    }
+    if pe_data.get(target) == Some(&0x55) {
+        return Some(target);
+    }
+    let search_start = target.saturating_sub(48);
+    for off in (search_start..target).rev() {
+        if pe_data.get(off) == Some(&0x55)
+            && pe_data.get(off + 1) == Some(&0x48)
+            && pe_data.get(off + 2) == Some(&0x89)
+            && pe_data.get(off + 3) == Some(&0xE5)
+        {
+            return Some(off);
+        }
+    }
+    None
 }
 
 fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize) -> Vec<usize> {
