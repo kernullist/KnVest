@@ -659,17 +659,23 @@ fn is_mul_or_add_kind(kind: &X64InstrKind) -> bool {
     )
 }
 
-fn mov_into_mul_dest(mov: &X64InstrKind, mul: &X64InstrKind) -> bool {
-    match (mov, mul) {
-        (X64InstrKind::MovRegReg { dst, .. }, X64InstrKind::ImulRegReg { dst: mul_dst, .. }) => {
-            dst.to_vm_reg() == mul_dst.to_vm_reg()
-        }
-        (X64InstrKind::MovRegReg { dst, .. }, X64InstrKind::ImulRegMem { dst: mul_dst, .. }) => {
-            dst.to_vm_reg() == mul_dst.to_vm_reg()
-        }
-        (X64InstrKind::MovRegReg { dst, .. }, X64InstrKind::AddRegReg { dst: add_dst, .. }) => {
-            dst.to_vm_reg() == add_dst.to_vm_reg()
-        }
+fn mul_dest_reg(kind: &X64InstrKind) -> Option<X64Reg> {
+    match kind {
+        X64InstrKind::ImulRegReg { dst, .. }
+        | X64InstrKind::ImulRegMem { dst, .. }
+        | X64InstrKind::AddRegReg { dst, .. } => Some(*dst),
+        _ => None,
+    }
+}
+
+fn mov_loads_into_reg(kind: &X64InstrKind, dest: X64Reg) -> bool {
+    match kind {
+        X64InstrKind::MovRegReg { dst, .. } if *dst == dest => true,
+        X64InstrKind::MovRegMem {
+            dst,
+            base,
+            offset: _,
+        } if *dst == dest && (*base == X64Reg::Rbp || *base == X64Reg::Ebp) => true,
         _ => false,
     }
 }
@@ -679,14 +685,24 @@ fn mov_before_mul_or_add(instrs: &[X64Instruction], mul_offset: usize) -> Option
     if !is_mul_or_add_kind(&mul.kind) {
         return None;
     }
-    let prev = instrs
-        .iter()
-        .filter(|i| i.offset < mul_offset)
-        .max_by_key(|i| i.offset)?;
-    if mov_into_mul_dest(&prev.kind, &mul.kind) {
-        Some(prev.offset)
-    } else {
-        None
+    let mul_dst = mul_dest_reg(&mul.kind)?;
+    let mut search_before = mul_offset;
+    loop {
+        let Some(prev) = instrs
+            .iter()
+            .filter(|i| i.offset < search_before)
+            .max_by_key(|i| i.offset)
+        else {
+            return None;
+        };
+        if is_fuse_gap_skippable(&prev.kind) {
+            search_before = prev.offset;
+            continue;
+        }
+        if mov_loads_into_reg(&prev.kind, mul_dst) {
+            return Some(prev.offset);
+        }
+        return None;
     }
 }
 
@@ -704,6 +720,63 @@ fn resolve_conditional_jump_target(
 ) -> Option<usize> {
     let adjusted = retarget_conditional_jmp_from_mul(instrs, target_x64_offset);
     resolve_jump_target(label_map, adjusted)
+}
+
+fn vm_instruction_len(bytecode: &[u8], pos: usize) -> Option<usize> {
+    if pos >= bytecode.len() {
+        return None;
+    }
+    let op = OpCode::from_u8(bytecode[pos])?;
+    let operand_bytes = match op {
+        OpCode::Nop | OpCode::Ret => 0,
+        OpCode::LoadImm => 9,
+        OpCode::LoadMem | OpCode::StoreMem | OpCode::Move | OpCode::Cmp => 2,
+        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor => 3,
+        OpCode::Jmp | OpCode::Call | OpCode::NativeCall | OpCode::LoadStr => 8,
+        OpCode::JmpIf => 9,
+        OpCode::Push | OpCode::Pop | OpCode::Exit | OpCode::LoadByte => 1,
+    };
+    Some(1 + operand_bytes)
+}
+
+fn vm_instruction_start_ending_at(bytecode: &[u8], end: usize) -> Option<usize> {
+    let mut pos = 0;
+    while pos < end {
+        let len = vm_instruction_len(bytecode, pos)?;
+        if pos + len == end {
+            return Some(pos);
+        }
+        if pos + len > end {
+            return None;
+        }
+        pos += len;
+    }
+    None
+}
+
+fn retarget_vm_jmpif_from_mul_to_move(target_vm: usize, bytecode: &[u8]) -> usize {
+    if target_vm >= bytecode.len() {
+        return target_vm;
+    }
+    let op_byte = bytecode[target_vm];
+    if op_byte != OpCode::Mul as u8 && op_byte != OpCode::Add as u8 {
+        return target_vm;
+    }
+    if target_vm + 1 >= bytecode.len() {
+        return target_vm;
+    }
+    let mul_dst = bytecode[target_vm + 1];
+    let Some(move_start) = vm_instruction_start_ending_at(bytecode, target_vm) else {
+        return target_vm;
+    };
+    if bytecode[move_start] != OpCode::Move as u8 {
+        return target_vm;
+    }
+    if bytecode[move_start + 1] == mul_dst {
+        move_start
+    } else {
+        target_vm
+    }
 }
 
 fn is_fuse_gap_skippable(kind: &X64InstrKind) -> bool {
@@ -1277,7 +1350,10 @@ fn lift_to_vm_bytecode_internal(
         } else {
             resolve_conditional_jump_target(instrs, &label_map, target_x64_offset)
         };
-        if let Some(target_vm_offset) = target_vm_offset {
+        if let Some(mut target_vm_offset) = target_vm_offset {
+            if !is_unconditional {
+                target_vm_offset = retarget_vm_jmpif_from_mul_to_move(target_vm_offset, &bytecode);
+            }
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
@@ -1775,7 +1851,10 @@ fn lift_to_vm_bytecode_internal_with_main(
         } else {
             resolve_conditional_jump_target(instrs, &label_map, target_x64_offset)
         };
-        if let Some(target_vm_offset) = target_vm_offset {
+        if let Some(mut target_vm_offset) = target_vm_offset {
+            if !is_unconditional {
+                target_vm_offset = retarget_vm_jmpif_from_mul_to_move(target_vm_offset, &bytecode);
+            }
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
@@ -2273,6 +2352,87 @@ mod tests {
         let jmp_pos = bc.iter().position(|&b| b == OpCode::Jmp as u8).unwrap();
         let target = u64::from_le_bytes(bc[jmp_pos + 1..jmp_pos + 9].try_into().unwrap()) as usize;
         assert_eq!(bc[target], OpCode::Cmp as u8);
+    }
+
+    #[test]
+    fn vm_retarget_jmpif_from_mul_to_preceding_move() {
+        let bytecode = vec![
+            OpCode::Move as u8,
+            0,
+            10,
+            OpCode::Mul as u8,
+            0,
+            0,
+            11,
+            OpCode::JmpIf as u8,
+            5,
+            3,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(retarget_vm_jmpif_from_mul_to_move(3, &bytecode), 0);
+        assert_eq!(retarget_vm_jmpif_from_mul_to_move(0, &bytecode), 0);
+    }
+
+    #[test]
+    fn conditional_jmp_retargets_with_mov_mem_cdqe_imul_mem() {
+        let main_off = 0x400;
+        let mov_off = main_off + 0x39;
+        let cdqe_off = mov_off + 3;
+        let mul_off = cdqe_off + 2;
+        let jle_off = main_off + 0x190;
+        let instrs = vec![
+            X64Instruction {
+                offset: mov_off,
+                bytes: vec![0x8B, 0x45, 0xF4],
+                kind: X64InstrKind::MovRegMem {
+                    dst: X64Reg::Rax,
+                    base: X64Reg::Rbp,
+                    offset: -12,
+                },
+            },
+            X64Instruction {
+                offset: cdqe_off,
+                bytes: vec![0x48, 0x98],
+                kind: X64InstrKind::Cdqe,
+            },
+            X64Instruction {
+                offset: mul_off,
+                bytes: vec![0x0F, 0xAF, 0x45, 0xF8],
+                kind: X64InstrKind::ImulRegMem {
+                    dst: X64Reg::Rax,
+                    base: X64Reg::Rbp,
+                    offset: -8,
+                },
+            },
+            X64Instruction {
+                offset: jle_off,
+                bytes: vec![0x7E, 0x00],
+                kind: X64InstrKind::Jle {
+                    target_offset: (mul_off as i32) - (jle_off as i32 + 2),
+                },
+            },
+            ret_at(jle_off + 2),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let jmp_if_pos = bc
+            .windows(2)
+            .position(|w| w[0] == OpCode::JmpIf as u8 && w[1] == 5)
+            .expect("inner JLE jmp_if");
+        let target =
+            u64::from_le_bytes(bc[jmp_if_pos + 2..jmp_if_pos + 10].try_into().unwrap()) as usize;
+        let mul_pos = bc.iter().position(|&b| b == OpCode::Mul as u8).unwrap();
+        let move_pos = bc.iter().position(|&b| b == OpCode::Move as u8).unwrap();
+        assert_eq!(
+            target, move_pos,
+            "MinGW mov [i]; cdqe; imul [j] must jmp_if to move, not mul"
+        );
+        assert_ne!(target, mul_pos);
     }
 
     #[test]
