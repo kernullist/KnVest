@@ -123,7 +123,7 @@ impl StubEmitter {
         self.jmp_rel32("name_cmp_loop");
 
         self.label("module_next");
-        self.emit(&[0x48, 0x8B, 0x1B]); // mov rbx, [rbx] — next InMemoryOrderModuleList entry
+        self.emit(&[0x48, 0x8B, 0x09]); // mov rcx, [rcx] — advance InMemoryOrderModuleList
         self.jmp_rel32("module_loop");
 
         self.label("name_cmp_done");

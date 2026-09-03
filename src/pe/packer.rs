@@ -157,7 +157,14 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     
     all_instrs.sort_by_key(|i| i.offset);
 
-    let bytecode = lift_to_vm_bytecode_for_main(&all_instrs, target_rva, file_offset, &pe.data);
+    let printf_literal = find_printf_literal_in_pe(pe);
+    let bytecode = lift_to_vm_bytecode_for_main(
+        &all_instrs,
+        target_rva,
+        file_offset,
+        &pe.data,
+        printf_literal.as_deref(),
+    );
 
     Ok(bytecode)
 }
@@ -227,6 +234,26 @@ fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize
     targets
 }
 
+
+fn find_printf_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
+    const NEEDLES: &[&[u8]] = &[b"Hello, World!\n", b"Hello, World!"];
+    for name in [".rdata", ".rdata$zzz", ".rodata", ".data"] {
+        if let Ok(sec) = pe.get_section(name) {
+            let start = sec.pointer_to_raw_data as usize;
+            let end = (start + sec.size_of_raw_data as usize).min(pe.data.len());
+            if start >= end {
+                continue;
+            }
+            let data = &pe.data[start..end];
+            for needle in NEEDLES {
+                if data.windows(needle.len()).any(|w| w == *needle) {
+                    return Some(needle.to_vec());
+                }
+            }
+        }
+    }
+    None
+}
 
 fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) -> PEResult<()> {
     let _original_entry_rva = pe.entry_point_rva;
@@ -782,5 +809,69 @@ mod tests {
                     i, original, packed);
             }
         }
+    }
+
+    #[test]
+    fn test_find_printf_literal_in_rdata() {
+        let pe_data = test_pe::create_pe64_with_overlay();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let sec = pe.get_section(".data").unwrap();
+        let off = sec.pointer_to_raw_data as usize;
+        let msg = b"Hello, World!\n";
+        while pe.data.len() < off + msg.len() {
+            pe.data.push(0);
+        }
+        pe.data[off..off + msg.len()].copy_from_slice(msg);
+        let found = super::find_printf_literal_in_pe(&pe);
+        assert_eq!(found.as_deref(), Some(&b"Hello, World!\n"[..]));
+    }
+
+    #[test]
+    fn test_module_next_advances_rcx_not_rbx() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let advance_rcx = [0x48u8, 0x8B, 0x09];
+        let advance_rbx = [0x48u8, 0x8B, 0x1B];
+        assert!(
+            stub.windows(advance_rcx.len()).any(|w| w == advance_rcx),
+            "module_next must advance list with mov rcx, [rcx]"
+        );
+        assert!(
+            !stub.windows(advance_rbx.len()).any(|w| w == advance_rbx),
+            "module_next must not dereference uninitialized rbx"
+        );
+    }
+
+    #[test]
+    fn test_handler_targets_for_push_and_native_call() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let pat = [0x48u8, 0x8D, 0x1D];
+        let mut table_base = 0usize;
+        for i in 0..stub.len().saturating_sub(7) {
+            if stub[i..i + 3] == pat {
+                let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
+                table_base = (i as i64 + 7 + disp as i64) as usize;
+                break;
+            }
+        }
+        let table_end = table_base + 1024;
+        let load_imm_off = i32::from_le_bytes(
+            stub[table_base + 4..table_base + 8].try_into().unwrap(),
+        );
+        let load_imm_target = (table_base as i64 + load_imm_off as i64) as usize;
+        assert!(load_imm_off > 0);
+        assert!(load_imm_target >= table_end);
+        assert_eq!(stub[load_imm_target], 0x0F);
+        assert_eq!(stub[load_imm_target + 1], 0xB6);
+
+        let nc_off = i32::from_le_bytes(
+            stub[table_base + 0x0E * 4..table_base + 0x0E * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let nc_target = (table_base as i64 + nc_off as i64) as usize;
+        assert!(nc_off > 0);
+        assert!(nc_target >= table_end);
+        assert_eq!(stub[nc_target], 0x48);
+        assert_eq!(stub[nc_target + 1], 0x8B);
     }
 }
