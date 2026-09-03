@@ -739,19 +739,27 @@ mod tests {
     fn test_jmpif_ne_uses_jne_not_je() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
         let ne_cond = [0x83u8, 0xF9, 0x02];
+        let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
-        for i in 0..stub.len().saturating_sub(ne_cond.len() + 16) {
+        for i in 0..stub.len().saturating_sub(ne_cond.len() + 32) {
             if stub[i..i + 3] != ne_cond {
                 continue;
             }
-            let window = &stub[i..i + 20];
-            assert!(
-                window.windows(2).any(|w| w == [0x0F, 0x85]),
-                "JmpIf NE must use native jne rel32 (0F 85) after popfq"
+            let window = &stub[i..i + 32];
+            let push_at = window
+                .windows(push_flags.len())
+                .position(|w| w == push_flags)
+                .expect("JmpIf must push saved VM flags before popfq");
+            assert_eq!(window[push_at + push_flags.len()], 0x9D, "JmpIf must popfq before semantic jcc");
+            assert_eq!(
+                window[push_at + push_flags.len() + 1],
+                0x0F,
+                "JmpIf NE must use near jcc rel32"
             );
-            assert!(
-                !window.windows(2).any(|w| w == [0x75, 0x00] || w == [0x74, 0x00]),
-                "JmpIf NE must not use rel8 placeholders"
+            assert_eq!(
+                window[push_at + push_flags.len() + 2],
+                0x85,
+                "JmpIf NE must use native jne rel32 (0F 85) on restored flags"
             );
             found = true;
             break;
