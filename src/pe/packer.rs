@@ -21,54 +21,68 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec
     Ok(bytecode)
 }
 
+fn has_stack_prologue(text_data: &[u8], offset: usize) -> bool {
+    if offset + 7 >= text_data.len() {
+        return false;
+    }
+    // sub rsp, imm8  (48 83 EC xx)
+    if text_data[offset + 4] == 0x48
+        && text_data[offset + 5] == 0x83
+        && text_data[offset + 6] == 0xEC
+    {
+        return true;
+    }
+    // sub rsp, imm32 (48 81 EC xx xx xx xx)
+    offset + 10 < text_data.len()
+        && text_data[offset + 4] == 0x48
+        && text_data[offset + 5] == 0x81
+        && text_data[offset + 6] == 0xEC
+}
+
+fn has_near_call_in_window(text_data: &[u8], offset: usize, window: usize) -> bool {
+    let start = offset + 4;
+    let end = std::cmp::min(offset + window, text_data.len());
+    if start + 5 > end {
+        return false;
+    }
+    text_data[start..end].contains(&0xE8)
+}
+
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
-    let text_section = pe.get_section(".text")
+    let text_section = pe
+        .get_section(".text")
         .or_else(|_| pe.get_section("CODE"))?;
-    
+
     let text_start_rva = text_section.virtual_address;
-    
+
     let text_offset = pe.rva_to_file_offset(text_start_rva)?;
-    let text_data = &pe.data[text_offset..std::cmp::min(text_offset + text_section.size_of_raw_data as usize, pe.data.len())];
-    
+    let text_data = &pe.data
+        [text_offset..std::cmp::min(text_offset + text_section.size_of_raw_data as usize, pe.data.len())];
+
     let mut candidates = Vec::new();
-    
-    for offset in (0..text_data.len().saturating_sub(50)).step_by(1) {
-        if text_data.len() < offset + 10 {
-            break;
-        }
-        
-        if text_data[offset] == 0x55 &&
-           text_data[offset + 1] == 0x48 &&
-           text_data[offset + 2] == 0x89 &&
-           text_data[offset + 3] == 0xE5 {
-            
-            let has_sub_rsp = offset + 7 < text_data.len() &&
-                text_data[offset + 4] == 0x48 &&
-                text_data[offset + 5] == 0x83 &&
-                text_data[offset + 6] == 0xEC;
-            
-            if !has_sub_rsp {
-                continue;
-            }
-            
-            let has_call_to_main = (offset + 20 < text_data.len()) && 
-                text_data[offset + 8..offset + 13].windows(5).any(|w| w[0] == 0xE8);
-            
-            if has_call_to_main {
-                let candidate_rva = text_start_rva + offset as u32;
-                if offset >= 0x4d0 && offset <= 0x800 {
-                    candidates.push((candidate_rva, offset));
-                }
-            }
+
+    for offset in 0..text_data.len().saturating_sub(50) {
+        if text_data[offset] == 0x55
+            && text_data[offset + 1] == 0x48
+            && text_data[offset + 2] == 0x89
+            && text_data[offset + 3] == 0xE5
+            && has_stack_prologue(text_data, offset)
+            && has_near_call_in_window(text_data, offset, 0x100)
+            && (0x350..=0x900).contains(&offset)
+        {
+            candidates.push((text_start_rva + offset as u32, offset));
         }
     }
-    
-    if let Some(&(rva, offset)) = candidates.first() {
+
+    if let Some(&(rva, offset)) = candidates.iter().max_by_key(|(_, off)| *off) {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
         return Ok(rva);
     }
-    
-    eprintln!("Could not auto-detect main, using entry point {:#x}", pe.entry_point_rva);
+
+    eprintln!(
+        "Could not auto-detect main, using entry point {:#x}",
+        pe.entry_point_rva
+    );
     Ok(pe.entry_point_rva)
 }
 
@@ -106,7 +120,7 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
             // Must start with push rbp (0x55)
             if pe.data[target_file_offset] == 0x55 {
                 let callee_code = &pe.data[target_file_offset..std::cmp::min(target_file_offset + 300, pe.data.len())];
-                let mut callee_instrs = disassemble_until_ret(callee_code, 100);
+                let mut callee_instrs = disassemble_callee(callee_code, 100);
                 
                 for instr in &mut callee_instrs {
                     instr.offset += target_file_offset;
@@ -124,7 +138,7 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
                     if !processed_targets.contains(&nested_target) && nested_target < file_offset {
                         if nested_target + 100 <= pe.data.len() && pe.data[nested_target] == 0x55 {
                             let nested_code = &pe.data[nested_target..std::cmp::min(nested_target + 300, pe.data.len())];
-                            let mut nested_instrs = disassemble_until_ret(nested_code, 100);
+                            let mut nested_instrs = disassemble_callee(nested_code, 100);
                             
                             for instr in &mut nested_instrs {
                                 instr.offset += nested_target;
@@ -141,37 +155,53 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
         }
     }
     
+    all_instrs.sort_by_key(|i| i.offset);
+
     let bytecode = lift_to_vm_bytecode_for_main(&all_instrs, target_rva, file_offset);
-    
+
     Ok(bytecode)
 }
 
 fn disassemble_until_ret(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
+    disassemble_window(code, max_instrs, true)
+}
+
+/// Disassemble a pre-main callee: do not stop at the first `ret` (early-return paths),
+/// stop at the next `push rbp` prologue or instruction limit.
+fn disassemble_callee(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
+    disassemble_window(code, max_instrs, false)
+}
+
+fn disassemble_window(code: &[u8], max_instrs: usize, stop_at_first_ret: bool) -> Vec<X64Instruction> {
     let mut instructions = Vec::new();
     let mut offset = 0;
-    
+
     while offset < code.len() && instructions.len() < max_instrs {
+        if offset > 0 && code[offset] == 0x55 {
+            break;
+        }
+
         let start_offset = offset;
         let remaining = &code[offset..];
-        
+
         if remaining.is_empty() {
             break;
         }
-        
+
         let mut instr_bytes = Vec::new();
         let kind = super::lifter::decode_instruction(remaining, &mut instr_bytes, &mut offset);
-        
+
         instructions.push(X64Instruction {
             offset: start_offset,
             bytes: instr_bytes,
             kind: kind.clone(),
         });
-        
-        if matches!(kind, X64InstrKind::Ret) {
+
+        if stop_at_first_ret && matches!(kind, X64InstrKind::Ret) {
             break;
         }
     }
-    
+
     instructions
 }
 
@@ -187,7 +217,7 @@ fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize
             if target_abs_offset < main_file_offset {
                 let distance = main_file_offset - target_abs_offset;
                 // Allow up to 512 bytes before main (for larger functions like factorial)
-                if distance < 0x200 {
+                if distance < 0x800 {
                     targets.push(target_abs_offset);
                 }
             }
@@ -584,6 +614,74 @@ mod tests {
             }
         }
         assert!(loadbyte_lea_found, "LoadByte lea rdx must patch to opcode 0 (VMBC+4)");
+    }
+
+    #[test]
+    fn test_prologue_uses_near_jb_ja_not_jl_jg() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let cmp_a = [0x83u8, 0xF8, 0x41];
+        let mut found_jb = false;
+        for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
+            if stub[i..i + 3] != cmp_a {
+                continue;
+            }
+            assert_eq!(
+                stub[i + 3],
+                0x0F,
+                "unsigned char range check must use near jcc"
+            );
+            assert_eq!(
+                stub[i + 4],
+                0x82,
+                "cmp eax,'A' must be followed by near jb (0F 82), not jl"
+            );
+            found_jb = true;
+            break;
+        }
+        assert!(found_jb, "kernel32 lowercase prologue must exist");
+    }
+
+    #[test]
+    fn test_handler_table_resolves_handlers() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let dispatch_lea = [0x48u8, 0x8D, 0x1D];
+        let mut table_base = None;
+        for i in 0..stub.len().saturating_sub(7) {
+            if stub[i..i + 3] == dispatch_lea {
+                let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
+                table_base = Some((i + 7) as isize + disp as isize);
+                break;
+            }
+        }
+        let table_base = table_base.expect("dispatch lea rbx,[handler_table]") as usize;
+        let load_imm_off = i32::from_le_bytes([
+            stub[table_base + 4],
+            stub[table_base + 5],
+            stub[table_base + 6],
+            stub[table_base + 7],
+        ]);
+        let h_load_imm = (table_base as i64 + load_imm_off as i64) as usize;
+        assert_eq!(stub[h_load_imm], 0x0F);
+        assert_eq!(stub[h_load_imm + 1], 0xB6);
+    }
+
+    #[test]
+    fn test_detect_main_prefers_high_candidate() {
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let text_off = pe.rva_to_file_offset(text.virtual_address).unwrap();
+        let sec_off = pe.sections_offset;
+        pe.data[sec_off + 16..sec_off + 20].copy_from_slice(&0x600u32.to_le_bytes());
+        while pe.data.len() < text_off + 0x600 {
+            pe.data.push(0x90);
+        }
+        let crt = [0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x28, 0xE8, 0x05, 0x00, 0x00, 0x00, 0x90, 0xC3];
+        pe.data[text_off + 0x380..text_off + 0x380 + crt.len()].copy_from_slice(&crt);
+        let mainfn = [0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x10, 0x00, 0x00, 0x00, 0xC3];
+        pe.data[text_off + 0x400..text_off + 0x400 + mainfn.len()].copy_from_slice(&mainfn);
+        let rva = super::detect_main_rva(&pe).unwrap();
+        assert_eq!(rva, text.virtual_address + 0x400);
     }
 
     #[test]

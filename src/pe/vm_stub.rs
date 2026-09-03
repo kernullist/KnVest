@@ -51,15 +51,18 @@ impl StubEmitter {
     }
 
     fn jcc_rel32_short(&mut self, cc: u8, target: &'static str) {
-        // Use near jcc (rel32) not rel8
+        // Map rel8 jcc opcodes to their rel32 near equivalents (0F xx)
         let near = match cc {
-            0x74 => 0x84, // je -> jz rel32
-            0x75 => 0x85, // jne -> jnz rel32
+            0x72 => 0x82, // jb/jc
+            0x73 => 0x83, // jae/jnb
+            0x74 => 0x84, // je/jz
+            0x75 => 0x85, // jne/jnz
+            0x76 => 0x86, // jbe/jna
+            0x77 => 0x87, // ja/jnbe
             0x7C => 0x8C, // jl
             0x7D => 0x8D, // jge
             0x7E => 0x8E, // jle
             0x7F => 0x8F, // jg
-            0x73 => 0x83, // jae
             _ => cc,
         };
         self.jcc_rel32(near, target);
@@ -118,6 +121,7 @@ impl StubEmitter {
         self.jmp_rel32("name_cmp_loop");
 
         self.label("module_next");
+        self.emit(&[0x48, 0x8B, 0x1B]); // mov rbx, [rbx] — next InMemoryOrderModuleList entry
         self.jmp_rel32("module_loop");
 
         self.label("name_cmp_done");
@@ -535,7 +539,6 @@ impl StubEmitter {
     fn emit_handler_table(&mut self) {
         self.label("handler_table");
         let table_base = self.pos();
-        let mut entries: Vec<u32> = vec![0; 256];
         let handlers: [(u8, &str); 16] = [
             (0x00, "h_nop"),
             (0x01, "h_load_imm"),
@@ -555,13 +558,13 @@ impl StubEmitter {
             (0xFF, "h_exit"),
         ];
         let default_off = self.handler_offset("h_nop", table_base);
-        for i in 0..256 {
-            entries[i] = default_off;
-        }
-        for (op, label) in handlers {
-            entries[op as usize] = self.handler_offset(label, table_base);
-        }
-        for off in entries {
+        for i in 0..256usize {
+            let op = i as u8;
+            let off = handlers
+                .iter()
+                .find(|(hop, _)| *hop == op)
+                .map(|(_, label)| self.handler_offset(label, table_base))
+                .unwrap_or(default_off);
             self.emit(&off.to_le_bytes());
         }
     }
