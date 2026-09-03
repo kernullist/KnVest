@@ -573,6 +573,66 @@ fn resolve_internal_call_target(
     target
 }
 
+fn lift_order_indices(instrs: &[X64Instruction], main_x64_offset: usize) -> Vec<usize> {
+    let mut main_idxs: Vec<usize> = instrs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.offset >= main_x64_offset)
+        .map(|(idx, _)| idx)
+        .collect();
+    let mut callee_idxs: Vec<usize> = instrs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.offset < main_x64_offset)
+        .map(|(idx, _)| idx)
+        .collect();
+    callee_idxs.sort_by_key(|&idx| instrs[idx].offset);
+    main_idxs.extend(callee_idxs);
+    main_idxs
+}
+
+fn emit_mov_reg_reg(bytecode: &mut Vec<u8>, dst: &X64Reg, src: &X64Reg) {
+    bytecode.push(OpCode::Move as u8);
+    bytecode.push(dst.to_vm_reg());
+    bytecode.push(src.to_vm_reg());
+}
+
+fn emit_add_reg_reg(bytecode: &mut Vec<u8>, dst: &X64Reg, src: &X64Reg) {
+    bytecode.push(OpCode::Add as u8);
+    bytecode.push(dst.to_vm_reg());
+    bytecode.push(dst.to_vm_reg());
+    bytecode.push(src.to_vm_reg());
+}
+
+fn try_fuse_index_base_mov_pair(
+    instrs: &[X64Instruction],
+    lift_indices: &[usize],
+    pos: usize,
+    bytecode: &mut Vec<u8>,
+) -> bool {
+    let idx = lift_indices[pos];
+    let X64InstrKind::MovRegReg { dst, src: index } = &instrs[idx].kind else {
+        return false;
+    };
+    if pos + 1 >= lift_indices.len() {
+        return false;
+    }
+    let next_idx = lift_indices[pos + 1];
+    let X64InstrKind::MovRegReg {
+        dst: dst2,
+        src: base,
+    } = &instrs[next_idx].kind
+    else {
+        return false;
+    };
+    if dst != dst2 || base == index {
+        return false;
+    }
+    emit_mov_reg_reg(bytecode, dst, base);
+    emit_add_reg_reg(bytecode, dst, index);
+    true
+}
+
 fn callee_entry_for(instrs: &[X64Instruction], offset: usize, main_x64_offset: usize) -> usize {
     instrs
         .iter()
@@ -1072,9 +1132,25 @@ fn lift_to_vm_bytecode_internal_with_main(
     let main_has_printf = !has_putchar_callees && main_external_calls > 1;
 
     let mut hit_main_ret = false;
+    let lift_indices = lift_order_indices(instrs, main_x64_offset);
+    let mut skip_next = false;
 
-    for instr in instrs {
+    for (pos, &idx) in lift_indices.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let instr = &instrs[idx];
         label_map.insert(instr.offset, bytecode.len());
+
+        if try_fuse_index_base_mov_pair(instrs, &lift_indices, pos, &mut bytecode) {
+            if pos + 1 < lift_indices.len() {
+                let next_instr = &instrs[lift_indices[pos + 1]];
+                label_map.insert(next_instr.offset, bytecode.len());
+            }
+            skip_next = true;
+            continue;
+        }
 
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
@@ -1740,5 +1816,109 @@ mod tests {
         let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
         assert_eq!(native_call_ids(&bc), vec![2]);
         assert!(bc.contains(&(OpCode::Call as u8)));
+        let call_off = bc.iter().position(|&b| b == OpCode::Call as u8).unwrap();
+        assert!(call_off < 20, "main must be first; call must not target offset 0 callee");
+        let mut target = [0u8; 8];
+        target.copy_from_slice(&bc[call_off + 1..call_off + 9]);
+        let target_off = u64::from_le_bytes(target);
+        assert!(target_off > 0, "internal call must jump past main, not to 0");
+    }
+
+    #[test]
+    fn main_bytecode_precedes_callees() {
+        let callee_off = 0x100;
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: callee_off,
+                bytes: vec![0x55],
+                kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+            },
+            ret_at(callee_off + 1),
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0xB8, 0x01, 0x00, 0x00, 0x00],
+                kind: X64InstrKind::MovRegImm {
+                    reg: X64Reg::Eax,
+                    imm: 1,
+                },
+            },
+            ret_at(main_off + 5),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        assert_eq!(bc[0], OpCode::LoadImm as u8, "main must start at bytecode offset 0");
+    }
+
+    #[test]
+    fn jg_branch_emits_jmp_if_condition_5() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x7F, 0x00],
+                kind: X64InstrKind::Jg { target_offset: 0 },
+            },
+            ret_at(main_off + 2),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let jmp_if_pos = bc.iter().position(|&b| b == OpCode::JmpIf as u8).unwrap();
+        assert_eq!(bc[jmp_if_pos + 1], 5);
+    }
+
+    #[test]
+    fn decodes_jg_and_jle_rel8() {
+        assert!(matches!(
+            decode(&[0x7F, 0x10]),
+            X64InstrKind::Jg { target_offset: 0x10 }
+        ));
+        assert!(matches!(
+            decode(&[0x7E, 0x10]),
+            X64InstrKind::Jle { target_offset: 0x10 }
+        ));
+    }
+
+    #[test]
+    fn jle_branch_emits_jmp_if_condition_4() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x7E, 0x00],
+                kind: X64InstrKind::Jle { target_offset: 0 },
+            },
+            ret_at(main_off + 2),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let jmp_if_pos = bc.iter().position(|&b| b == OpCode::JmpIf as u8).unwrap();
+        assert_eq!(bc[jmp_if_pos + 1], 4);
+    }
+
+    #[test]
+    fn fuses_mov_index_then_mov_base_into_add() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x89, 0xD8],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::Rbx,
+                },
+            },
+            X64Instruction {
+                offset: main_off + 2,
+                bytes: vec![0x89, 0xF0],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::Rsi,
+                },
+            },
+            ret_at(main_off + 4),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let moves = bc.iter().filter(|&&b| b == OpCode::Move as u8).count();
+        let adds = bc.iter().filter(|&&b| b == OpCode::Add as u8).count();
+        assert_eq!(moves, 1, "fused pair should emit one move, not two");
+        assert_eq!(adds, 1);
     }
 }
