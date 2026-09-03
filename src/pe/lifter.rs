@@ -573,7 +573,7 @@ pub fn lift_to_vm_bytecode_for_main(
     pe_data: &[u8],
     printf_literal: Option<&[u8]>,
 ) -> Vec<u8> {
-    let (mut bytecode, _, string_patch_positions, main_has_printf, _) =
+    let (mut bytecode, _, string_patch_positions, _main_has_printf, _) =
         lift_to_vm_bytecode_internal_with_main(
             instrs,
             base_rva,
@@ -582,17 +582,15 @@ pub fn lift_to_vm_bytecode_for_main(
             printf_literal,
         );
 
-    if main_has_printf {
-        if let Some(string_bytes) = printf_literal {
-            let offset = ((bytecode.len() + 15) / 16) * 16;
-            while bytecode.len() < offset {
-                bytecode.push(0x00);
-            }
-            bytecode.extend_from_slice(string_bytes);
-            let string_offset = offset as u64;
-            for patch_pos in string_patch_positions {
-                bytecode[patch_pos..patch_pos + 8].copy_from_slice(&string_offset.to_le_bytes());
-            }
+    if let Some(string_bytes) = printf_literal {
+        let offset = ((bytecode.len() + 15) / 16) * 16;
+        while bytecode.len() < offset {
+            bytecode.push(0x00);
+        }
+        bytecode.extend_from_slice(string_bytes);
+        let string_offset = offset as u64;
+        for patch_pos in string_patch_positions {
+            bytecode[patch_pos..patch_pos + 8].copy_from_slice(&string_offset.to_le_bytes());
         }
     } else if !string_patch_positions.is_empty() {
         let offset = ((bytecode.len() + 15) / 16) * 16;
@@ -1234,6 +1232,9 @@ fn lift_to_vm_bytecode_internal_with_main(
                                 bytecode.extend_from_slice(&(str_bytes.len() as u64).to_le_bytes());
                                 bytecode.push(OpCode::NativeCall as u8);
                                 bytecode.extend_from_slice(&1u64.to_le_bytes());
+                            } else {
+                                bytecode.push(OpCode::NativeCall as u8);
+                                bytecode.extend_from_slice(&2u64.to_le_bytes());
                             }
                         }
                     }
@@ -1340,4 +1341,115 @@ fn lift_to_vm_bytecode_internal_with_main(
         main_has_printf,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::OpCode;
+
+    fn call_at(offset: usize, target: i32) -> X64Instruction {
+        X64Instruction {
+            offset,
+            bytes: vec![0xE8, 0, 0, 0, 0],
+            kind: X64InstrKind::Call {
+                target_offset: target,
+            },
+        }
+    }
+
+    fn ret_at(offset: usize) -> X64Instruction {
+        X64Instruction {
+            offset,
+            bytes: vec![0xC3],
+            kind: X64InstrKind::Ret,
+        }
+    }
+
+    fn native_call_ids(bytecode: &[u8]) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i < bytecode.len() {
+            match OpCode::from_u8(bytecode[i]) {
+                Some(OpCode::LoadImm) if i + 10 <= bytecode.len() => {
+                    i += 10;
+                }
+                Some(OpCode::NativeCall) if i + 9 <= bytecode.len() => {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&bytecode[i + 1..i + 9]);
+                    ids.push(u64::from_le_bytes(bytes));
+                    i += 9;
+                }
+                Some(OpCode::Exit) => {
+                    i += 2;
+                }
+                Some(OpCode::Ret) => {
+                    i += 1;
+                }
+                Some(OpCode::Move) => {
+                    i += 3;
+                }
+                Some(OpCode::Jmp) if i + 9 <= bytecode.len() => {
+                    i += 9;
+                }
+                Some(OpCode::JmpIf) if i + 10 <= bytecode.len() => {
+                    i += 10;
+                }
+                Some(OpCode::Call) if i + 9 <= bytecode.len() => {
+                    i += 9;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn hello_literal_emits_native_call_1_not_2() {
+        let main_off = 0x400;
+        let instrs = vec![
+            call_at(main_off, 0x1000),
+            call_at(main_off + 5, 0x1000),
+            ret_at(main_off + 10),
+        ];
+        let hello = b"Hello, World!\n";
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], Some(hello));
+        assert_eq!(native_call_ids(&bc), vec![1]);
+        assert!(bc.windows(hello.len()).any(|w| w == hello));
+    }
+
+    #[test]
+    fn integer_printf_emits_native_call_2() {
+        let main_off = 0x400;
+        let instrs = vec![
+            call_at(main_off, 0x1000),
+            call_at(main_off + 5, 0x1000),
+            ret_at(main_off + 10),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        assert_eq!(native_call_ids(&bc), vec![2]);
+    }
+
+    #[test]
+    fn str_lea_rip_rel_embeds_knvest_when_no_hello_literal() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x48, 0x8D, 0x05, 0, 0, 0, 0],
+                kind: X64InstrKind::LeaRipRel {
+                    dst: X64Reg::Rax,
+                    offset: 0,
+                },
+            },
+            call_at(main_off + 7, 0x1000),
+            call_at(main_off + 12, 0x1000),
+            ret_at(main_off + 17),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        assert!(bc.windows(7).any(|w| w == b"knvest\0"));
+        assert_eq!(native_call_ids(&bc), vec![2]);
+    }
 }
