@@ -7,8 +7,8 @@ Toy VM protector + IR viewer for your own PE64 binaries (educational/dev tool)
 KnVest is an educational tool that demonstrates basic VM-based code protection for Windows PE64 executables. It provides:
 
 1. A simple register-based virtual machine (VM)
-2. A packer that wraps function code in VM bytecode
-3. An IR viewer that pretty-prints VM bytecode as human-readable assembly
+2. A packer that lifts x64 code into VM bytecode and injects an in-process interpreter stub
+3. An IR viewer that pretty-prints the embedded VM bytecode as human-readable assembly
 
 **Language:** Rust  
 **Target:** Windows x86-64 PE (PE32+)
@@ -25,10 +25,11 @@ This is a toy/educational project, not a production-grade protector. It does NOT
 
 ## Features
 
-- **Minimal VM**: 16 registers, stack, simple opcodes (load, store, arithmetic, control flow)
-- **Pack**: Virtualizes a function (default: entry point) and emits a modified PE
+- **Minimal VM**: 16 registers, call stack, data stack, opcodes (load, arithmetic, control flow, native helpers)
+- **Pack**: Lifts `main` plus pre-main callees (functions starting with `push rbp`) into VM bytecode; new PE entry is the interpreter stub (`0x55` = `push rbp`, not a JMP-to-OEP trampoline)
 - **IR Display**: Pretty-prints VM bytecode with addresses and operands
-- **Portable**: Written in Rust, runs on Linux/Windows, targets PE64
+- **x64 lifter**: Uses [iced-x86](https://github.com/icedland/iced) to decode the lifted code window
+- **Portable**: Written in Rust, runs on Linux/Windows for pack/IR; packed binaries run on Windows
 
 ## Build
 
@@ -42,7 +43,7 @@ The binary will be at `target/release/knvest` (or `knvest.exe` on Windows).
 
 ### Pack an Executable
 
-Wrap the entry-point function in VM protection:
+Virtualize the detected `main` function (default: auto-detect) and write a new PE whose entry point runs the VM interpreter:
 
 ```bash
 knvest pack input.exe -o output.exe
@@ -62,161 +63,103 @@ Pretty-print the VM bytecode from a packed executable:
 knvest ir output.exe
 ```
 
-Example output:
+Example output (bytecode differs per sample):
 
 ```
 Address  | Opcode       | Operands
 ---------+--------------+---------
-00000000 | load_imm     | r0, 0x48656c6c6f
-00000009 | load_imm     | r1, 0x576f726c64
-00000012 | native_call  | 0x1
-0000001b | load_imm     | r0, 0x0
-00000024 | exit         | r0
+00000000 | push         | r5
+00000002 | move         | r5, r4
+...
+00000024 | native_call  | 0x2
+0000002d | load_imm     | r0, 0x0
+00000036 | exit         | r0
 ```
 
-## VM Instruction Set
+## Runtime Model
 
-The VM supports the following operations:
+1. **Parse PE** and locate `main` (or use `--rva`)
+2. **Lift** `main` and real pre-main callees (must start with `0x55`; CRT/`__main` are skipped) via iced-x86 → VM opcodes
+3. **Inject** a `.knvest` section containing:
+   - An x64 VM interpreter stub (opcode → handler VA table dispatch)
+   - A `VMBC` marker followed by VM bytecode
+4. **Redirect** the PE entry point to the stub (first byte `0x55`)
+5. **Execute**: The stub interprets bytecode. Native helpers handle I/O:
+   - `native_call 1` — WriteFile a string from VM registers (used when the lifter emits it from real x64, e.g. hello via `printf`)
+   - `native_call 2` — print integer in `r2` with newline (1/2/3-digit branches)
+   - `native_call 3` — putchar one byte from `r0`, no newline
 
-| Opcode       | Description                                    |
-|--------------|------------------------------------------------|
-| `nop`        | No operation                                   |
-| `load_imm`   | Load immediate value into register             |
-| `load_mem`   | Load from memory into register                 |
-| `store_mem`  | Store register to memory                       |
-| `move`       | Copy value between registers                   |
-| `add`        | Add two registers, store result                |
-| `sub`        | Subtract two registers, store result           |
-| `xor`        | XOR two registers, store result                |
-| `cmp`        | Compare two registers, set flags               |
-| `jmp`        | Unconditional jump                             |
-| `jmp_if`     | Conditional jump based on flags                |
-| `call`       | Call VM function (push return address)         |
-| `ret`        | Return from VM function                        |
-| `native_call`| Call native function by ID                     |
-| `push`       | Push register onto VM stack                    |
-| `pop`        | Pop from VM stack into register                |
-| `exit`       | Exit VM with return code                       |
+Overwriting the original EP bytes with `0xCC` still works: the packed program does not depend on executing the original EP.
 
-## Sample
+**Cmp / branches**: The interpreter stores x64-like flags (ZF/SF/CF/OF). `jmp_if` condition codes match x64 Jcc semantics (JE, JNE, JL, JLE, JG, JGE).
 
-The `sample/` directory contains a hello-world C program:
+## Sample Programs
 
-```c
-#include <stdio.h>
+The `sample/` directory contains seven C programs exercised by the packer:
 
-int main() {
-    printf("Hello, World!\n");
-    return 0;
-}
-```
+| Sample   | Behavior |
+|----------|----------|
+| `hello`  | `printf("Hello, World!\n")` — lifted like all other samples (no special path) |
+| `loop`   | Countdown loop |
+| `arith`  | Arithmetic |
+| `call`   | Internal calls |
+| `nested` | Nested loops, `putchar` via native_call 3 |
+| `fact`   | Recursive factorial |
+| `str`    | Walks embedded `knvest\0` string via LoadByte |
 
-### Building the Sample
+### Building Samples (Windows)
 
-**On Windows:**
+**MinGW:**
 
 ```bash
-# MinGW
-gcc hello.c -o hello.exe
-
-# Visual Studio
-cl hello.c /Fe:hello.exe
-```
-
-**On Linux (cross-compile):**
-
-```bash
-# Install MinGW-w64
-sudo apt-get install mingw-w64
-
-# Compile for Windows x64
 x86_64-w64-mingw32-gcc sample/hello.c -o sample/hello.exe
+x86_64-w64-mingw32-gcc sample/loop.c -o sample/loop.exe
+# ... same for arith.c, call.c, nested.c, fact.c, str.c
 ```
 
-### Pack and Run
+**MSVC (Developer Command Prompt):**
+
+```bat
+cl /Fe:hello.exe sample\hello.c
+cl /Fe:loop.exe sample\loop.c
+```
+
+### Pack and Run (Windows)
 
 ```bash
-# Pack the executable
-cargo run --release -- pack sample/hello.exe -o sample/hello_packed.exe
-
-# View the IR
-cargo run --release -- ir sample/hello_packed.exe
-
-# Run on Windows
-sample/hello_packed.exe
+knvest pack sample/hello.exe -o sample/hello_packed.exe
+knvest ir sample/hello_packed.exe
+sample\hello_packed.exe
 ```
+
+Verify: EP starts with `0x55`, stdout matches original (CRLF/LF ok), exit code 0; patching original EP to `CC` still prints the same output.
 
 ## Testing
-
-Run all unit and integration tests:
 
 ```bash
 cargo test
 ```
 
-Tests cover:
-
-- VM instruction execution semantics
-- IR disassembly and pretty-printing
-- PE file parsing and structure validation
-- End-to-end pack and IR extraction
-
-All tests run on Linux (no Windows runtime required for CI).
+Tests cover VM semantics, IR disassembly, PE parsing/packing, stub invariants (handler table, LoadByte rip-rel, WriteFile slot), and integration pack→IR workflow. Unit tests run on Linux without a Windows runtime.
 
 ## Project Structure
 
 ```
 src/
-├── vm/          - Virtual machine implementation
-│   ├── mod.rs
-│   ├── opcode.rs   - Opcode definitions
-│   └── machine.rs  - VM interpreter
+├── vm/          - Virtual machine (reference interpreter for tests)
 ├── ir/          - IR disassembly and display
-│   └── mod.rs
-├── pe/          - PE file parsing and packing
-│   ├── mod.rs
-│   ├── parser.rs   - PE64 parser
-│   ├── packer.rs   - Function virtualization
-│   └── test_pe.rs  - Minimal PE generator for tests
-├── pack/        - High-level packing logic
-│   └── mod.rs
-├── cli/         - Command-line interface
-│   └── mod.rs
-├── main.rs      - CLI entry point
-└── lib.rs       - Library exports
+├── pe/
+│   ├── parser.rs
+│   ├── lifter.rs   - iced-x86 lifter → VM bytecode
+│   ├── vm_stub.rs  - x64 interpreter stub generator
+│   └── packer.rs
+├── pack/
+├── cli/
+└── main.rs
 
+sample/          - hello, loop, arith, call, nested, fact, str
 tests/
-└── integration_test.rs
-
-sample/
-├── hello.c
-└── README.md
 ```
-
-## How It Works
-
-1. **Parse PE**: Read the input PE64 file and extract the original entry point RVA
-2. **Generate Bytecode**: Create VM bytecode that represents calling the original entry point
-3. **Create New Section**: Add a `.knvest` section containing:
-   - A small x64 stub that jumps to the original entry point
-   - A `VMBC` marker followed by the VM bytecode
-4. **Update Headers**: Properly update:
-   - Section count in COFF header
-   - Entry point RVA to point to the new section
-   - Image size in optional header
-5. **Execute**: At runtime, the stub redirects execution to the original entry point, so the program behaves identically
-
-The VM bytecode is present and extractable (for IR viewing) but the current toy implementation uses a direct jump rather than full interpretation. A production protector would implement a complete VM interpreter that executes the bytecode instruction-by-instruction.
-
-### Why This Approach?
-
-This demonstrates the key concepts of VM-based protection:
-- Adding new PE sections with proper alignment
-- Redirecting control flow through a stub
-- Embedding bytecode that can be disassembled and viewed
-- Maintaining a valid, loadable PE structure
-
-The bytecode format is real and uses actual VM opcodes. Future enhancements could add a full interpreter loop in x64 assembly.
 
 ## License
 
@@ -224,4 +167,4 @@ MIT License (see LICENSE file)
 
 ## Disclaimer
 
-This is an educational tool for learning about code virtualization and PE file formats. Use only on your own binaries. Not intended for malicious use or to circumvent software protections.
+Educational tool for learning about code virtualization and PE file formats. Use only on your own binaries. Not intended for malicious use.

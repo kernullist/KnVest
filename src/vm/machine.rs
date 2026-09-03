@@ -206,27 +206,35 @@ impl VirtualMachine {
                 let src2 = self.read_u8()?;
                 let val1 = self.get_register(src1)?;
                 let val2 = self.get_register(src2)?;
-                self.flags = if val1 == val2 {
-                    1
-                } else if val1 > val2 {
-                    2
-                } else {
-                    0
-                };
+                let result = val1.wrapping_sub(val2);
+                let zf = val1 == val2;
+                let sf = (result as i64) < 0;
+                let cf = val1 < val2;
+                let of = ((val1 ^ val2) & (val1 ^ result)) >> 63 != 0;
+                self.flags = (if zf { 0x40 } else { 0 })
+                    | (if sf { 0x80 } else { 0 })
+                    | (if cf { 0x01 } else { 0 })
+                    | (if of { 0x800 } else { 0 });
             },
-            
+
             OpCode::Jmp => {
                 let offset = self.read_u64()? as usize;
                 self.pc = offset;
             },
-            
+
             OpCode::JmpIf => {
                 let condition = self.read_u8()?;
                 let offset = self.read_u64()? as usize;
+                let zf = self.flags & 0x40 != 0;
+                let sf = self.flags & 0x80 != 0;
+                let of = self.flags & 0x800 != 0;
                 let should_jump = match condition {
-                    1 => self.flags == 1,
-                    2 => self.flags != 1,
-                    3 => self.flags == 2,
+                    1 => zf,                          // JE: ZF=1
+                    2 => !zf,                         // JNE: ZF=0
+                    3 => sf != of,                    // JL: SF!=OF
+                    4 => zf || sf != of,              // JLE
+                    5 => !zf && sf == of,             // JG
+                    6 => sf == of,                    // JGE
                     _ => false,
                 };
                 if should_jump {

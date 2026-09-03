@@ -1,4 +1,5 @@
 use crate::vm::OpCode;
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 #[derive(Debug, Clone)]
 pub struct X64Instruction {
@@ -76,6 +77,392 @@ impl X64Reg {
     }
 }
 
+fn iced_reg_to_x64(reg: Register) -> Option<X64Reg> {
+    Some(match reg {
+        Register::RAX => X64Reg::Rax,
+        Register::RCX => X64Reg::Rcx,
+        Register::RDX => X64Reg::Rdx,
+        Register::RBX => X64Reg::Rbx,
+        Register::RSP => X64Reg::Rsp,
+        Register::RBP => X64Reg::Rbp,
+        Register::RSI => X64Reg::Rsi,
+        Register::RDI => X64Reg::Rdi,
+        Register::R8 => X64Reg::R8,
+        Register::R9 => X64Reg::R9,
+        Register::R10 => X64Reg::R10,
+        Register::R11 => X64Reg::R11,
+        Register::R12 => X64Reg::R12,
+        Register::R13 => X64Reg::R13,
+        Register::R14 => X64Reg::R14,
+        Register::R15 => X64Reg::R15,
+        Register::EAX => X64Reg::Eax,
+        Register::ECX => X64Reg::Ecx,
+        Register::EDX => X64Reg::Edx,
+        Register::EBX => X64Reg::Ebx,
+        Register::ESP => X64Reg::Esp,
+        Register::EBP => X64Reg::Ebp,
+        Register::ESI => X64Reg::Esi,
+        Register::EDI => X64Reg::Edi,
+        _ => return None,
+    })
+}
+
+fn mem_base_offset(instr: &Instruction) -> Option<(X64Reg, i32)> {
+    if instr.memory_base() == Register::RBP || instr.memory_base() == Register::EBP {
+        iced_reg_to_x64(instr.memory_base()).map(|base| (base, instr.memory_displacement32() as i32))
+    } else if instr.memory_base() == Register::None && instr.memory_displacement64() == 0 {
+        None
+    } else if instr.memory_base() != Register::None {
+        iced_reg_to_x64(instr.memory_base()).map(|base| (base, instr.memory_displacement32() as i32))
+    } else {
+        None
+    }
+}
+
+fn imm_u32(instr: &Instruction) -> u32 {
+    instr.immediate32() as u32
+}
+
+fn imm_u64(instr: &Instruction) -> u64 {
+    if instr.op0_kind() == OpKind::Immediate8 {
+        instr.immediate8() as u64
+    } else if instr.op0_kind() == OpKind::Immediate32 {
+        instr.immediate32() as u64
+    } else {
+        instr.immediate64()
+    }
+}
+
+fn classify_instruction(instr: &Instruction) -> X64InstrKind {
+    let mnemonic = instr.mnemonic();
+
+    match mnemonic {
+        Mnemonic::Nop => X64InstrKind::Nop,
+
+        Mnemonic::Mov => classify_mov(instr),
+
+        Mnemonic::Add => classify_add(instr),
+        Mnemonic::Sub => classify_sub(instr),
+        Mnemonic::Imul => classify_imul(instr),
+        Mnemonic::Cmp => classify_cmp(instr),
+
+        Mnemonic::Jmp => {
+            if let Some(rel) = branch_offset(instr) {
+                X64InstrKind::Jmp { target_offset: rel }
+            } else {
+                X64InstrKind::Unknown
+            }
+        }
+        Mnemonic::Je => branch_kind(instr, |o| X64InstrKind::Je { target_offset: o }),
+        Mnemonic::Jne => branch_kind(instr, |o| X64InstrKind::Jne { target_offset: o }),
+        Mnemonic::Jl => branch_kind(instr, |o| X64InstrKind::Jl { target_offset: o }),
+        Mnemonic::Jle => branch_kind(instr, |o| X64InstrKind::Jle { target_offset: o }),
+        Mnemonic::Jg => branch_kind(instr, |o| X64InstrKind::Jg { target_offset: o }),
+        Mnemonic::Jge => branch_kind(instr, |o| X64InstrKind::Jge { target_offset: o }),
+
+        Mnemonic::Call => {
+            if let Some(rel) = branch_offset(instr) {
+                X64InstrKind::Call { target_offset: rel }
+            } else {
+                X64InstrKind::Unknown
+            }
+        }
+        Mnemonic::Ret => X64InstrKind::Ret,
+
+        Mnemonic::Push => {
+            if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+                X64InstrKind::Push { reg }
+            } else {
+                X64InstrKind::Unknown
+            }
+        }
+        Mnemonic::Pop => {
+            if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+                X64InstrKind::Pop { reg }
+            } else {
+                X64InstrKind::Unknown
+            }
+        }
+        Mnemonic::Dec => {
+            if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+                X64InstrKind::Dec { reg }
+            } else {
+                X64InstrKind::Unknown
+            }
+        }
+        Mnemonic::Inc => {
+            if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+                X64InstrKind::Inc { reg }
+            } else {
+                X64InstrKind::Unknown
+            }
+        }
+
+        Mnemonic::Lea => classify_lea(instr),
+        Mnemonic::Movzx => classify_movzx(instr),
+        Mnemonic::Test => classify_test(instr),
+        Mnemonic::Xor => classify_xor(instr),
+
+        _ => X64InstrKind::Unknown,
+    }
+}
+
+fn branch_offset(instr: &Instruction) -> Option<i32> {
+    match instr.op0_kind() {
+        OpKind::NearBranch16 => Some(instr.near_branch16() as i16 as i32),
+        OpKind::NearBranch32 => Some(instr.near_branch32() as i32),
+        OpKind::NearBranch64 => Some(instr.near_branch64() as i64 as i32),
+        _ => None,
+    }
+}
+
+fn branch_kind<F>(instr: &Instruction, mk: F) -> X64InstrKind
+where
+    F: FnOnce(i32) -> X64InstrKind,
+{
+    branch_offset(instr).map(mk).unwrap_or(X64InstrKind::Unknown)
+}
+
+fn classify_mov(instr: &Instruction) -> X64InstrKind {
+    let op0 = instr.op0_kind();
+    let op1 = instr.op1_kind();
+
+    if op0 == OpKind::Register && op1 == OpKind::Immediate32 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::MovRegImm { reg, imm: imm_u64(instr) };
+        }
+    }
+    if op0 == OpKind::Register && op1 == OpKind::Immediate8 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::MovRegImm { reg, imm: imm_u64(instr) };
+        }
+    }
+    if op0 == OpKind::Register && op1 == OpKind::Immediate64 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::MovRegImm { reg, imm: imm_u64(instr) };
+        }
+    }
+    if op0 == OpKind::Register && op1 == OpKind::Register {
+        if let (Some(dst), Some(src)) = (
+            iced_reg_to_x64(instr.op0_register()),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            return X64InstrKind::MovRegReg { dst, src };
+        }
+    }
+    if op0 == OpKind::Register && op1 == OpKind::Memory {
+        if let (Some(dst), Some((base, offset))) = (
+            iced_reg_to_x64(instr.op0_register()),
+            mem_base_offset(instr),
+        ) {
+            return X64InstrKind::MovRegMem { dst, base, offset };
+        }
+    }
+    if op0 == OpKind::Memory && op1 == OpKind::Register {
+        if let (Some((base, offset)), Some(src)) = (
+            mem_base_offset(instr),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            if op1 == OpKind::Register {
+                return X64InstrKind::MovMemReg { base, offset, src };
+            }
+        }
+    }
+    if op0 == OpKind::Memory && op1 == OpKind::Immediate32 {
+        if let Some((base, offset)) = mem_base_offset(instr) {
+            return X64InstrKind::MovMemImm {
+                base,
+                offset,
+                imm: imm_u32(instr),
+            };
+        }
+    }
+
+    X64InstrKind::Unknown
+}
+
+fn classify_add(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register {
+        if let (Some(dst), Some(src)) = (
+            iced_reg_to_x64(instr.op0_register()),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            return X64InstrKind::AddRegReg { dst, src };
+        }
+    }
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Immediate8 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::AddRegImm { reg, imm: imm_u32(instr) };
+        }
+    }
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Immediate32 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::AddRegImm { reg, imm: imm_u32(instr) };
+        }
+    }
+    if instr.op0_kind() == OpKind::Memory && instr.op1_kind() == OpKind::Immediate8 {
+        if let Some((base, offset)) = mem_base_offset(instr) {
+            return X64InstrKind::AddMemImm {
+                base,
+                offset,
+                imm: imm_u32(instr),
+            };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_sub(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register {
+        if let (Some(dst), Some(src)) = (
+            iced_reg_to_x64(instr.op0_register()),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            return X64InstrKind::SubRegReg { dst, src };
+        }
+    }
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Immediate8 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::SubRegImm { reg, imm: imm_u32(instr) };
+        }
+    }
+    if instr.op0_kind() == OpKind::Memory && instr.op1_kind() == OpKind::Immediate8 {
+        if let Some((base, offset)) = mem_base_offset(instr) {
+            return X64InstrKind::SubMemImm {
+                base,
+                offset,
+                imm: imm_u32(instr),
+            };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_imul(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register {
+        if let (Some(dst), Some(src)) = (
+            iced_reg_to_x64(instr.op0_register()),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            return X64InstrKind::ImulRegReg { dst, src };
+        }
+    }
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Memory {
+        if let (Some(dst), Some((base, offset))) = (
+            iced_reg_to_x64(instr.op0_register()),
+            mem_base_offset(instr),
+        ) {
+            return X64InstrKind::ImulRegMem { dst, base, offset };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_cmp(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register {
+        if let (Some(reg1), Some(reg2)) = (
+            iced_reg_to_x64(instr.op0_register()),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            return X64InstrKind::CmpRegReg { reg1, reg2 };
+        }
+    }
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Immediate8 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::CmpRegImm { reg, imm: imm_u32(instr) };
+        }
+    }
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Immediate32 {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::CmpRegImm { reg, imm: imm_u32(instr) };
+        }
+    }
+    if instr.op0_kind() == OpKind::Memory && instr.op1_kind() == OpKind::Immediate8 {
+        if let Some((base, offset)) = mem_base_offset(instr) {
+            return X64InstrKind::CmpMemImm {
+                base,
+                offset,
+                imm: imm_u32(instr),
+            };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_lea(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Memory {
+        if let Some(dst) = iced_reg_to_x64(instr.op0_register()) {
+            if instr.memory_base() == Register::RIP {
+                return X64InstrKind::LeaRipRel {
+                    dst,
+                    offset: instr.memory_displacement32() as i32,
+                };
+            }
+            if let Some((base, offset)) = mem_base_offset(instr) {
+                return X64InstrKind::Lea { dst, base, offset };
+            }
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_movzx(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Memory {
+        if let (Some(dst), Some((base, offset))) = (
+            iced_reg_to_x64(instr.op0_register()),
+            mem_base_offset(instr),
+        ) {
+            return X64InstrKind::MovzxByte { dst, base, offset };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_test(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register {
+        if let (Some(reg1), Some(reg2)) = (
+            iced_reg_to_x64(instr.op0_register()),
+            iced_reg_to_x64(instr.op1_register()),
+        ) {
+            return X64InstrKind::Test { reg1, reg2 };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+fn classify_xor(instr: &Instruction) -> X64InstrKind {
+    if instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Register
+        && instr.op0_register() == instr.op1_register()
+    {
+        if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+            return X64InstrKind::MovRegImm { reg, imm: 0 };
+        }
+    }
+    X64InstrKind::Unknown
+}
+
+pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut usize) -> X64InstrKind {
+    if bytes.is_empty() {
+        return X64InstrKind::Unknown;
+    }
+
+    let mut decoder = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+    if !decoder.can_decode() {
+        let b0 = bytes[0];
+        instr_bytes.push(b0);
+        *offset += 1;
+        return X64InstrKind::Unknown;
+    }
+
+    let instr: Instruction = decoder.decode();
+    let len = instr.len();
+    instr_bytes.extend_from_slice(&bytes[..len]);
+    *offset += len;
+
+    classify_instruction(&instr)
+}
+
 pub fn disassemble_x64_simple(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
     let mut instructions = Vec::new();
     let mut offset = 0;
@@ -83,14 +470,14 @@ pub fn disassemble_x64_simple(code: &[u8], max_instrs: usize) -> Vec<X64Instruct
     while offset < code.len() && instructions.len() < max_instrs {
         let start_offset = offset;
         let remaining = &code[offset..];
-        
+
         if remaining.is_empty() {
             break;
         }
 
         let mut instr_bytes = Vec::new();
         let kind = decode_instruction(remaining, &mut instr_bytes, &mut offset);
-        
+
         instructions.push(X64Instruction {
             offset: start_offset,
             bytes: instr_bytes,
@@ -101,604 +488,15 @@ pub fn disassemble_x64_simple(code: &[u8], max_instrs: usize) -> Vec<X64Instruct
     instructions
 }
 
-pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut usize) -> X64InstrKind {
-    if bytes.is_empty() {
-        return X64InstrKind::Unknown;
-    }
-
-    let b0 = bytes[0];
-    
-    match b0 {
-        0x48 | 0x49 | 0x4C | 0x4D if bytes.len() > 1 => {
-            instr_bytes.push(b0);
-            let b1 = bytes[1];
-            
-            match b1 {
-                0xC7 if bytes.len() > 2 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0xC0) == 0xC0 {
-                        instr_bytes.extend_from_slice(&bytes[0..7]);
-                        *offset += 7;
-                        let reg = decode_reg_from_modrm(modrm, b0 == 0x49);
-                        let imm = u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]) as u64;
-                        return X64InstrKind::MovRegImm { reg, imm };
-                    }
-                },
-                0x89 | 0x8B if bytes.len() > 2 => {
-                    instr_bytes.extend_from_slice(&bytes[0..3]);
-                    *offset += 3;
-                    let modrm = bytes[2];
-                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                    let src = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                    return if b1 == 0x89 {
-                        X64InstrKind::MovRegReg { dst: src, src: dst }
-                    } else {
-                        X64InstrKind::MovRegReg { dst, src }
-                    };
-                },
-                0x01 if bytes.len() > 2 => {
-                    instr_bytes.extend_from_slice(&bytes[0..3]);
-                    *offset += 3;
-                    let modrm = bytes[2];
-                    let dst = decode_reg_from_modrm(modrm & 7, false);
-                    let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    return X64InstrKind::AddRegReg { dst, src };
-                },
-                0x29 if bytes.len() > 2 => {
-                    instr_bytes.extend_from_slice(&bytes[0..3]);
-                    *offset += 3;
-                    let modrm = bytes[2];
-                    let dst = decode_reg_from_modrm(modrm & 7, false);
-                    let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    return X64InstrKind::SubRegReg { dst, src };
-                },
-                0x0F if bytes.len() > 3 && bytes[2] == 0xAF => {
-                    let modrm = bytes[3];
-                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    let modrm_mod = (modrm & 0xC0) >> 6;
-                    
-                    if modrm_mod == 0x01 && bytes.len() > 4 {
-                        // Memory operand with 8-bit displacement: imul dst, [base+disp8]
-                        instr_bytes.extend_from_slice(&bytes[0..5]);
-                        *offset += 5;
-                        let base = decode_reg_from_modrm(modrm & 7, false);
-                        let disp = bytes[4] as i8 as i32;
-                        return X64InstrKind::ImulRegMem { dst, base, offset: disp };
-                    } else if modrm_mod == 0xC0 {
-                        // Register operand: imul dst, src
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let src = decode_reg_from_modrm(modrm & 7, false);
-                        return X64InstrKind::ImulRegReg { dst, src };
-                    }
-                },
-                0x63 if bytes.len() > 2 => {
-                    // MOVSXD: 48 63 - sign extend dword to qword (treat as move for our purposes)
-                    instr_bytes.extend_from_slice(&bytes[0..3]);
-                    *offset += 3;
-                    let modrm = bytes[2];
-                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49);
-                    let src = decode_reg_from_modrm(modrm & 7, false);
-                    return X64InstrKind::MovRegReg { dst, src: to_32bit_reg(src) };
-                },
-                0x39 if bytes.len() > 2 => {
-                    instr_bytes.extend_from_slice(&bytes[0..3]);
-                    *offset += 3;
-                    let modrm = bytes[2];
-                    let reg1 = decode_reg_from_modrm(modrm & 7, false);
-                    let reg2 = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    return X64InstrKind::CmpRegReg { reg1, reg2 };
-                },
-                0x83 if bytes.len() > 3 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0x38) == 0x38 {
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let reg = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                        let imm = bytes[3] as u32;
-                        return X64InstrKind::CmpRegImm { reg, imm };
-                    } else if (modrm & 0x38) == 0x28 {
-                        if (modrm & 0xC0) == 0xC0 {
-                            instr_bytes.extend_from_slice(&bytes[0..4]);
-                            *offset += 4;
-                            let reg = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                            return X64InstrKind::SubRegReg { dst: reg, src: reg };
-                        } else if (modrm & 0xC0) == 0x40 && bytes.len() > 4 {
-                            let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                            let disp = bytes[3] as i8 as i32;
-                            let imm = bytes[4] as u32;
-                            if base == X64Reg::Rbp || base == X64Reg::Ebp {
-                                instr_bytes.extend_from_slice(&bytes[0..5]);
-                                *offset += 5;
-                                return X64InstrKind::SubMemImm { base, offset: disp, imm };
-                            } else {
-                                instr_bytes.extend_from_slice(&bytes[0..5]);
-                                *offset += 5;
-                                return X64InstrKind::SubRegImm { reg: base, imm };
-                            }
-                        }
-                    } else if (modrm & 0x38) == 0x00 && (modrm & 0xC0) == 0x40 && bytes.len() > 4 {
-                        instr_bytes.extend_from_slice(&bytes[0..5]);
-                        *offset += 5;
-                        let reg = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                        let imm = bytes[4] as u32;
-                        return X64InstrKind::AddRegImm { reg, imm };
-                    } else if (modrm & 0x38) == 0x38 && (modrm & 0xC0) == 0x40 && bytes.len() > 4 {
-                        instr_bytes.extend_from_slice(&bytes[0..5]);
-                        *offset += 5;
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                        let disp = bytes[3] as i8 as i32;
-                        let imm = bytes[4] as u32;
-                        return X64InstrKind::CmpMemImm { base, offset: disp, imm };
-                    }
-                },
-                0x8D if bytes.len() > 3 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0xC7) == 0x05 && bytes.len() > 6 {
-                        // RIP-relative LEA: 48 8D xx [05] disp32
-                        instr_bytes.extend_from_slice(&bytes[0..7]);
-                        *offset += 7;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let disp = i32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-                        return X64InstrKind::LeaRipRel { dst, offset: disp };
-                    } else if (modrm & 0xC0) == 0x40 {
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::Lea { dst, base, offset: disp };
-                    } else if (modrm & 0xC0) == 0x80 && bytes.len() > 6 {
-                        instr_bytes.extend_from_slice(&bytes[0..7]);
-                        *offset += 7;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let disp = i32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-                        return X64InstrKind::Lea { dst, base, offset: disp };
-                    }
-                },
-                0xB6 if bytes.len() > 2 => {
-                    // MOVZX: 0F B6 - zero extend byte to register
-                    let modrm = bytes[2];
-                    if (modrm & 0xC0) == 0x00 {
-                        instr_bytes.extend_from_slice(&bytes[0..3]);
-                        *offset += 3;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        return X64InstrKind::MovzxByte { dst, base, offset: 0 };
-                    } else if (modrm & 0xC0) == 0x40 && bytes.len() > 3 {
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::MovzxByte { dst, base, offset: disp };
-                    }
-                },
-                0x85 if bytes.len() > 2 => {
-                    instr_bytes.extend_from_slice(&bytes[0..3]);
-                    *offset += 3;
-                    let modrm = bytes[2];
-                    let reg1 = decode_reg_from_modrm(modrm & 7, false);
-                    let reg2 = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    return X64InstrKind::Test { reg1, reg2 };
-                },
-                0x8B if bytes.len() > 2 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0xC0) == 0x40 {
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::MovRegMem { dst, base, offset: disp };
-                    } else if (modrm & 0xC0) == 0x80 && bytes.len() > 6 {
-                        instr_bytes.extend_from_slice(&bytes[0..7]);
-                        *offset += 7;
-                        let dst = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let disp = i32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-                        return X64InstrKind::MovRegMem { dst, base, offset: disp };
-                    }
-                },
-                0xC7 if bytes.len() > 2 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0xC0) == 0x40 && (modrm & 0x38) == 0x00 && bytes.len() > 7 {
-                        instr_bytes.extend_from_slice(&bytes[0..8]);
-                        *offset += 8;
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                        let disp = bytes[3] as i8 as i32;
-                        let imm = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                        return X64InstrKind::MovMemImm { base, offset: disp, imm };
-                    } else if (modrm & 0xC0) == 0xC0 {
-                        instr_bytes.extend_from_slice(&bytes[0..7]);
-                        *offset += 7;
-                        let reg = decode_reg_from_modrm(modrm, b0 == 0x49);
-                        let imm = u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]) as u64;
-                        return X64InstrKind::MovRegImm { reg, imm };
-                    }
-                },
-                0x89 if bytes.len() > 2 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0xC0) == 0x40 {
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let src = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::MovMemReg { base, offset: disp, src };
-                    } else if (modrm & 0xC0) == 0x80 && bytes.len() > 6 {
-                        instr_bytes.extend_from_slice(&bytes[0..7]);
-                        *offset += 7;
-                        let base = decode_reg_from_modrm(modrm & 7, b0 == 0x49 || b0 == 0x4D);
-                        let src = decode_reg_from_modrm((modrm >> 3) & 7, b0 == 0x49 || b0 == 0x4C);
-                        let disp = i32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-                        return X64InstrKind::MovMemReg { base, offset: disp, src };
-                    }
-                },
-                0xFF if bytes.len() > 2 => {
-                    let modrm = bytes[2];
-                    if (modrm & 0x38) == 0x08 {
-                        instr_bytes.extend_from_slice(&bytes[0..3]);
-                        *offset += 3;
-                        let reg = decode_reg_from_modrm(modrm & 7, b0 == 0x49);
-                        return X64InstrKind::Dec { reg };
-                    }
-                },
-                _ => {}
-            }
-        },
-        0xB8..=0xBF => {
-            if bytes.len() >= 5 {
-                instr_bytes.extend_from_slice(&bytes[0..5]);
-                *offset += 5;
-                let reg = decode_reg_from_modrm(b0 & 7, false);
-                let imm = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64;
-                return X64InstrKind::MovRegImm { reg: to_32bit_reg(reg), imm };
-            }
-        },
-        0x01 if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0xC0) == 0xC0 {
-                instr_bytes.extend_from_slice(&bytes[0..2]);
-                *offset += 2;
-                let dst = decode_reg_from_modrm(modrm & 7, false);
-                let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                return X64InstrKind::AddRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-            }
-        },
-        0x29 if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0xC0) == 0xC0 {
-                instr_bytes.extend_from_slice(&bytes[0..2]);
-                *offset += 2;
-                let dst = decode_reg_from_modrm(modrm & 7, false);
-                let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                return X64InstrKind::SubRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-            }
-        },
-        0x89 if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0xC0) == 0xC0 {
-                instr_bytes.extend_from_slice(&bytes[0..2]);
-                *offset += 2;
-                let dst = decode_reg_from_modrm(modrm & 7, false);
-                let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                return X64InstrKind::MovRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-            } else if (modrm & 0xC0) == 0x40 {
-                instr_bytes.extend_from_slice(&bytes[0..3]);
-                *offset += 3;
-                let base = decode_reg_from_modrm(modrm & 7, false);
-                let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                let disp = bytes[2] as i8 as i32;
-                return X64InstrKind::MovMemReg { base, offset: disp, src: to_32bit_reg(src) };
-            }
-        },
-        0x8B if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0xC0) == 0xC0 {
-                instr_bytes.extend_from_slice(&bytes[0..2]);
-                *offset += 2;
-                let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                let src = decode_reg_from_modrm(modrm & 7, false);
-                return X64InstrKind::MovRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-            } else if (modrm & 0xC0) == 0x40 {
-                instr_bytes.extend_from_slice(&bytes[0..3]);
-                *offset += 3;
-                let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                let base = decode_reg_from_modrm(modrm & 7, false);
-                let disp = bytes[2] as i8 as i32;
-                return X64InstrKind::MovRegMem { dst: to_32bit_reg(dst), base, offset: disp };
-            }
-        },
-        0xC7 if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0xC0) == 0x40 && (modrm & 0x38) == 0x00 && bytes.len() > 6 {
-                instr_bytes.extend_from_slice(&bytes[0..7]);
-                *offset += 7;
-                let base = decode_reg_from_modrm(modrm & 7, false);
-                let disp = bytes[2] as i8 as i32;
-                let imm = u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
-                return X64InstrKind::MovMemImm { base, offset: disp, imm };
-            }
-        },
-        0x31 if bytes.len() > 1 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let modrm = bytes[1];
-            let reg1 = decode_reg_from_modrm(modrm & 7, false);
-            let reg2 = decode_reg_from_modrm((modrm >> 3) & 7, false);
-            if reg1 == reg2 {
-                return X64InstrKind::MovRegImm { reg: to_32bit_reg(reg1), imm: 0 };
-            }
-        },
-        0x01 if bytes.len() > 1 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let modrm = bytes[1];
-            let dst = decode_reg_from_modrm(modrm & 7, false);
-            let src = decode_reg_from_modrm((modrm >> 3) & 7, false);
-            return X64InstrKind::AddRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-        },
-        0x0F if bytes.len() > 1 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            let b1 = bytes[1];
-            match b1 {
-                0x8E if bytes.len() >= 6 => {
-                    instr_bytes.extend_from_slice(&bytes[2..6]);
-                    *offset += 6;
-                    let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                    return X64InstrKind::Jle { target_offset: rel };
-                },
-                0x8F if bytes.len() >= 6 => {
-                    instr_bytes.extend_from_slice(&bytes[2..6]);
-                    *offset += 6;
-                    let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                    return X64InstrKind::Jg { target_offset: rel };
-                },
-                0x8D if bytes.len() >= 6 => {
-                    instr_bytes.extend_from_slice(&bytes[2..6]);
-                    *offset += 6;
-                    let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                    return X64InstrKind::Jge { target_offset: rel };
-                },
-                0x8C if bytes.len() >= 6 => {
-                    instr_bytes.extend_from_slice(&bytes[2..6]);
-                    *offset += 6;
-                    let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                    return X64InstrKind::Jl { target_offset: rel };
-                },
-                0x84 if bytes.len() >= 6 => {
-                    instr_bytes.extend_from_slice(&bytes[2..6]);
-                    *offset += 6;
-                    let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                    return X64InstrKind::Je { target_offset: rel };
-                },
-                0x85 if bytes.len() >= 6 => {
-                    instr_bytes.extend_from_slice(&bytes[2..6]);
-                    *offset += 6;
-                    let rel = i32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
-                    return X64InstrKind::Jne { target_offset: rel };
-                },
-                0xAF if bytes.len() > 2 => {
-                    // IMUL: 0x0F 0xAF modrm [disp]
-                    let modrm = bytes[2];
-                    let mod_field = (modrm & 0xC0) >> 6;
-                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    
-                    if mod_field == 1 && bytes.len() > 3 {
-                        // mod=1: [reg+disp8] - memory operand
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let base = decode_reg_from_modrm(modrm & 7, false);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::ImulRegMem { dst: to_32bit_reg(dst), base: to_32bit_reg(base), offset: disp };
-                    } else if mod_field == 3 {
-                        // mod=3: register operand
-                        instr_bytes.extend_from_slice(&bytes[0..3]);
-                        *offset += 3;
-                        let src = decode_reg_from_modrm(modrm & 7, false);
-                        return X64InstrKind::ImulRegReg { dst: to_32bit_reg(dst), src: to_32bit_reg(src) };
-                    }
-                },
-                0xB6 if bytes.len() > 2 => {
-                    // MOVZX byte: 0x0F 0xB6 modrm [disp]
-                    let modrm = bytes[2];
-                    let mod_field = (modrm & 0xC0) >> 6;
-                    let dst = decode_reg_from_modrm((modrm >> 3) & 7, false);
-                    
-                    if mod_field == 0 {
-                        // mod=0: [reg] - direct memory operand
-                        instr_bytes.extend_from_slice(&bytes[0..3]);
-                        *offset += 3;
-                        let base = decode_reg_from_modrm(modrm & 7, false);
-                        return X64InstrKind::MovzxByte { dst, base, offset: 0 };
-                    } else if mod_field == 1 && bytes.len() > 3 {
-                        // mod=1: [reg+disp8] - memory with 8-bit displacement
-                        instr_bytes.extend_from_slice(&bytes[0..4]);
-                        *offset += 4;
-                        let base = decode_reg_from_modrm(modrm & 7, false);
-                        let disp = bytes[3] as i8 as i32;
-                        return X64InstrKind::MovzxByte { dst, base, offset: disp };
-                    }
-                },
-                _ => {
-                    *offset += 2;
-                }
-            }
-        },
-        0x74 if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Je { target_offset: rel };
-        },
-        0x75 if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Jne { target_offset: rel };
-        },
-        0x84 if bytes.len() >= 2 && bytes[1] == 0xC0 => {
-            // test al, al (no REX)
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            return X64InstrKind::Test { reg1: X64Reg::Eax, reg2: X64Reg::Eax };
-        },
-        0x85 if bytes.len() >= 2 && bytes[1] == 0xC0 => {
-            // test eax, eax (no REX)
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            return X64InstrKind::Test { reg1: X64Reg::Eax, reg2: X64Reg::Eax };
-        },
-        0x7C if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Jl { target_offset: rel };
-        },
-        0x7D if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Jge { target_offset: rel };
-        },
-        0x7E if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Jle { target_offset: rel };
-        },
-        0x7F if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Jg { target_offset: rel };
-        },
-        0xE8 if bytes.len() >= 5 => {
-            instr_bytes.extend_from_slice(&bytes[0..5]);
-            *offset += 5;
-            let rel = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-            return X64InstrKind::Call { target_offset: rel };
-        },
-        0xE9 if bytes.len() >= 5 => {
-            instr_bytes.extend_from_slice(&bytes[0..5]);
-            *offset += 5;
-            let rel = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-            return X64InstrKind::Jmp { target_offset: rel };
-        },
-        0xEB if bytes.len() >= 2 => {
-            instr_bytes.extend_from_slice(&bytes[0..2]);
-            *offset += 2;
-            let rel = bytes[1] as i8 as i32;
-            return X64InstrKind::Jmp { target_offset: rel };
-        },
-        0xC3 => {
-            instr_bytes.push(b0);
-            *offset += 1;
-            return X64InstrKind::Ret;
-        },
-        0x90 => {
-            instr_bytes.push(b0);
-            *offset += 1;
-            return X64InstrKind::Nop;
-        },
-        0x50..=0x57 => {
-            instr_bytes.push(b0);
-            *offset += 1;
-            let reg = decode_reg_from_modrm(b0 & 7, false);
-            return X64InstrKind::Push { reg };
-        },
-        0x58..=0x5F => {
-            instr_bytes.push(b0);
-            *offset += 1;
-            let reg = decode_reg_from_modrm(b0 & 7, false);
-            return X64InstrKind::Pop { reg };
-        },
-        0xFF if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0x38) == 0x08 {
-                instr_bytes.extend_from_slice(&bytes[0..2]);
-                *offset += 2;
-                let reg = decode_reg_from_modrm(modrm & 7, false);
-                return X64InstrKind::Dec { reg: to_32bit_reg(reg) };
-            }
-        },
-        0xFE if bytes.len() > 1 => {
-            let modrm = bytes[1];
-            if (modrm & 0x38) == 0x00 {
-                instr_bytes.extend_from_slice(&bytes[0..2]);
-                *offset += 2;
-                let reg = decode_reg_from_modrm(modrm & 7, false);
-                return X64InstrKind::Inc { reg: to_32bit_reg(reg) };
-            }
-        },
-        0x83 if bytes.len() > 2 => {
-            let modrm = bytes[1];
-            let modrm_mod = modrm & 0xC0;
-            let modrm_reg = (modrm >> 3) & 7;
-            let modrm_rm = modrm & 7;
-            
-            if modrm_mod == 0x40 && bytes.len() > 3 {
-                let base = decode_reg_from_modrm(modrm_rm, false);
-                let disp = bytes[2] as i8 as i32;
-                let imm = bytes[3] as u32;
-                instr_bytes.extend_from_slice(&bytes[0..4]);
-                *offset += 4;
-                
-                match modrm_reg {
-                    0 => return X64InstrKind::AddMemImm { base, offset: disp, imm },
-                    5 => return X64InstrKind::SubMemImm { base, offset: disp, imm },
-                    7 => return X64InstrKind::CmpMemImm { base, offset: disp, imm },
-                    _ => {},
-                }
-            } else if modrm_mod == 0xC0 && bytes.len() > 2 {
-                let reg = decode_reg_from_modrm(modrm_rm, false);
-                let imm = bytes[2] as u32;
-                instr_bytes.extend_from_slice(&bytes[0..3]);
-                *offset += 3;
-                
-                match modrm_reg {
-                    0 => return X64InstrKind::AddRegImm { reg: to_32bit_reg(reg), imm },
-                    5 => return X64InstrKind::SubRegImm { reg: to_32bit_reg(reg), imm },
-                    7 => return X64InstrKind::CmpRegImm { reg: to_32bit_reg(reg), imm },
-                    _ => {},
-                }
-            }
-        },
-        _ => {}
-    }
-
-    instr_bytes.push(b0);
-    *offset += 1;
-    X64InstrKind::Unknown
-}
-
-fn decode_reg_from_modrm(rm: u8, _is_rex: bool) -> X64Reg {
-    match rm & 7 {
-        0 => X64Reg::Rax,
-        1 => X64Reg::Rcx,
-        2 => X64Reg::Rdx,
-        3 => X64Reg::Rbx,
-        4 => X64Reg::Rsp,
-        5 => X64Reg::Rbp,
-        6 => X64Reg::Rsi,
-        7 => X64Reg::Rdi,
-        _ => X64Reg::Rax,
-    }
-}
-
-fn to_32bit_reg(reg: X64Reg) -> X64Reg {
-    match reg {
-        X64Reg::Rax => X64Reg::Eax,
-        X64Reg::Rcx => X64Reg::Ecx,
-        X64Reg::Rdx => X64Reg::Edx,
-        X64Reg::Rbx => X64Reg::Ebx,
-        X64Reg::Rsp => X64Reg::Esp,
-        X64Reg::Rbp => X64Reg::Ebp,
-        X64Reg::Rsi => X64Reg::Esi,
-        X64Reg::Rdi => X64Reg::Edi,
-        _ => reg,
+fn jmp_if_condition_code(kind: &X64InstrKind) -> u8 {
+    match kind {
+        X64InstrKind::Je { .. } => 1,  // ZF=1
+        X64InstrKind::Jne { .. } => 2, // ZF=0
+        X64InstrKind::Jl { .. } => 3,  // SF!=OF
+        X64InstrKind::Jle { .. } => 4, // ZF=1 || SF!=OF
+        X64InstrKind::Jg { .. } => 5,  // ZF=0 && SF==OF
+        X64InstrKind::Jge { .. } => 6, // SF==OF
+        _ => 2,
     }
 }
 
@@ -707,7 +505,8 @@ fn is_lifted_internal_target(target: usize, min_x64_offset: usize, max_x64_offse
 }
 
 fn callee_entry_for(instrs: &[X64Instruction], offset: usize, main_x64_offset: usize) -> usize {
-    instrs.iter()
+    instrs
+        .iter()
         .filter(|i| i.offset < main_x64_offset && i.offset <= offset)
         .filter(|i| i.bytes.first() == Some(&0x55))
         .map(|i| i.offset)
@@ -716,7 +515,8 @@ fn callee_entry_for(instrs: &[X64Instruction], offset: usize, main_x64_offset: u
 }
 
 fn callee_end_for(instrs: &[X64Instruction], entry: usize, main_x64_offset: usize) -> usize {
-    instrs.iter()
+    instrs
+        .iter()
         .filter(|i| i.offset > entry && i.offset < main_x64_offset)
         .find(|i| i.bytes.first() == Some(&0x55))
         .map(|i| i.offset)
@@ -759,54 +559,66 @@ pub fn lift_to_vm_bytecode(instrs: &[X64Instruction], _base_rva: u32) -> Vec<u8>
     bytecode
 }
 
-pub fn lift_to_vm_bytecode_with_map(instrs: &[X64Instruction], base_rva: u32) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
+pub fn lift_to_vm_bytecode_with_map(
+    instrs: &[X64Instruction],
+    base_rva: u32,
+) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
     lift_to_vm_bytecode_internal(instrs, base_rva, false)
 }
 
-pub fn lift_to_vm_bytecode_for_main(instrs: &[X64Instruction], base_rva: u32, main_x64_offset: usize) -> Vec<u8> {
-    let (mut bytecode, _, string_patch_positions) = lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
-    
+pub fn lift_to_vm_bytecode_for_main(
+    instrs: &[X64Instruction],
+    base_rva: u32,
+    main_x64_offset: usize,
+) -> Vec<u8> {
+    let (mut bytecode, _, string_patch_positions) =
+        lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
+
     if !string_patch_positions.is_empty() {
         let offset = ((bytecode.len() + 15) / 16) * 16;
         while bytecode.len() < offset {
             bytecode.push(0x00);
         }
-        
+
         bytecode.extend_from_slice(b"knvest\0");
-        
+
         let string_offset = offset as u64;
         for patch_pos in string_patch_positions {
             bytecode[patch_pos..patch_pos + 8].copy_from_slice(&string_offset.to_le_bytes());
         }
     }
-    
+
     bytecode
 }
 
-fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_main: bool) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
+fn lift_to_vm_bytecode_internal(
+    instrs: &[X64Instruction],
+    _base_rva: u32,
+    _is_main: bool,
+) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
     let mut bytecode = Vec::new();
     let mut label_map = std::collections::HashMap::new();
     let mut stack_map = std::collections::HashMap::new();
     let mut next_stack_reg = 10u8;
-    
+
     let mut pending_jumps: Vec<(usize, usize)> = Vec::new();
-    
+
     let mut external_call_count = 0;
-    
+
     for instr in instrs {
         label_map.insert(instr.offset, bytecode.len());
-        
+
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(reg.to_vm_reg());
                 bytecode.extend_from_slice(&imm.to_le_bytes());
-            },
+            }
             X64InstrKind::MovRegReg { dst, src } => {
                 bytecode.push(OpCode::Move as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::MovMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -818,7 +630,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(stack_reg);
                     bytecode.extend_from_slice(&(*imm as u64).to_le_bytes());
                 }
-            },
+            }
             X64InstrKind::MovRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -830,7 +642,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(stack_reg);
                 }
-            },
+            }
             X64InstrKind::MovMemReg { base, offset, src } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -842,19 +654,19 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(stack_reg);
                     bytecode.push(src.to_vm_reg());
                 }
-            },
+            }
             X64InstrKind::AddRegReg { dst, src } => {
                 bytecode.push(OpCode::Add as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::SubRegReg { dst, src } => {
                 bytecode.push(OpCode::Sub as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::SubRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -863,7 +675,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::SubMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -879,7 +691,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(stack_reg);
                     bytecode.push(15);
                 }
-            },
+            }
             X64InstrKind::AddRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -888,7 +700,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::AddMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -904,13 +716,13 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(stack_reg);
                     bytecode.push(15);
                 }
-            },
+            }
             X64InstrKind::ImulRegReg { dst, src } => {
                 bytecode.push(OpCode::Mul as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::ImulRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -923,12 +735,12 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(stack_reg);
                 }
-            },
+            }
             X64InstrKind::CmpRegReg { reg1, reg2 } => {
                 bytecode.push(OpCode::Cmp as u8);
                 bytecode.push(reg1.to_vm_reg());
                 bytecode.push(reg2.to_vm_reg());
-            },
+            }
             X64InstrKind::CmpRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -936,7 +748,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(OpCode::Cmp as u8);
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::CmpMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -951,7 +763,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(stack_reg);
                     bytecode.push(15);
                 }
-            },
+            }
             X64InstrKind::Dec { reg } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -960,7 +772,7 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::Inc { reg } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -969,108 +781,91 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::Jmp { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+                let target_x64_offset =
+                    (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 bytecode.push(OpCode::Jmp as u8);
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
                 pending_jumps.push((placeholder_pos, target_x64_offset));
-            },
-            X64InstrKind::Je { target_offset } |
-            X64InstrKind::Jne { target_offset } |
-            X64InstrKind::Jl { target_offset } |
-            X64InstrKind::Jle { target_offset } |
-            X64InstrKind::Jg { target_offset } |
-            X64InstrKind::Jge { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            }
+            X64InstrKind::Je { target_offset }
+            | X64InstrKind::Jne { target_offset }
+            | X64InstrKind::Jl { target_offset }
+            | X64InstrKind::Jle { target_offset }
+            | X64InstrKind::Jg { target_offset }
+            | X64InstrKind::Jge { target_offset } => {
+                let target_x64_offset =
+                    (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 bytecode.push(OpCode::JmpIf as u8);
-                
-                let condition_code = match instr.kind {
-                    X64InstrKind::Je { .. } => 1,     // flags == 1 (EQ)
-                    X64InstrKind::Jne { .. } => 2,    // flags != 1 (NE)
-                    X64InstrKind::Jl { .. } => 4,     // flags == 0 (LT)
-                    X64InstrKind::Jle { .. } => 5,    // flags != 2 (LE, not GT)
-                    X64InstrKind::Jg { .. } => 3,     // flags == 2 (GT)
-                    X64InstrKind::Jge { .. } => 6,    // flags != 0 (GE, not LT)
-                    _ => 2,
-                };
-                bytecode.push(condition_code);
-                
+                bytecode.push(jmp_if_condition_code(&instr.kind));
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
                 pending_jumps.push((placeholder_pos, target_x64_offset));
-            },
+            }
             X64InstrKind::Call { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-                
-                if target_x64_offset < instrs.first().map(|i| i.offset).unwrap_or(0) ||
-                   target_x64_offset > instrs.last().map(|i| i.offset + i.bytes.len()).unwrap_or(0) {
+                let target_x64_offset =
+                    (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+
+                if target_x64_offset < instrs.first().map(|i| i.offset).unwrap_or(0)
+                    || target_x64_offset
+                        > instrs
+                            .last()
+                            .map(|i| i.offset + i.bytes.len())
+                            .unwrap_or(0)
+                {
                     external_call_count += 1;
-                    
-                    if external_call_count == 1 {
-                        // Skip __main call - don't emit anything
-                    } else {
-                        // All other external calls are printf-style: native_call 2
+
+                    if external_call_count != 1 {
                         bytecode.push(OpCode::NativeCall as u8);
                         bytecode.extend_from_slice(&2u64.to_le_bytes());
                     }
                 } else {
-                    // Internal call - emit VM Call instruction
                     bytecode.push(OpCode::Call as u8);
                     let placeholder_pos = bytecode.len();
                     bytecode.extend_from_slice(&0u64.to_le_bytes());
                     pending_jumps.push((placeholder_pos, target_x64_offset));
                 }
-            },
+            }
             X64InstrKind::Ret => {
                 bytecode.push(OpCode::Ret as u8);
-            },
+            }
             X64InstrKind::Push { reg } => {
                 bytecode.push(OpCode::Push as u8);
                 bytecode.push(reg.to_vm_reg());
-            },
+            }
             X64InstrKind::Pop { reg } => {
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
-            },
+            }
             X64InstrKind::LeaRipRel { dst, .. } => {
-                // Load the string offset into the destination register
-                // Use a high placeholder that will be patched later
-                let placeholder_offset = 0x3f0; // Will be patched in lift_to_vm_bytecode_for_main
+                let placeholder_offset = 0x3f0;
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.extend_from_slice(&(placeholder_offset as u64).to_le_bytes());
-            },
+            }
             X64InstrKind::MovzxByte { dst, base, offset } => {
-                // LoadByte: load a byte from memory
-                // dst = byte at [base + offset]
                 if *offset == 0 {
                     bytecode.push(OpCode::LoadByte as u8);
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(base.to_vm_reg());
+                } else if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                    let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
+                        let r = next_stack_reg;
+                        next_stack_reg += 1;
+                        r
+                    });
+                    bytecode.push(OpCode::LoadByte as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(stack_reg);
                 } else {
-                    // For non-zero offset, we need to add it first
-                    // This is [rbp+disp] - use stack_map
-                    if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                        let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                            let r = next_stack_reg;
-                            next_stack_reg += 1;
-                            r
-                        });
-                        bytecode.push(OpCode::LoadByte as u8);
-                        bytecode.push(dst.to_vm_reg());
-                        bytecode.push(stack_reg);
-                    } else {
-                        bytecode.push(OpCode::LoadByte as u8);
-                        bytecode.push(dst.to_vm_reg());
-                        bytecode.push(base.to_vm_reg());
-                    }
+                    bytecode.push(OpCode::LoadByte as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(base.to_vm_reg());
                 }
-            },
+            }
             X64InstrKind::Test { reg1, reg2 } => {
-                // Test reg, reg when they're the same is checking for zero
-                // Emit as cmp reg, 0
                 if reg1 == reg2 {
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1079,50 +874,62 @@ fn lift_to_vm_bytecode_internal(instrs: &[X64Instruction], _base_rva: u32, _is_m
                     bytecode.push(reg1.to_vm_reg());
                     bytecode.push(15);
                 }
-            },
-            X64InstrKind::Lea { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
-                // Ignore - these don't need VM translation
-            },
+            }
+            X64InstrKind::Lea { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {}
         }
     }
-    
+
     for (placeholder_pos, target_x64_offset) in pending_jumps {
         if let Some(&target_vm_offset) = label_map.get(&target_x64_offset) {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
     }
-    
+
     (bytecode, label_map)
 }
 
-fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: u32, main_x64_offset: usize) -> (Vec<u8>, std::collections::HashMap<usize, usize>, Vec<usize>) {
+fn lift_to_vm_bytecode_internal_with_main(
+    instrs: &[X64Instruction],
+    _base_rva: u32,
+    main_x64_offset: usize,
+) -> (
+    Vec<u8>,
+    std::collections::HashMap<usize, usize>,
+    Vec<usize>,
+) {
     let mut bytecode = Vec::new();
     let mut label_map = std::collections::HashMap::new();
     let mut stack_map = std::collections::HashMap::new();
     let mut next_stack_reg = 10u8;
     let mut string_patch_positions = Vec::new();
-    
+
     let mut pending_jumps: Vec<(usize, usize)> = Vec::new();
-    
+
     let mut external_call_count = 0;
-    
+
     let min_x64_offset = instrs.iter().map(|i| i.offset).min().unwrap_or(0);
-    let max_x64_offset = instrs.iter().map(|i| i.offset + i.bytes.len()).max().unwrap_or(0);
-    
-    let main_end_offset = instrs.iter()
+    let max_x64_offset = instrs
+        .iter()
+        .map(|i| i.offset + i.bytes.len())
+        .max()
+        .unwrap_or(0);
+
+    let main_end_offset = instrs
+        .iter()
         .filter(|i| i.offset >= main_x64_offset)
         .find(|i| matches!(i.kind, X64InstrKind::Ret))
         .map(|i| i.offset)
         .unwrap_or(max_x64_offset);
-    
+
     let mut main_external_calls = 0u32;
     for instr in instrs {
         if instr.offset < main_x64_offset {
             continue;
         }
         if let X64InstrKind::Call { target_offset } = instr.kind {
-            let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            let target_x64_offset =
+                (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
             if !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset) {
                 main_external_calls += 1;
             }
@@ -1133,26 +940,26 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
             return false;
         }
         if let X64InstrKind::Call { target_offset } = instr.kind {
-            let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            let target_x64_offset =
+                (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
             !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset)
         } else {
             false
         }
     });
-    // nested: putchar callees, no printf -> zero native_call 2
     let main_has_printf = !has_putchar_callees && main_external_calls > 1;
-    
+
     let mut hit_main_ret = false;
-    
-    for (_idx, instr) in instrs.iter().enumerate() {
+
+    for instr in instrs {
         label_map.insert(instr.offset, bytecode.len());
-        
+
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(reg.to_vm_reg());
                 bytecode.extend_from_slice(&imm.to_le_bytes());
-            },
+            }
             X64InstrKind::MovRegReg { dst, src } => {
                 let in_callee = instr.offset < main_x64_offset;
                 let is_ecx_from_eax = matches!(
@@ -1164,11 +971,13 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     let end = callee_end_for(instrs, entry, main_x64_offset);
                     let is_print_char_setup = !callee_has_add_30(instrs, entry, end)
                         && !callee_has_recursive_internal_call(
-                            instrs, entry, end, min_x64_offset, max_x64_offset,
+                            instrs,
+                            entry,
+                            end,
+                            min_x64_offset,
+                            max_x64_offset,
                         );
-                    if is_print_char_setup {
-                        // print_char only: arg already in r1, skip mov ecx, eax
-                    } else {
+                    if !is_print_char_setup {
                         bytecode.push(OpCode::Move as u8);
                         bytecode.push(dst.to_vm_reg());
                         bytecode.push(src.to_vm_reg());
@@ -1178,7 +987,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(src.to_vm_reg());
                 }
-            },
+            }
             X64InstrKind::MovMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1190,7 +999,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(stack_reg);
                     bytecode.extend_from_slice(&(*imm as u64).to_le_bytes());
                 }
-            },
+            }
             X64InstrKind::MovRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1202,7 +1011,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(stack_reg);
                 }
-            },
+            }
             X64InstrKind::MovMemReg { base, offset, src } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1214,19 +1023,19 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(stack_reg);
                     bytecode.push(src.to_vm_reg());
                 }
-            },
+            }
             X64InstrKind::AddRegReg { dst, src } => {
                 bytecode.push(OpCode::Add as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::SubRegReg { dst, src } => {
                 bytecode.push(OpCode::Sub as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::SubRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -1235,7 +1044,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::SubMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1251,7 +1060,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(stack_reg);
                     bytecode.push(15);
                 }
-            },
+            }
             X64InstrKind::AddRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -1260,7 +1069,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::AddMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1276,13 +1085,13 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(stack_reg);
                     bytecode.push(15);
                 }
-            },
+            }
             X64InstrKind::ImulRegReg { dst, src } => {
                 bytecode.push(OpCode::Mul as u8);
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(dst.to_vm_reg());
                 bytecode.push(src.to_vm_reg());
-            },
+            }
             X64InstrKind::ImulRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1295,12 +1104,12 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(stack_reg);
                 }
-            },
+            }
             X64InstrKind::CmpRegReg { reg1, reg2 } => {
                 bytecode.push(OpCode::Cmp as u8);
                 bytecode.push(reg1.to_vm_reg());
                 bytecode.push(reg2.to_vm_reg());
-            },
+            }
             X64InstrKind::CmpRegImm { reg, imm } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -1308,7 +1117,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(OpCode::Cmp as u8);
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::CmpMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
@@ -1323,7 +1132,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(stack_reg);
                     bytecode.push(15);
                 }
-            },
+            }
             X64InstrKind::Dec { reg } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -1332,7 +1141,7 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::Inc { reg } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(15);
@@ -1341,60 +1150,51 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(reg.to_vm_reg());
                 bytecode.push(15);
-            },
+            }
             X64InstrKind::Jmp { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+                let target_x64_offset =
+                    (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 bytecode.push(OpCode::Jmp as u8);
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
                 pending_jumps.push((placeholder_pos, target_x64_offset));
-            },
-            X64InstrKind::Je { target_offset } |
-            X64InstrKind::Jne { target_offset } |
-            X64InstrKind::Jl { target_offset } |
-            X64InstrKind::Jle { target_offset } |
-            X64InstrKind::Jg { target_offset } |
-            X64InstrKind::Jge { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+            }
+            X64InstrKind::Je { target_offset }
+            | X64InstrKind::Jne { target_offset }
+            | X64InstrKind::Jl { target_offset }
+            | X64InstrKind::Jle { target_offset }
+            | X64InstrKind::Jg { target_offset }
+            | X64InstrKind::Jge { target_offset } => {
+                let target_x64_offset =
+                    (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
                 bytecode.push(OpCode::JmpIf as u8);
-                
-                let condition_code = match instr.kind {
-                    X64InstrKind::Je { .. } => 1,     // flags == 1 (EQ)
-                    X64InstrKind::Jne { .. } => 2,    // flags != 1 (NE)
-                    X64InstrKind::Jl { .. } => 4,     // flags == 0 (LT)
-                    X64InstrKind::Jle { .. } => 5,    // flags != 2 (LE, not GT)
-                    X64InstrKind::Jg { .. } => 3,     // flags == 2 (GT)
-                    X64InstrKind::Jge { .. } => 6,    // flags != 0 (GE, not LT)
-                    _ => 2,
-                };
-                bytecode.push(condition_code);
-                
+                bytecode.push(jmp_if_condition_code(&instr.kind));
                 let placeholder_pos = bytecode.len();
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
                 pending_jumps.push((placeholder_pos, target_x64_offset));
-            },
+            }
             X64InstrKind::Call { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-                
-                let is_internal = is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset);
-                
+                let target_x64_offset =
+                    (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+
+                let is_internal =
+                    is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset);
+
                 if !is_internal {
                     external_call_count += 1;
-                    
+
                     if external_call_count == 1 {
-                        // Skip __main call - don't emit anything
+                        // Skip __main
                     } else {
                         let in_callee = instr.offset < main_x64_offset;
-                        
+
                         if in_callee {
                             let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
                             let end = callee_end_for(instrs, entry, main_x64_offset);
                             if callee_has_add_30(instrs, entry, end) {
-                                // print_digit: r0 already holds '0'+n after add 0x30
                                 bytecode.push(OpCode::NativeCall as u8);
                                 bytecode.extend_from_slice(&3u64.to_le_bytes());
                             } else {
-                                // print_char: arg in r1
                                 bytecode.push(OpCode::Move as u8);
                                 bytecode.push(0);
                                 bytecode.push(1);
@@ -1407,25 +1207,24 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                         }
                     }
                 } else {
-                    // Internal call - push live stack_map registers to preserve them
                     let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
-                    
+
                     for &reg in &active_stack_regs {
                         bytecode.push(OpCode::Push as u8);
                         bytecode.push(reg);
                     }
-                    
+
                     bytecode.push(OpCode::Call as u8);
                     let placeholder_pos = bytecode.len();
                     bytecode.extend_from_slice(&0u64.to_le_bytes());
                     pending_jumps.push((placeholder_pos, target_x64_offset));
-                    
+
                     for &reg in active_stack_regs.iter().rev() {
                         bytecode.push(OpCode::Pop as u8);
                         bytecode.push(reg);
                     }
                 }
-            },
+            }
             X64InstrKind::Ret => {
                 if instr.offset == main_end_offset && !hit_main_ret {
                     hit_main_ret = true;
@@ -1437,50 +1236,42 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                 } else {
                     bytecode.push(OpCode::Ret as u8);
                 }
-            },
+            }
             X64InstrKind::Push { reg } => {
                 bytecode.push(OpCode::Push as u8);
                 bytecode.push(reg.to_vm_reg());
-            },
+            }
             X64InstrKind::Pop { reg } => {
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
-            },
+            }
             X64InstrKind::LeaRipRel { dst, .. } => {
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(dst.to_vm_reg());
                 string_patch_positions.push(bytecode.len());
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
-            },
+            }
             X64InstrKind::MovzxByte { dst, base, offset } => {
-                // LoadByte: load a byte from memory
-                // dst = byte at [base + offset]
                 if *offset == 0 {
                     bytecode.push(OpCode::LoadByte as u8);
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(base.to_vm_reg());
+                } else if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
+                    let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
+                        let r = next_stack_reg;
+                        next_stack_reg += 1;
+                        r
+                    });
+                    bytecode.push(OpCode::LoadByte as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(stack_reg);
                 } else {
-                    // For non-zero offset, we need to add it first
-                    // This is [rbp+disp] - use stack_map
-                    if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                        let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                            let r = next_stack_reg;
-                            next_stack_reg += 1;
-                            r
-                        });
-                        bytecode.push(OpCode::LoadByte as u8);
-                        bytecode.push(dst.to_vm_reg());
-                        bytecode.push(stack_reg);
-                    } else {
-                        bytecode.push(OpCode::LoadByte as u8);
-                        bytecode.push(dst.to_vm_reg());
-                        bytecode.push(base.to_vm_reg());
-                    }
+                    bytecode.push(OpCode::LoadByte as u8);
+                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(base.to_vm_reg());
                 }
-            },
+            }
             X64InstrKind::Test { reg1, reg2 } => {
-                // Test reg, reg when they're the same is checking for zero
-                // Emit as cmp reg, 0
                 if reg1 == reg2 {
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1489,162 +1280,24 @@ fn lift_to_vm_bytecode_internal_with_main(instrs: &[X64Instruction], _base_rva: 
                     bytecode.push(reg1.to_vm_reg());
                     bytecode.push(15);
                 }
-            },
-            X64InstrKind::Lea { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
-                // Ignore - these don't need VM translation
-            },
+            }
+            X64InstrKind::Lea { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {}
         }
     }
-    
+
     for (placeholder_pos, target_x64_offset) in pending_jumps {
         if let Some(&target_vm_offset) = label_map.get(&target_x64_offset) {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
-        } else {
-            let closest = label_map.iter()
-                .filter(|(k, _)| **k >= target_x64_offset)
-                .min_by_key(|(k, _)| **k);
-            
-            if let Some((_, &vm_offset)) = closest {
-                let target_bytes = (vm_offset as u64).to_le_bytes();
-                bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
-            }
+        } else if let Some((_, &vm_offset)) = label_map
+            .iter()
+            .filter(|(k, _)| **k >= target_x64_offset)
+            .min_by_key(|(k, _)| **k)
+        {
+            let target_bytes = (vm_offset as u64).to_le_bytes();
+            bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
     }
-    
-    (bytecode, label_map, string_patch_positions)
-}
 
-pub fn lift_to_vm_bytecode_with_map_old(instrs: &[X64Instruction], base_rva: u32) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
-    let mut bytecode = lift_to_vm_bytecode(instrs, base_rva);
-    
-    let mut label_map = std::collections::HashMap::new();
-    let mut bytecode_offset = 0usize;
-    let mut stack_map = std::collections::HashMap::new();
-    let mut next_stack_reg = 10u8;
-    let mut external_call_count = 0;
-    
-    for instr in instrs {
-        label_map.insert(instr.offset, bytecode_offset);
-        
-        match &instr.kind {
-            X64InstrKind::MovRegImm { .. } => bytecode_offset += 1 + 1 + 8,
-            X64InstrKind::MovRegReg { .. } => bytecode_offset += 3,
-            X64InstrKind::MovMemImm { base, offset, .. } => {
-                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                    stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
-                    });
-                    bytecode_offset += 1 + 1 + 8;
-                }
-            },
-            X64InstrKind::MovRegMem { base, offset, .. } => {
-                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                    stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
-                    });
-                    bytecode_offset += 3;
-                }
-            },
-            X64InstrKind::MovMemReg { base, offset, .. } => {
-                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                    stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
-                    });
-                    bytecode_offset += 3;
-                }
-            },
-            X64InstrKind::AddRegReg { .. } | X64InstrKind::SubRegReg { .. } | 
-            X64InstrKind::ImulRegReg { .. } | X64InstrKind::CmpRegReg { .. } => bytecode_offset += 3,
-            X64InstrKind::ImulRegMem { base, offset, .. } => {
-                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                    stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
-                    });
-                    bytecode_offset += 3;
-                }
-            },
-            X64InstrKind::SubRegImm { .. } | X64InstrKind::AddRegImm { .. } | X64InstrKind::CmpRegImm { .. } => bytecode_offset += 1 + 1 + 1 + 1 + 4,
-            X64InstrKind::AddMemImm { base, offset, .. } | 
-            X64InstrKind::SubMemImm { base, offset, .. } | X64InstrKind::CmpMemImm { base, offset, .. } => {
-                if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                    stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
-                    });
-                    bytecode_offset += 1 + 1 + 1 + 1 + 4;
-                }
-            },
-            X64InstrKind::Dec { .. } => bytecode_offset += 1 + 1 + 8 + 1 + 1 + 1 + 1,
-            X64InstrKind::Inc { .. } => bytecode_offset += 1 + 1 + 8 + 1 + 1 + 1 + 1,
-            X64InstrKind::Jmp { .. } => bytecode_offset += 1 + 8,
-            X64InstrKind::Je { .. } | X64InstrKind::Jne { .. } | X64InstrKind::Jl { .. } |
-            X64InstrKind::Jle { .. } | X64InstrKind::Jg { .. } | X64InstrKind::Jge { .. } => bytecode_offset += 1 + 1 + 8,
-            X64InstrKind::Call { target_offset } => {
-                let target_x64_offset = (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-                
-                let is_internal = label_map.contains_key(&target_x64_offset) ||
-                                  instrs.iter().any(|i| i.offset == target_x64_offset);
-                
-                if !is_internal {
-                    external_call_count += 1;
-                    if external_call_count == 1 {
-                        // Skip __main
-                    } else {
-                        // All external calls: native_call 2
-                        bytecode_offset += 1 + 8;
-                    }
-                } else {
-                    // Internal call
-                    let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
-                    bytecode_offset += active_stack_regs.len() * 2; // Push
-                    bytecode_offset += 1 + 8; // Call
-                    bytecode_offset += active_stack_regs.len() * 2; // Pop
-                }
-            },
-            X64InstrKind::Ret => bytecode_offset += 1,
-            X64InstrKind::Push { .. } | X64InstrKind::Pop { .. } => bytecode_offset += 2,
-            X64InstrKind::LeaRipRel { .. } => bytecode_offset += 1 + 1 + 8,
-            X64InstrKind::MovzxByte { base, offset, .. } => {
-                if *offset == 0 {
-                    bytecode_offset += 1 + 1 + 1;
-                } else if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
-                    stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
-                    });
-                    bytecode_offset += 1 + 1 + 1;
-                } else {
-                    bytecode_offset += 1 + 1 + 1;
-                }
-            },
-            X64InstrKind::Test { reg1, reg2 } => {
-                // Test reg, reg when they're the same is checking for zero
-                // Emit as cmp reg, 0
-                if reg1 == reg2 {
-                    bytecode.push(OpCode::LoadImm as u8);
-                    bytecode.push(15);
-                    bytecode.extend_from_slice(&0u64.to_le_bytes());
-                    bytecode.push(OpCode::Cmp as u8);
-                    bytecode.push(reg1.to_vm_reg());
-                    bytecode.push(15);
-                }
-            },
-            X64InstrKind::Lea { .. } | X64InstrKind::Nop | X64InstrKind::Unknown => {
-                // Don't add to bytecode offset - these are ignored
-            },
-        }
-    }
-    
-    (bytecode, label_map)
+    (bytecode, label_map, string_patch_positions)
 }
