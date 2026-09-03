@@ -738,16 +738,16 @@ mod tests {
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
-        let ne_cond = [0x48u8, 0x83, 0xF9, 0x02];
+        let ne_cond = [0x83u8, 0xF9, 0x02];
         let mut found = false;
         for i in 0..stub.len().saturating_sub(ne_cond.len() + 16) {
-            if stub[i..i + 4] != ne_cond {
+            if stub[i..i + 3] != ne_cond {
                 continue;
             }
             let window = &stub[i..i + 20];
             assert!(
-                window.windows(2).any(|w| w == [0x0F, 0x85]) || window.windows(2).any(|w| w == [0x0F, 0x84]),
-                "JmpIf NE must use near jcc rel32 (0F 84/85)"
+                window.windows(2).any(|w| w == [0x0F, 0x85]),
+                "JmpIf NE must use native jne rel32 (0F 85) after popfq"
             );
             assert!(
                 !window.windows(2).any(|w| w == [0x75, 0x00] || w == [0x74, 0x00]),
@@ -757,6 +757,26 @@ mod tests {
             break;
         }
         assert!(found, "JmpIf NE (cond 2) handler must exist in stub");
+    }
+
+    #[test]
+    fn test_h_cmp_preserves_zf_in_flag_mask() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
+        assert!(
+            stub.windows(mask.len()).any(|w| w == mask),
+            "h_cmp must mask flags with 0x8C1 (ZF|SF|CF|OF), not 0x881"
+        );
+    }
+
+    #[test]
+    fn test_jmpif_taken_uses_add_rsi_rbx() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let taken_add = [0x48u8, 0x01, 0xDE];
+        assert!(
+            stub.windows(taken_add.len()).any(|w| w == taken_add),
+            "jmpif_taken must add target offset in rbx to bytecode base in rsi"
+        );
     }
 
     #[test]

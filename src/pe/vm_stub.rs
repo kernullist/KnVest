@@ -281,7 +281,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
         self.emit(&[0x9C]);
         self.emit(&[0x58]);
-        self.emit(&[0x48, 0x25, 0x81, 0x08, 0x00, 0x00]);
+        self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
         self.emit(&[0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
 
@@ -374,73 +374,51 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x06]);
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
         self.emit(&[0x48, 0x89, 0xC3]);
-        self.emit(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x8B, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
+        self.emit(&[0x50]);
+        self.emit(&[0x9D]);
 
-        self.emit(&[0x48, 0x83, 0xF9, 0x01]);
-        self.jcc_rel32(0x85, "jmpif_not_cond1");
-        self.emit(&[0xF6, 0xC2, 0x40]);
-        self.jcc_rel32(0x85, "jmpif_not_taken");
-        self.jmp_rel32("jmpif_taken");
-        self.label("jmpif_not_cond1");
+        self.emit(&[0x83, 0xF9, 0x01]);
+        self.jcc_rel32(0x85, "jmpif_chk2");
+        self.jcc_rel32(0x84, "jmpif_taken");
+        self.jmp_rel32("jmpif_not_taken");
+        self.label("jmpif_chk2");
 
-        self.emit(&[0x48, 0x83, 0xF9, 0x02]);
-        self.jcc_rel32(0x85, "jmpif_not_cond2");
-        self.emit(&[0xF6, 0xC2, 0x40]);
-        self.jcc_rel32(0x84, "jmpif_not_taken");
-        self.jmp_rel32("jmpif_taken");
-        self.label("jmpif_not_cond2");
-
-        self.emit(&[0x48, 0x83, 0xF9, 0x03]);
-        self.jcc_rel32(0x85, "jmpif_not_cond3");
-        self.emit(&[0x48, 0x89, 0xD0]);
-        self.emit(&[0x48, 0xC1, 0xE8, 0x07]);
-        self.emit(&[0x48, 0x31, 0xD0]);
-        self.emit(&[0xA8, 0x10]);
-        self.jcc_rel32(0x85, "jmpif_not_taken");
-        self.jmp_rel32("jmpif_taken");
-        self.label("jmpif_not_cond3");
-
-        self.emit(&[0x48, 0x83, 0xF9, 0x04]);
-        self.jcc_rel32(0x85, "jmpif_not_cond4");
-        self.emit(&[0xF6, 0xC2, 0x40]);
-        self.jcc_rel32(0x85, "jmpif_taken");
-        self.emit(&[0x48, 0x89, 0xD0]);
-        self.emit(&[0x48, 0xC1, 0xE8, 0x07]);
-        self.emit(&[0x48, 0x31, 0xD0]);
-        self.emit(&[0xA8, 0x10]);
+        self.emit(&[0x83, 0xF9, 0x02]);
+        self.jcc_rel32(0x85, "jmpif_chk3");
         self.jcc_rel32(0x85, "jmpif_taken");
         self.jmp_rel32("jmpif_not_taken");
-        self.label("jmpif_not_cond4");
+        self.label("jmpif_chk3");
 
-        self.emit(&[0x48, 0x83, 0xF9, 0x05]);
-        self.jcc_rel32(0x85, "jmpif_not_cond5");
-        self.emit(&[0xF6, 0xC2, 0x40]);
-        self.jcc_rel32(0x84, "jmpif_not_taken");
-        self.emit(&[0x48, 0x89, 0xD0]);
-        self.emit(&[0x48, 0xC1, 0xE8, 0x07]);
-        self.emit(&[0x48, 0x31, 0xD0]);
-        self.emit(&[0xA8, 0x10]);
-        self.jcc_rel32(0x84, "jmpif_not_taken");
-        self.jmp_rel32("jmpif_taken");
-        self.label("jmpif_not_cond5");
+        self.emit(&[0x83, 0xF9, 0x03]);
+        self.jcc_rel32(0x85, "jmpif_chk4");
+        self.jcc_rel32(0x8F, "jmpif_taken");
+        self.jmp_rel32("jmpif_not_taken");
+        self.label("jmpif_chk4");
 
-        self.emit(&[0x48, 0x83, 0xF9, 0x06]);
+        self.emit(&[0x83, 0xF9, 0x04]);
+        self.jcc_rel32(0x85, "jmpif_chk5");
+        self.jcc_rel32(0x8C, "jmpif_taken");
+        self.jmp_rel32("jmpif_not_taken");
+        self.label("jmpif_chk5");
+
+        self.emit(&[0x83, 0xF9, 0x05]);
+        self.jcc_rel32(0x85, "jmpif_chk6");
+        self.jcc_rel32(0x8E, "jmpif_taken");
+        self.jmp_rel32("jmpif_not_taken");
+        self.label("jmpif_chk6");
+
+        self.emit(&[0x83, 0xF9, 0x06]);
         self.jcc_rel32(0x85, "jmpif_not_taken");
-        self.emit(&[0x48, 0x89, 0xD0]);
-        self.emit(&[0x48, 0xC1, 0xE8, 0x07]);
-        self.emit(&[0x48, 0x31, 0xD0]);
-        self.emit(&[0xA8, 0x10]);
-        self.jcc_rel32(0x84, "jmpif_not_taken");
-        self.jmp_rel32("jmpif_taken");
+        self.jcc_rel32(0x8D, "jmpif_taken");
+        self.jmp_rel32("jmpif_not_taken");
 
         self.label("jmpif_not_taken");
         self.jmp_to_dispatch();
 
         self.label("jmpif_taken");
-        self.emit(&[0x48, 0x89, 0xDE]);
         self.lea_rip_rel32(0x48, 6, "bytecode");
-        self.emit(&[0x48, 0x01, 0xF0]);
-        self.emit(&[0x48, 0x89, 0xC6]);
+        self.emit(&[0x48, 0x01, 0xDE]);
         self.jmp_to_dispatch();
     }
 
