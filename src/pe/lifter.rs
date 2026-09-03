@@ -570,9 +570,10 @@ pub fn lift_to_vm_bytecode_for_main(
     instrs: &[X64Instruction],
     base_rva: u32,
     main_x64_offset: usize,
+    pe_data: &[u8],
 ) -> Vec<u8> {
-    let (mut bytecode, _, string_patch_positions) =
-        lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset);
+    let (mut bytecode, _, string_patch_positions, main_has_printf, printf_string_bytes) =
+        lift_to_vm_bytecode_internal_with_main(instrs, base_rva, main_x64_offset, pe_data);
 
     if !string_patch_positions.is_empty() {
         let offset = ((bytecode.len() + 15) / 16) * 16;
@@ -580,7 +581,13 @@ pub fn lift_to_vm_bytecode_for_main(
             bytecode.push(0x00);
         }
 
-        bytecode.extend_from_slice(b"knvest\0");
+        if main_has_printf {
+            if let Some(string_bytes) = printf_string_bytes {
+                bytecode.extend_from_slice(&string_bytes);
+            }
+        } else {
+            bytecode.extend_from_slice(b"knvest\0");
+        }
 
         let string_offset = offset as u64;
         for patch_pos in string_patch_positions {
@@ -589,6 +596,22 @@ pub fn lift_to_vm_bytecode_for_main(
     }
 
     bytecode
+}
+
+fn read_cstring(pe_data: &[u8], file_offset: usize, max_len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..max_len {
+        let idx = file_offset + i;
+        if idx >= pe_data.len() {
+            break;
+        }
+        let b = pe_data[idx];
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+    }
+    out
 }
 
 fn lift_to_vm_bytecode_internal(
@@ -893,10 +916,13 @@ fn lift_to_vm_bytecode_internal_with_main(
     instrs: &[X64Instruction],
     _base_rva: u32,
     main_x64_offset: usize,
+    pe_data: &[u8],
 ) -> (
     Vec<u8>,
     std::collections::HashMap<usize, usize>,
     Vec<usize>,
+    bool,
+    Option<Vec<u8>>,
 ) {
     let mut bytecode = Vec::new();
     let mut label_map = std::collections::HashMap::new();
@@ -948,6 +974,9 @@ fn lift_to_vm_bytecode_internal_with_main(
         }
     });
     let main_has_printf = !has_putchar_callees && main_external_calls > 1;
+
+    let mut printf_string_reg: Option<u8> = None;
+    let mut printf_string_bytes: Option<Vec<u8>> = None;
 
     let mut hit_main_ret = false;
 
@@ -1202,8 +1231,20 @@ fn lift_to_vm_bytecode_internal_with_main(
                                 bytecode.extend_from_slice(&3u64.to_le_bytes());
                             }
                         } else if main_has_printf {
+                            if let Some(reg) = printf_string_reg {
+                                if reg != 0 {
+                                    bytecode.push(OpCode::Move as u8);
+                                    bytecode.push(0);
+                                    bytecode.push(reg);
+                                }
+                            }
+                            if let Some(ref str_bytes) = printf_string_bytes {
+                                bytecode.push(OpCode::LoadImm as u8);
+                                bytecode.push(1);
+                                bytecode.extend_from_slice(&(str_bytes.len() as u64).to_le_bytes());
+                            }
                             bytecode.push(OpCode::NativeCall as u8);
-                            bytecode.extend_from_slice(&2u64.to_le_bytes());
+                            bytecode.extend_from_slice(&1u64.to_le_bytes());
                         }
                     }
                 } else {
@@ -1245,11 +1286,18 @@ fn lift_to_vm_bytecode_internal_with_main(
                 bytecode.push(OpCode::Pop as u8);
                 bytecode.push(reg.to_vm_reg());
             }
-            X64InstrKind::LeaRipRel { dst, .. } => {
+            X64InstrKind::LeaRipRel { dst, offset } => {
+                let str_file_off =
+                    (instr.offset + instr.bytes.len()).wrapping_add(*offset as usize);
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(dst.to_vm_reg());
                 string_patch_positions.push(bytecode.len());
                 bytecode.extend_from_slice(&0u64.to_le_bytes());
+                if instr.offset >= main_x64_offset {
+                    let bytes = read_cstring(pe_data, str_file_off, 256);
+                    printf_string_reg = Some(dst.to_vm_reg());
+                    printf_string_bytes = Some(bytes);
+                }
             }
             X64InstrKind::MovzxByte { dst, base, offset } => {
                 if *offset == 0 {
@@ -1299,5 +1347,15 @@ fn lift_to_vm_bytecode_internal_with_main(
         }
     }
 
-    (bytecode, label_map, string_patch_positions)
+    (
+        bytecode,
+        label_map,
+        string_patch_positions,
+        main_has_printf,
+        if main_has_printf {
+            printf_string_bytes
+        } else {
+            None
+        },
+    )
 }

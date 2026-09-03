@@ -157,7 +157,7 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     
     all_instrs.sort_by_key(|i| i.offset);
 
-    let bytecode = lift_to_vm_bytecode_for_main(&all_instrs, target_rva, file_offset);
+    let bytecode = lift_to_vm_bytecode_for_main(&all_instrs, target_rva, file_offset, &pe.data);
 
     Ok(bytecode)
 }
@@ -660,9 +660,30 @@ mod tests {
             stub[table_base + 6],
             stub[table_base + 7],
         ]);
+        assert!(load_imm_off > 0, "handler offsets must be positive (handlers after table)");
         let h_load_imm = (table_base as i64 + load_imm_off as i64) as usize;
         assert_eq!(stub[h_load_imm], 0x0F);
         assert_eq!(stub[h_load_imm + 1], 0xB6);
+    }
+
+    #[test]
+    fn test_native_call_saves_and_restores_rsi() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
+        let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
+        assert!(
+            stub.windows(save_rsi.len()).any(|w| w == save_rsi),
+            "native_call must save bytecode rsi at [rbp-0x68]"
+        );
+        assert!(
+            stub.windows(restore_rsi.len()).any(|w| w == restore_rsi),
+            "native_call must restore bytecode rsi from [rbp-0x68]"
+        );
+        let clobber_r3 = [0x48u8, 0x89, 0x85, 0x68, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(clobber_r3.len()).any(|w| w == clobber_r3),
+            "native_call must not clobber VM r3 via mov [rbp-0x68], rax"
+        );
     }
 
     #[test]

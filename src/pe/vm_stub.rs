@@ -5,8 +5,8 @@ pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u
     let mut e = StubEmitter::new();
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
+    e.emit_handler_table_placeholder();
     e.emit_handlers();
-    e.emit_handler_table();
     e.emit_strings_and_marker();
     e.finalize()
 }
@@ -16,6 +16,7 @@ struct StubEmitter {
     labels: HashMap<&'static str, usize>,
     rel32: Vec<(usize, &'static str)>,
     lea_rip: Vec<(usize, &'static str)>,
+    handler_table_start: Option<usize>,
 }
 
 impl StubEmitter {
@@ -25,6 +26,7 @@ impl StubEmitter {
             labels: HashMap::new(),
             rel32: Vec::new(),
             lea_rip: Vec::new(),
+            handler_table_start: None,
         }
     }
 
@@ -445,7 +447,8 @@ impl StubEmitter {
     fn emit_native_call_handler(&mut self) {
         self.emit(&[0x48, 0x8B, 0x06]);
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
-        self.emit(&[0x48, 0x89, 0x85, 0x68, 0xFF, 0xFF, 0xFF]);
+        // Save bytecode pointer past func id (PR3 slot at [rbp-0x68], not VM r3).
+        self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
 
         self.emit(&[0x48, 0x83, 0xF8, 0x01]);
         self.jcc_rel32(0x84, "nc_func1");
@@ -534,11 +537,21 @@ impl StubEmitter {
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
 
         self.label("nc_done");
+        self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
     }
 
-    fn emit_handler_table(&mut self) {
+    fn emit_handler_table_placeholder(&mut self) {
         self.label("handler_table");
-        let table_base = self.pos();
+        self.handler_table_start = Some(self.pos());
+        for _ in 0..256 {
+            self.emit(&[0x00, 0x00, 0x00, 0x00]);
+        }
+    }
+
+    fn fill_handler_table(&mut self) {
+        let table_base = self
+            .handler_table_start
+            .expect("handler table placeholder missing");
         let handlers: [(u8, &str); 16] = [
             (0x00, "h_nop"),
             (0x01, "h_load_imm"),
@@ -565,13 +578,14 @@ impl StubEmitter {
                 .find(|(hop, _)| *hop == op)
                 .map(|(_, label)| self.handler_offset(label, table_base))
                 .unwrap_or(default_off);
-            self.emit(&off.to_le_bytes());
+            let patch_at = table_base + i * 4;
+            self.code[patch_at..patch_at + 4].copy_from_slice(&off.to_le_bytes());
         }
     }
 
-    fn handler_offset(&self, label: &str, table_base: usize) -> u32 {
+    fn handler_offset(&self, label: &str, table_base: usize) -> i32 {
         let handler = *self.labels.get(label).unwrap_or(&table_base);
-        (handler as i64 - table_base as i64) as u32
+        (handler as i64 - table_base as i64) as i32
     }
 
     fn emit_strings_and_marker(&mut self) {
@@ -597,6 +611,7 @@ impl StubEmitter {
     }
 
     fn finalize(mut self) -> (Vec<u8>, usize) {
+        self.fill_handler_table();
         let rel32 = std::mem::take(&mut self.rel32);
         for (patch_at, target) in rel32 {
             let tgt = *self.labels.get(target).unwrap_or(&0);
