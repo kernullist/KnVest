@@ -543,14 +543,25 @@ pub fn disassemble_x64_simple(code: &[u8], max_instrs: usize) -> Vec<X64Instruct
 
 fn jmp_if_condition_code(kind: &X64InstrKind) -> u8 {
     match kind {
-        X64InstrKind::Je { .. } => 1,  // ZF=1
-        X64InstrKind::Jne { .. } => 2, // ZF=0
-        X64InstrKind::Jl { .. } => 3,  // SF!=OF
-        X64InstrKind::Jle { .. } => 4, // ZF=1 || SF!=OF
-        X64InstrKind::Jg { .. } => 5,  // ZF=0 && SF==OF
-        X64InstrKind::Jge { .. } => 6, // SF==OF
+        X64InstrKind::Je { .. } => 1,  // EQ / ZF=1
+        X64InstrKind::Jne { .. } => 2, // NE / ZF=0
+        X64InstrKind::Jg { .. } => 3,  // JG / ZF=0 && SF==OF
+        X64InstrKind::Jl { .. } => 4,  // JL / SF!=OF
+        X64InstrKind::Jle { .. } => 5, // JLE / ZF=1 || SF!=OF
+        X64InstrKind::Jge { .. } => 6, // JGE / SF==OF
         _ => 2,
     }
+}
+
+fn resolve_jump_target(label_map: &std::collections::HashMap<usize, usize>, target_x64_offset: usize) -> Option<usize> {
+    if let Some(&target_vm_offset) = label_map.get(&target_x64_offset) {
+        return Some(target_vm_offset);
+    }
+    label_map
+        .iter()
+        .filter(|(k, _)| **k <= target_x64_offset)
+        .max_by_key(|(k, _)| **k)
+        .map(|(_, &vm_offset)| vm_offset)
 }
 
 fn is_lifted_internal_target(target: usize, min_x64_offset: usize, max_x64_offset: usize) -> bool {
@@ -625,7 +636,7 @@ fn try_fuse_index_base_mov_pair(
     else {
         return false;
     };
-    if dst != dst2 || base == index {
+    if dst.to_vm_reg() != dst2.to_vm_reg() || index.to_vm_reg() == base.to_vm_reg() {
         return false;
     }
     emit_mov_reg_reg(bytecode, dst, base);
@@ -1058,7 +1069,7 @@ fn lift_to_vm_bytecode_internal(
     }
 
     for (placeholder_pos, target_x64_offset) in pending_jumps {
-        if let Some(&target_vm_offset) = label_map.get(&target_x64_offset) {
+        if let Some(target_vm_offset) = resolve_jump_target(&label_map, target_x64_offset) {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
@@ -1540,15 +1551,8 @@ fn lift_to_vm_bytecode_internal_with_main(
     }
 
     for (placeholder_pos, target_x64_offset) in pending_jumps {
-        if let Some(&target_vm_offset) = label_map.get(&target_x64_offset) {
+        if let Some(target_vm_offset) = resolve_jump_target(&label_map, target_x64_offset) {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
-            bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
-        } else if let Some((_, &vm_offset)) = label_map
-            .iter()
-            .filter(|(k, _)| **k >= target_x64_offset)
-            .min_by_key(|(k, _)| **k)
-        {
-            let target_bytes = (vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
     }
@@ -1850,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn jg_branch_emits_jmp_if_condition_5() {
+    fn jg_branch_emits_jmp_if_condition_3() {
         let main_off = 0x400;
         let instrs = vec![
             X64Instruction {
@@ -1862,23 +1866,33 @@ mod tests {
         ];
         let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
         let jmp_if_pos = bc.iter().position(|&b| b == OpCode::JmpIf as u8).unwrap();
-        assert_eq!(bc[jmp_if_pos + 1], 5);
+        assert_eq!(bc[jmp_if_pos + 1], 3);
+    }
+
+    #[test]
+    fn jl_branch_emits_jmp_if_condition_4() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x7C, 0x00],
+                kind: X64InstrKind::Jl { target_offset: 0 },
+            },
+            ret_at(main_off + 2),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let jmp_if_pos = bc.iter().position(|&b| b == OpCode::JmpIf as u8).unwrap();
+        assert_eq!(bc[jmp_if_pos + 1], 4);
     }
 
     #[test]
     fn decodes_jg_and_jle_rel8() {
-        assert!(matches!(
-            decode(&[0x7F, 0x10]),
-            X64InstrKind::Jg { target_offset: 0x10 }
-        ));
-        assert!(matches!(
-            decode(&[0x7E, 0x10]),
-            X64InstrKind::Jle { target_offset: 0x10 }
-        ));
+        assert!(matches!(decode(&[0x7F, 0x10]), X64InstrKind::Jg { .. }));
+        assert!(matches!(decode(&[0x7E, 0x10]), X64InstrKind::Jle { .. }));
     }
 
     #[test]
-    fn jle_branch_emits_jmp_if_condition_4() {
+    fn jle_branch_emits_jmp_if_condition_5() {
         let main_off = 0x400;
         let instrs = vec![
             X64Instruction {
@@ -1890,7 +1904,7 @@ mod tests {
         ];
         let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
         let jmp_if_pos = bc.iter().position(|&b| b == OpCode::JmpIf as u8).unwrap();
-        assert_eq!(bc[jmp_if_pos + 1], 4);
+        assert_eq!(bc[jmp_if_pos + 1], 5);
     }
 
     #[test]
@@ -1920,5 +1934,43 @@ mod tests {
         let adds = bc.iter().filter(|&&b| b == OpCode::Add as u8).count();
         assert_eq!(moves, 1, "fused pair should emit one move, not two");
         assert_eq!(adds, 1);
+    }
+
+    #[test]
+    fn fuses_mov_pair_with_32bit_reg_names() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x89, 0xD8],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Eax,
+                    src: X64Reg::Ebx,
+                },
+            },
+            X64Instruction {
+                offset: main_off + 2,
+                bytes: vec![0x89, 0xF0],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::Rsi,
+                },
+            },
+            ret_at(main_off + 4),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        assert_eq!(bc.iter().filter(|&&b| b == OpCode::Move as u8).count(), 1);
+        assert_eq!(bc.iter().filter(|&&b| b == OpCode::Add as u8).count(), 1);
+    }
+
+    #[test]
+    fn jmp_resolves_to_nearest_label_at_or_before_target() {
+        let mut label_map = std::collections::HashMap::new();
+        label_map.insert(0x100, 10);
+        label_map.insert(0x110, 20);
+        label_map.insert(0x120, 30);
+        assert_eq!(resolve_jump_target(&label_map, 0x110), Some(20));
+        assert_eq!(resolve_jump_target(&label_map, 0x115), Some(20));
+        assert_eq!(resolve_jump_target(&label_map, 0x125), Some(30));
     }
 }

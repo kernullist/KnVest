@@ -231,9 +231,9 @@ impl VirtualMachine {
                 let should_jump = match condition {
                     1 => zf,                          // JE: ZF=1
                     2 => !zf,                         // JNE: ZF=0
-                    3 => sf != of,                    // JL: SF!=OF
-                    4 => zf || sf != of,              // JLE
-                    5 => !zf && sf == of,             // JG
+                    3 => !zf && sf == of,             // JG: ZF=0 && SF==OF
+                    4 => sf != of,                    // JL: SF!=OF
+                    5 => zf || sf != of,              // JLE
                     6 => sf == of,                    // JGE
                     _ => false,
                 };
