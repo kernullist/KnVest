@@ -650,6 +650,62 @@ fn resolve_unconditional_jump_target(
     resolve_jump_target(label_map, adjusted)
 }
 
+fn is_mul_or_add_kind(kind: &X64InstrKind) -> bool {
+    matches!(
+        kind,
+        X64InstrKind::ImulRegReg { .. }
+            | X64InstrKind::ImulRegMem { .. }
+            | X64InstrKind::AddRegReg { .. }
+    )
+}
+
+fn mov_into_mul_dest(mov: &X64InstrKind, mul: &X64InstrKind) -> bool {
+    match (mov, mul) {
+        (X64InstrKind::MovRegReg { dst, .. }, X64InstrKind::ImulRegReg { dst: mul_dst, .. }) => {
+            dst.to_vm_reg() == mul_dst.to_vm_reg()
+        }
+        (X64InstrKind::MovRegReg { dst, .. }, X64InstrKind::ImulRegMem { dst: mul_dst, .. }) => {
+            dst.to_vm_reg() == mul_dst.to_vm_reg()
+        }
+        (X64InstrKind::MovRegReg { dst, .. }, X64InstrKind::AddRegReg { dst: add_dst, .. }) => {
+            dst.to_vm_reg() == add_dst.to_vm_reg()
+        }
+        _ => false,
+    }
+}
+
+fn mov_before_mul_or_add(instrs: &[X64Instruction], mul_offset: usize) -> Option<usize> {
+    let mul = instrs.iter().find(|i| i.offset == mul_offset)?;
+    if !is_mul_or_add_kind(&mul.kind) {
+        return None;
+    }
+    let prev = instrs
+        .iter()
+        .filter(|i| i.offset < mul_offset)
+        .max_by_key(|i| i.offset)?;
+    if mov_into_mul_dest(&prev.kind, &mul.kind) {
+        Some(prev.offset)
+    } else {
+        None
+    }
+}
+
+fn retarget_conditional_jmp_from_mul(instrs: &[X64Instruction], target_x64_offset: usize) -> usize {
+    let Some(instr) = instruction_at_offset(instrs, target_x64_offset) else {
+        return target_x64_offset;
+    };
+    mov_before_mul_or_add(instrs, instr.offset).unwrap_or(target_x64_offset)
+}
+
+fn resolve_conditional_jump_target(
+    instrs: &[X64Instruction],
+    label_map: &std::collections::HashMap<usize, usize>,
+    target_x64_offset: usize,
+) -> Option<usize> {
+    let adjusted = retarget_conditional_jmp_from_mul(instrs, target_x64_offset);
+    resolve_jump_target(label_map, adjusted)
+}
+
 fn is_fuse_gap_skippable(kind: &X64InstrKind) -> bool {
     matches!(
         kind,
@@ -1219,7 +1275,7 @@ fn lift_to_vm_bytecode_internal(
         let target_vm_offset = if is_unconditional {
             resolve_unconditional_jump_target(instrs, &label_map, target_x64_offset)
         } else {
-            resolve_jump_target(&label_map, target_x64_offset)
+            resolve_conditional_jump_target(instrs, &label_map, target_x64_offset)
         };
         if let Some(target_vm_offset) = target_vm_offset {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
@@ -1717,7 +1773,7 @@ fn lift_to_vm_bytecode_internal_with_main(
         let target_vm_offset = if is_unconditional {
             resolve_unconditional_jump_target(instrs, &label_map, target_x64_offset)
         } else {
-            resolve_jump_target(&label_map, target_x64_offset)
+            resolve_conditional_jump_target(instrs, &label_map, target_x64_offset)
         };
         if let Some(target_vm_offset) = target_vm_offset {
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
@@ -2217,6 +2273,103 @@ mod tests {
         let jmp_pos = bc.iter().position(|&b| b == OpCode::Jmp as u8).unwrap();
         let target = u64::from_le_bytes(bc[jmp_pos + 1..jmp_pos + 9].try_into().unwrap()) as usize;
         assert_eq!(bc[target], OpCode::Cmp as u8);
+    }
+
+    #[test]
+    fn conditional_jmp_to_mul_retargets_to_preceding_mov() {
+        let main_off = 0x400;
+        let mov_off = main_off + 0x39;
+        let mul_off = mov_off + 3;
+        let cmp_off = main_off + 0x18d;
+        let jle_off = cmp_off + 3;
+        let instrs = vec![
+            X64Instruction {
+                offset: mov_off,
+                bytes: vec![0x4C, 0x89, 0xD0],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::R10,
+                },
+            },
+            X64Instruction {
+                offset: mul_off,
+                bytes: vec![0x4D, 0x0F, 0xAF, 0xC3],
+                kind: X64InstrKind::ImulRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::R11,
+                },
+            },
+            X64Instruction {
+                offset: cmp_off,
+                bytes: vec![0x4D, 0x39, 0xFB],
+                kind: X64InstrKind::CmpRegReg {
+                    reg1: X64Reg::R11,
+                    reg2: X64Reg::R15,
+                },
+            },
+            X64Instruction {
+                offset: jle_off,
+                bytes: vec![0x7E, 0x00],
+                kind: X64InstrKind::Jle {
+                    target_offset: (mul_off as i32) - (jle_off as i32 + 2),
+                },
+            },
+            ret_at(jle_off + 2),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let jmp_if_pos = bc
+            .windows(2)
+            .position(|w| w[0] == OpCode::JmpIf as u8 && w[1] == 5)
+            .expect("inner JLE jmp_if");
+        let target =
+            u64::from_le_bytes(bc[jmp_if_pos + 2..jmp_if_pos + 10].try_into().unwrap()) as usize;
+        let mul_pos = bc.iter().position(|&b| b == OpCode::Mul as u8).unwrap();
+        let move_pos = bc.iter().position(|&b| b == OpCode::Move as u8).unwrap();
+        assert_eq!(target, move_pos, "inner JLE must target mov i into r0, not mul");
+        assert!(move_pos < mul_pos);
+        assert_ne!(target, mul_pos);
+    }
+
+    #[test]
+    fn conditional_jmp_one_byte_into_mul_retargets_to_mov() {
+        let main_off = 0x400;
+        let mov_off = main_off + 0x39;
+        let mul_off = mov_off + 3;
+        let jle_off = main_off + 0x190;
+        let instrs = vec![
+            X64Instruction {
+                offset: mov_off,
+                bytes: vec![0x4C, 0x89, 0xD0],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::R10,
+                },
+            },
+            X64Instruction {
+                offset: mul_off,
+                bytes: vec![0x4D, 0x0F, 0xAF, 0xC3],
+                kind: X64InstrKind::ImulRegReg {
+                    dst: X64Reg::Rax,
+                    src: X64Reg::R11,
+                },
+            },
+            X64Instruction {
+                offset: jle_off,
+                bytes: vec![0x7E, 0x00],
+                kind: X64InstrKind::Jle {
+                    target_offset: (mul_off as i32 + 1) - (jle_off as i32 + 2),
+                },
+            },
+            ret_at(jle_off + 2),
+        ];
+        let bc = lift_to_vm_bytecode_for_main(&instrs, 0x1000, main_off, &[], None);
+        let jmp_if_pos = bc
+            .windows(2)
+            .position(|w| w[0] == OpCode::JmpIf as u8 && w[1] == 5)
+            .unwrap();
+        let target =
+            u64::from_le_bytes(bc[jmp_if_pos + 2..jmp_if_pos + 10].try_into().unwrap()) as usize;
+        assert_eq!(bc[target], OpCode::Move as u8);
     }
 
     #[test]
