@@ -319,7 +319,7 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x8B, 0x44, 0xCD, 0x80]); // mov eax, dword [rbp+rcx*8-0x80]
-        self.emit(&[0x3B, 0x44, 0xBD, 0x80]); // cmp eax, dword [rbp+rdi*8-0x80]
+        self.emit(&[0x3B, 0x44, 0xFD, 0x80]); // cmp eax, dword [rbp+rdi*8-0x80]
         self.emit(&[0x9C]);
         self.emit(&[0x58]);
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
@@ -977,14 +977,26 @@ mod tests {
             stub.windows(qword_cmp.len()).any(|w| w == qword_cmp),
             "h_cmp must use 64-bit qword compare (fact/loop JG depend on this)"
         );
-        let dword_cmp32 = [0x8Bu8, 0x44, 0xCD, 0x80, 0x3B, 0x44, 0xBD, 0x80];
+        let dword_cmp32 = [0x8Bu8, 0x44, 0xCD, 0x80, 0x3B, 0x44, 0xFD, 0x80];
         assert!(
             stub.windows(dword_cmp32.len()).any(|w| w == dword_cmp32),
-            "h_cmp32 must use SIB scale*8 (CD) for dword [rbp+reg*8-0x80], not scale*4 (8D)"
+            "h_cmp32 must use SIB scale*8 (CD/FD) for dword [rbp+reg*8-0x80], not scale*4 (8D/BD)"
         );
         assert!(
             !stub.windows(4).any(|w| w == [0x8B, 0x44, 0x8D, 0x80]),
-            "h_cmp32 must not use scale*4 SIB 8D (reads wrong VM slot, e.g. r10→r5)"
+            "h_cmp32 must not use scale*4 SIB 8D on src (reads wrong VM slot, e.g. r10→r5)"
+        );
+        assert!(
+            !stub.windows(4).any(|w| w == [0x3B, 0x44, 0xBD, 0x80]),
+            "h_cmp32 must not use scale*4 SIB BD on dst (reads wrong VM slot, e.g. r15→[rbp-0x44])"
+        );
+        let cmp32_flags = [
+            0x8B, 0x44, 0xCD, 0x80, 0x3B, 0x44, 0xFD, 0x80, 0x9C, 0x58, 0x48, 0x25, 0xC1, 0x08,
+            0x00, 0x00, 0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF,
+        ];
+        assert!(
+            stub.windows(cmp32_flags.len()).any(|w| w == cmp32_flags),
+            "h_cmp32 must store masked flags to [rbp-0x90] after dword cmp (same path as h_cmp)"
         );
         let spill_save_r10 = [0x48u8, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0x00, 0xFB, 0xFF, 0xFF];
         assert!(
