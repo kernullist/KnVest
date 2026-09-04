@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 // L2 VM interpreter frame map (rbp-relative; disp32 = signed i32 little-endian)
 //   VM r0..r15     [rbp-0x80]..[rbp-0x08]   reg n → [rbp + n*8 - 0x80]
+//     r1 = 88 FF FF FF, r2 = 90 FF FF FF (NOT 78/70 — those are -0x88 / flags -0x90)
 //   cmp flags      [rbp-0x90]  bytes 70 FF FF FF
 //   bytecode rsi   [rbp-0x98]  bytes 68 FF FF FF  (native_call save / h_call scratch)
 //   stdout handle  [rbp-0xA0]  bytes 60 FF FF FF
@@ -14,7 +15,7 @@ use std::collections::HashMap;
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
 //   ret addrs      [rbp + depth*8 - 0x200]
-//   data stack     [rbp + idx*8 - 0x280]
+//   data stack     [rbp + idx*8 - 0x480]  (must not alias ret slots; fact needs 16+ pushes)
 pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
     let mut e = StubEmitter::new();
     e.emit_prologue_and_api_resolve();
@@ -346,7 +347,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFD, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFB, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
@@ -357,7 +358,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xCA]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFD, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFB, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
 
@@ -535,15 +536,15 @@ impl StubEmitter {
         self.label("nc_iat");
         // rax = func_id; ebx = iat_rva; r11d = low dword (ptr flag in bit 31)
         self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
-        self.emit(&[0x41, 0x89, 0xDB]); // mov ebx, r11d  (NOT 41 89 C3 = mov r11d,eax only)
+        self.emit(&[0x44, 0x89, 0xDB]); // mov ebx, r11d (44=REX.R; 41 89 DB is mov r11d,ebx)
         self.emit(&[0x81, 0xE3, 0xFF, 0xFF, 0xFF, 0x7F]); // and ebx, 0x7fffffff
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // PEB
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
-        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3
-        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0
-        self.emit(&[0x48, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1
+        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3 (disp32 = signed offset, not hex low byte)
+        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0 [rbp-0x80]
+        self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
@@ -757,10 +758,15 @@ mod tests {
             stub.windows(rcx_from_r0.len()).any(|w| w == rcx_from_r0),
             "IAT path must map x64 rcx from VM register 0"
         );
-        let rdx_from_r1 = [0x48u8, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF];
+        let rdx_from_r1 = [0x48u8, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF];
         assert!(
             stub.windows(rdx_from_r1.len()).any(|w| w == rdx_from_r1),
-            "IAT path must map x64 rdx from VM register 1"
+            "IAT path must map x64 rdx from VM r1 [rbp-0x78] (88 FF FF FF)"
+        );
+        let rdx_wrong_gap = [0x48u8, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(rdx_wrong_gap.len()).any(|w| w == rdx_wrong_gap),
+            "IAT rdx must not use 78 FF FF FF ([rbp-0x88] gap, not r1)"
         );
         let ptr_fixup = [0x49u8, 0x01, 0xD1]; // add rcx, r10 after lea r10, [bytecode]
         assert!(
@@ -794,7 +800,9 @@ mod tests {
         );
         let iat_load = [0x48u8, 0x8B, 0x18]; // mov rbx, [rax]
         let iat_call = [0xFFu8, 0xD3]; // call rbx
-        let mov_ebx_r11d = [0x41u8, 0x89, 0xDB];
+        let mov_r11d_eax = [0x41u8, 0x89, 0xC3];
+        let mov_ebx_r11d = [0x44u8, 0x89, 0xDB];
+        let wrong_mov_r11d_ebx = [0x41u8, 0x89, 0xDB];
         assert!(
             stub.windows(iat_load.len()).any(|w| w == iat_load),
             "nc_iat must load resolved import with mov rbx,[rax]"
@@ -803,9 +811,19 @@ mod tests {
             stub.windows(iat_call.len()).any(|w| w == iat_call),
             "nc_iat must call through rbx (FF D3), not rax"
         );
+        // Byte-exact nc_iat prologue: eax→r11d, then ebx←r11d (not reversed)
+        let nc_iat_off = stub
+            .windows(mov_r11d_eax.len())
+            .position(|w| w == mov_r11d_eax)
+            .expect("nc_iat mov r11d,eax");
+        assert_eq!(
+            &stub[nc_iat_off + mov_r11d_eax.len()..nc_iat_off + mov_r11d_eax.len() + mov_ebx_r11d.len()],
+            mov_ebx_r11d,
+            "after mov r11d,eax nc_iat must emit 44 89 DB (mov ebx,r11d)"
+        );
         assert!(
-            stub.windows(mov_ebx_r11d.len()).any(|w| w == mov_ebx_r11d),
-            "nc_iat must use mov ebx,r11d (41 89 DB), not mov r11d,ebx"
+            !stub.windows(wrong_mov_r11d_ebx.len()).any(|w| w == wrong_mov_r11d_ebx),
+            "must not emit 41 89 DB (mov r11d,ebx) after copying func_id low dword"
         );
         assert!(
             !stub.windows([0xFFu8, 0xD0].len()).any(|w| w == [0xFF, 0xD0]),
@@ -867,6 +885,16 @@ mod tests {
         assert!(
             !stub.windows(nc2_from_r2.len()).any(|w| w == nc2_from_r2),
             "nc_func2 must not load from VM r2 [rbp-0x70] (45 90)"
+        );
+        // fact(5) does 4 pushes × 4 recursive frames → push idx 16; old -0x280 base aliased ret[0]
+        let data_stack_disp = [0x80u8, 0xFB, 0xFF, 0xFF];
+        assert!(
+            stub.windows(data_stack_disp.len()).filter(|w| *w == data_stack_disp).count() >= 2,
+            "h_push/h_pop data stack must use [rbp-0x480] (80 FB FF FF)"
+        );
+        assert!(
+            !stub.windows(4).any(|w| w == [0x80, 0xFD, 0xFF, 0xFF]),
+            "data stack must not use old [rbp-0x280] base (aliases ret stack at idx 16)"
         );
     }
 }
