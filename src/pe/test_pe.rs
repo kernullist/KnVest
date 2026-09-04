@@ -270,6 +270,93 @@ pub fn create_pe64_with_callee() -> Vec<u8> {
     pe
 }
 
+/// PE64 with main that `call rel32`s forward into fake CRT — must not be CFG-collected.
+pub fn create_pe64_with_forward_crt_call() -> Vec<u8> {
+    let mut pe = Vec::new();
+
+    pe.extend_from_slice(&create_dos_header(0x80));
+    pe.extend_from_slice(&vec![0u8; 0x80 - 64]);
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&create_coff_header(1));
+    pe.extend_from_slice(&create_optional_header_pe32plus());
+    pe.extend_from_slice(&create_section_header(
+        b".text\0\0\0",
+        0x800,
+        0x1000,
+        0x800,
+        0x400,
+    ));
+
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    let mut text = vec![0x90u8; 0x800];
+    // fake CRT at .text+0x400
+    text[0x400] = 0x55;
+    text[0x401] = 0x48;
+    text[0x402] = 0x89;
+    text[0x403] = 0xE5;
+    text[0x404] = 0xB8;
+    text[0x409] = 0xC3;
+
+    // main at .text+0x20
+    let main_off = 0x20usize;
+    let crt_off = 0x400usize;
+    let call_from = main_off + 4;
+    let call_end = call_from + 5;
+    let rel = (crt_off as i32) - (call_end as i32);
+    text[main_off] = 0x55;
+    text[main_off + 1] = 0x48;
+    text[main_off + 2] = 0x89;
+    text[main_off + 3] = 0xE5;
+    text[call_from] = 0xE8;
+    text[call_from + 1..call_from + 5].copy_from_slice(&rel.to_le_bytes());
+    text[call_from + 5] = 0x5D;
+    text[call_from + 6] = 0xC3;
+
+    pe.extend_from_slice(&text);
+    while pe.len() < 0xC00 {
+        pe.push(0);
+    }
+    pe
+}
+
+/// PE64 with `call rel32` to an FF 25 import thunk for puts.
+pub fn create_pe64_with_puts_thunk_call() -> Vec<u8> {
+    let mut pe = create_pe64_with_imports();
+    let pe_file = crate::pe::parser::PEFile::from_bytes(pe.clone()).unwrap();
+    let imports = pe_file.parse_imports().unwrap();
+    let puts = imports.entries().iter().find(|e| e.name == "puts").unwrap();
+    let text = pe_file.get_section(".text").unwrap();
+    let text_off = pe_file.rva_to_file_offset(text.virtual_address).unwrap();
+
+    // Place FF 25 thunk at .text+0x80
+    let thunk_off = text_off + 0x80;
+    pe[thunk_off] = 0xFF;
+    pe[thunk_off + 1] = 0x25;
+    let disp = (puts.iat_rva as i32) - ((text.virtual_address + 0x80 + 6) as i32);
+    pe[thunk_off + 2..thunk_off + 6].copy_from_slice(&disp.to_le_bytes());
+
+    // main: push rbp; mov rbp,rsp; call thunk; xor eax,eax; pop rbp; ret
+    let main_off = text_off + 0x20;
+    let call_from = main_off + 4;
+    let call_end = call_from + 5;
+    let rel = (thunk_off as i32) - (call_end as i32);
+    pe[main_off] = 0x55;
+    pe[main_off + 1] = 0x48;
+    pe[main_off + 2] = 0x89;
+    pe[main_off + 3] = 0xE5;
+    pe[call_from] = 0xE8;
+    pe[call_from + 1..call_from + 5].copy_from_slice(&rel.to_le_bytes());
+    pe[call_from + 5] = 0x31;
+    pe[call_from + 6] = 0xC0;
+    pe[call_from + 7] = 0x5D;
+    pe[call_from + 8] = 0xC3;
+
+    pe
+}
+
 fn create_dos_header(pe_offset: u32) -> Vec<u8> {
     let mut header = vec![0u8; 64];
     header[0] = b'M';

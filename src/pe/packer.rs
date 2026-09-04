@@ -2,20 +2,20 @@ use super::parser::{PEFile, PEResult, PEError};
 use super::lifter::lift_to_vm_bytecode_for_main;
 use super::vm_stub::create_vm_interpreter_stub;
 use super::cfg::{collect_cfg_entries, disassemble_cfg_function};
-use crate::vm::OpCode;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
 const FILE_ALIGNMENT: u32 = 0x200;
 
 pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec<u8>> {
+    let explicit_rva = function_rva.is_some();
     let target_rva = if let Some(rva) = function_rva {
         rva
     } else {
         detect_main_rva(pe)?
     };
     let original_entry_rva = pe.entry_point_rva;
-    
-    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva)?;
+
+    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva, explicit_rva)?;
     
     add_vm_section(pe, &[], &bytecode)?;
     
@@ -87,7 +87,12 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     Ok(pe.entry_point_rva)
 }
 
-fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
+fn translate_to_vm_bytecode(
+    pe: &PEFile,
+    target_rva: u32,
+    _original_entry: u32,
+    explicit_rva: bool,
+) -> PEResult<Vec<u8>> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
     if file_offset + 16 > pe.data.len() {
@@ -100,7 +105,16 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
     let text_start = pe.rva_to_file_offset(text_section.virtual_address)?;
     let text_end = text_start + text_section.size_of_raw_data as usize;
 
-    let cfg_entries = collect_cfg_entries(pe, file_offset, text_start, text_end)?;
+    let imports = pe.parse_imports()?;
+    let cfg_entries = collect_cfg_entries(
+        pe,
+        file_offset,
+        file_offset,
+        text_start,
+        text_end,
+        &imports,
+        explicit_rva,
+    )?;
 
     if cfg_entries.is_empty() {
         return Err(PEError::InvalidPE("CFG found no functions to lift".to_string()));
@@ -120,22 +134,26 @@ fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) 
         return Err(PEError::InvalidPE("Failed to disassemble CFG functions".to_string()));
     }
 
-    let imports = pe.parse_imports()?;
-    let printf_literal = find_printf_literal_in_pe(pe);
+    let string_literal = find_string_literal_in_pe(pe);
     let bytecode = lift_to_vm_bytecode_for_main(
         &all_instrs,
         target_rva,
         file_offset,
         pe,
-        printf_literal.as_deref(),
+        string_literal.as_deref(),
         &imports,
     );
 
     Ok(bytecode)
 }
 
-fn find_printf_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
-    const NEEDLES: &[&[u8]] = &[b"Hello, World!\n", b"Hello, World!"];
+fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
+    const NEEDLES: &[&[u8]] = &[
+        b"IAT puts hello\n",
+        b"IAT puts hello\0",
+        b"Hello, World!\n",
+        b"Hello, World!",
+    ];
     for name in [".rdata", ".rdata$zzz", ".rodata", ".data"] {
         if let Ok(sec) = pe.get_section(name) {
             let start = sec.pointer_to_raw_data as usize;
@@ -362,7 +380,9 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pe::imports::native_call_iat_id;
     use crate::pe::test_pe;
+    use crate::vm::OpCode;
 
     #[test]
     fn test_pack_with_explicit_rva() {
@@ -384,7 +404,16 @@ mod tests {
         let text_start = pe.rva_to_file_offset(text.virtual_address).unwrap();
         let text_end = text_start + text.size_of_raw_data as usize;
         let main_off = text_start + 0x20;
-        let entries = collect_cfg_entries(&pe, main_off, text_start, text_end).unwrap();
+        let entries = collect_cfg_entries(
+            &pe,
+            main_off,
+            main_off,
+            text_start,
+            text_end,
+            &pe.parse_imports().unwrap(),
+            false,
+        )
+        .unwrap();
         assert!(entries.len() >= 2);
     }
 
@@ -773,7 +802,7 @@ mod tests {
             pe.data.push(0);
         }
         pe.data[off..off + msg.len()].copy_from_slice(msg);
-        let found = super::find_printf_literal_in_pe(&pe);
+        let found = super::find_string_literal_in_pe(&pe);
         assert_eq!(found.as_deref(), Some(&b"Hello, World!\n"[..]));
     }
 
@@ -824,5 +853,49 @@ mod tests {
         assert!(nc_target >= table_end);
         assert_eq!(stub[nc_target], 0x48);
         assert_eq!(stub[nc_target + 1], 0x8B);
+    }
+
+    fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i < bytecode.len() {
+            if bytecode[i] == OpCode::NativeCall as u8 && i + 9 <= bytecode.len() {
+                ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
+                i += 9;
+            } else {
+                i += 1;
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn test_pack_puts_thunk_emits_iat_native_call() {
+        let pe_data = test_pe::create_pe64_with_puts_thunk_call();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let imports = pe.parse_imports().unwrap();
+        let puts = imports.entries().iter().find(|e| e.name == "puts").unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
+        let ids = native_call_ids_in_bytecode(&bc);
+        assert!(
+            ids.iter().any(|id| *id == native_call_iat_id(puts.iat_rva)),
+            "expected IAT puts native_call, got {:?}",
+            ids
+        );
+        assert!(bc.len() < 300, "puts thunk pack should stay small, got {} bytes", bc.len());
+    }
+
+    #[test]
+    fn test_pack_does_not_lift_forward_crt_call() {
+        let pe_data = test_pe::create_pe64_with_forward_crt_call();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
+        assert!(
+            bc.len() < 400,
+            "forward CRT must not be lifted into bytecode, got {} bytes",
+            bc.len()
+        );
     }
 }

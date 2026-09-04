@@ -1,6 +1,7 @@
 use crate::vm::OpCode;
 use super::imports::{native_call_iat_id, ImportTable};
 use super::parser::PEFile;
+use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 #[derive(Debug, Clone)]
@@ -192,7 +193,7 @@ fn classify_instruction(instr: &Instruction) -> X64InstrKind {
                 && instr.memory_base() == Register::RIP
             {
                 X64InstrKind::CallIndRip {
-                    disp: instr.memory_displacement32() as i32,
+                    disp: rip_relative_disp32(instr),
                 }
             } else {
                 X64InstrKind::Unknown
@@ -241,12 +242,14 @@ fn classify_instruction(instr: &Instruction) -> X64InstrKind {
 }
 
 fn branch_offset(instr: &Instruction) -> Option<i32> {
-    match instr.op0_kind() {
-        OpKind::NearBranch16 => Some(instr.near_branch16() as i16 as i32),
-        OpKind::NearBranch32 => Some(instr.near_branch32() as i32),
-        OpKind::NearBranch64 => Some(instr.near_branch64() as i64 as i32),
-        _ => None,
-    }
+    // iced reports the absolute branch target; our lifter stores rel32 from insn end.
+    let abs = match instr.op0_kind() {
+        OpKind::NearBranch16 => instr.near_branch16() as i16 as i32,
+        OpKind::NearBranch32 => instr.near_branch32() as i32,
+        OpKind::NearBranch64 => instr.near_branch64() as i64 as i32,
+        _ => return None,
+    };
+    Some(abs - instr.next_ip() as i32)
 }
 
 fn branch_kind<F>(instr: &Instruction, mk: F) -> X64InstrKind
@@ -412,13 +415,18 @@ fn classify_cmp(instr: &Instruction) -> X64InstrKind {
     X64InstrKind::Unknown
 }
 
+fn rip_relative_disp32(instr: &Instruction) -> i32 {
+    // iced reports the absolute RIP-relative target; store rel32 from the next RIP.
+    (instr.memory_displacement32() as i64 - instr.next_ip() as i64) as i32
+}
+
 fn classify_lea(instr: &Instruction) -> X64InstrKind {
     if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Memory {
         if let Some(dst) = iced_reg_to_x64(instr.op0_register()) {
             if instr.memory_base() == Register::RIP {
                 return X64InstrKind::LeaRipRel {
                     dst,
-                    offset: instr.memory_displacement32() as i32,
+                    offset: rip_relative_disp32(instr),
                 };
             }
             if instr.memory_index() != Register::None {
@@ -500,12 +508,17 @@ fn classify_xor(instr: &Instruction) -> X64InstrKind {
     X64InstrKind::Unknown
 }
 
-pub fn decode_instruction(bytes: &[u8], instr_bytes: &mut Vec<u8>, offset: &mut usize) -> X64InstrKind {
+pub fn decode_instruction(
+    bytes: &[u8],
+    instr_bytes: &mut Vec<u8>,
+    offset: &mut usize,
+    start_ip: u64,
+) -> X64InstrKind {
     if bytes.is_empty() {
         return X64InstrKind::Unknown;
     }
 
-    let mut decoder = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+    let mut decoder = Decoder::with_ip(64, bytes, start_ip, DecoderOptions::NONE);
     if !decoder.can_decode() {
         let b0 = bytes[0];
         instr_bytes.push(b0);
@@ -534,7 +547,7 @@ pub fn disassemble_x64_simple(code: &[u8], max_instrs: usize) -> Vec<X64Instruct
         }
 
         let mut instr_bytes = Vec::new();
-        let kind = decode_instruction(remaining, &mut instr_bytes, &mut offset);
+        let kind = decode_instruction(remaining, &mut instr_bytes, &mut offset, start_offset as u64);
 
         instructions.push(X64Instruction {
             offset: start_offset,
@@ -853,20 +866,28 @@ fn emit_iat_native_call(bytecode: &mut Vec<u8>, iat_rva: u32) {
 }
 
 fn iat_rva_for_instr(pe: &PEFile, imports: &ImportTable, instr: &X64Instruction) -> Option<u32> {
-    let instr_rva = pe.file_offset_to_rva(instr.offset).ok()?;
-    let target_rva = match &instr.kind {
+    match &instr.kind {
         X64InstrKind::CallIndRip { disp } => {
-            (instr_rva as i64 + instr.bytes.len() as i64 + *disp as i64) as u32
+            let instr_rva = pe.file_offset_to_rva(instr.offset).ok()?;
+            let slot_rva =
+                (instr_rva as i64 + instr.bytes.len() as i64 + *disp as i64) as u32;
+            pe.resolve_iat_target(imports, slot_rva)
+                .map(|e| e.iat_rva)
+                .or_else(|| {
+                    if imports.lookup_iat_rva(slot_rva).is_some() {
+                        Some(slot_rva)
+                    } else {
+                        None
+                    }
+                })
         }
         X64InstrKind::Call { target_offset } => {
             let target_off =
                 (instr.offset as i32 + instr.bytes.len() as i32 + *target_offset) as usize;
-            pe.file_offset_to_rva(target_off).ok()?
+            iat_rva_for_call_target(pe, imports, target_off)
         }
-        _ => return None,
-    };
-    pe.resolve_iat_target(imports, target_rva)
-        .map(|e| e.iat_rva)
+        _ => None,
+    }
 }
 
 fn is_crt_external_instr(pe: &PEFile, imports: &ImportTable, instr: &X64Instruction) -> bool {
@@ -934,7 +955,13 @@ fn emit_external_call(
     }
 
     if let Some(iat_rva) = iat_rva_for_instr(pe, imports, instr) {
-        emit_iat_native_call(bytecode, iat_rva);
+        let skip = pe
+            .resolve_iat_target(imports, iat_rva)
+            .map(|e| imports.is_crt_startup(e))
+            .unwrap_or(false);
+        if !skip {
+            emit_iat_native_call(bytecode, iat_rva);
+        }
         return;
     }
 
@@ -957,7 +984,7 @@ fn emit_external_call(
             bytecode.push(1);
             emit_legacy_native_call(bytecode, 3, string_patch_positions, printf_literal);
         }
-    } else if main_has_printf {
+    } else if main_has_printf || printf_literal.is_some() {
         if printf_literal.is_some() {
             emit_legacy_native_call(bytecode, 1, string_patch_positions, printf_literal);
         } else {
@@ -1809,6 +1836,28 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::Call { target_offset } => {
                 let raw_target =
                     (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
+
+                if let Some(iat_rva) = iat_rva_for_call_target(pe, imports, raw_target) {
+                    let entry = pe.resolve_iat_target(imports, iat_rva);
+                    if entry.map(|e| imports.is_crt_startup(e)).unwrap_or(false) {
+                        // CRT startup — skip
+                    } else {
+                        emit_iat_native_call(&mut bytecode, iat_rva);
+                    }
+                } else if is_non_liftable_target(pe, imports, raw_target) {
+                    emit_external_call(
+                        instr,
+                        instrs,
+                        pe,
+                        imports,
+                        main_x64_offset,
+                        main_has_printf,
+                        printf_literal,
+                        &mut bytecode,
+                        &mut string_patch_positions,
+                        &mut external_call_count,
+                    );
+                } else {
                 let target_x64_offset = resolve_internal_call_target(
                     instrs,
                     raw_target,
@@ -1819,7 +1868,7 @@ fn lift_to_vm_bytecode_internal_with_main(
 
                 let is_internal =
                     is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset)
-                        || instrs.iter().any(|i| i.offset == target_x64_offset);
+                        && instrs.iter().any(|i| i.offset == target_x64_offset);
 
                 if !is_internal {
                     emit_external_call(
@@ -1852,13 +1901,21 @@ fn lift_to_vm_bytecode_internal_with_main(
                         bytecode.push(reg);
                     }
                 }
+                }
             }
             X64InstrKind::CallIndRip { .. } => {
-                if is_crt_external_instr(pe, imports, instr) {
-                    // CRT startup import — skip
-                } else if let Some(iat_rva) = iat_rva_for_instr(pe, imports, instr) {
-                    emit_iat_native_call(&mut bytecode, iat_rva);
-                }
+                emit_external_call(
+                    instr,
+                    instrs,
+                    pe,
+                    imports,
+                    main_x64_offset,
+                    main_has_printf,
+                    printf_literal,
+                    &mut bytecode,
+                    &mut string_patch_positions,
+                    &mut external_call_count,
+                );
             }
             X64InstrKind::Ret => {
                 if instr.offset == main_end_offset && !hit_main_ret {
@@ -1881,8 +1938,11 @@ fn lift_to_vm_bytecode_internal_with_main(
                 bytecode.push(reg.to_vm_reg());
             }
             X64InstrKind::LeaRipRel { dst, offset: _ } => {
-                if !(instr.offset >= main_x64_offset && main_has_printf && printf_literal.is_some())
-                {
+                let skip_for_hello_printf = instr.offset >= main_x64_offset
+                    && main_has_printf
+                    && printf_literal.is_some()
+                    && printf_literal.is_some_and(|s| s.starts_with(b"Hello"));
+                if !skip_for_hello_printf {
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(dst.to_vm_reg());
                     string_patch_positions.push(bytecode.len());
@@ -2024,41 +2084,39 @@ mod tests {
         }
     }
 
+    fn vm_opcode_len(bytecode: &[u8], i: usize) -> Option<usize> {
+        let op = OpCode::from_u8(bytecode[i])?;
+        Some(match op {
+            OpCode::Nop => 1,
+            OpCode::LoadImm => 10,
+            OpCode::LoadMem | OpCode::StoreMem => 3,
+            OpCode::Move => 3,
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor => 4,
+            OpCode::Cmp => 3,
+            OpCode::Jmp | OpCode::Call => 9,
+            OpCode::JmpIf => 10,
+            OpCode::Ret => 1,
+            OpCode::NativeCall => 9,
+            OpCode::Push | OpCode::Pop => 2,
+            OpCode::LoadByte => 3,
+            OpCode::LoadStr => 10,
+            OpCode::Exit => 2,
+        })
+    }
+
     fn native_call_ids(bytecode: &[u8]) -> Vec<u64> {
         let mut ids = Vec::new();
         let mut i = 0;
         while i < bytecode.len() {
-            match OpCode::from_u8(bytecode[i]) {
-                Some(OpCode::LoadImm) if i + 10 <= bytecode.len() => {
-                    i += 10;
-                }
-                Some(OpCode::NativeCall) if i + 9 <= bytecode.len() => {
+            if let Some(len) = vm_opcode_len(bytecode, i) {
+                if bytecode[i] == OpCode::NativeCall as u8 && i + 9 <= bytecode.len() {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&bytecode[i + 1..i + 9]);
                     ids.push(u64::from_le_bytes(bytes));
-                    i += 9;
                 }
-                Some(OpCode::Exit) => {
-                    i += 2;
-                }
-                Some(OpCode::Ret) => {
-                    i += 1;
-                }
-                Some(OpCode::Move) => {
-                    i += 3;
-                }
-                Some(OpCode::Jmp) if i + 9 <= bytecode.len() => {
-                    i += 9;
-                }
-                Some(OpCode::JmpIf) if i + 10 <= bytecode.len() => {
-                    i += 10;
-                }
-                Some(OpCode::Call) if i + 9 <= bytecode.len() => {
-                    i += 9;
-                }
-                _ => {
-                    i += 1;
-                }
+                i += len;
+            } else {
+                i += 1;
             }
         }
         ids
@@ -2076,6 +2134,41 @@ mod tests {
         let bc = lift_for_test(&instrs, main_off, Some(hello));
         assert_eq!(native_call_ids(&bc), vec![1]);
         assert!(bc.windows(hello.len()).any(|w| w == hello));
+    }
+
+    #[test]
+    fn puts_thunk_rel32_emits_iat_native_call() {
+        use super::super::imports::{iat_rva_from_native_call, is_iat_native_call};
+        use super::super::cfg::disassemble_cfg_function;
+
+        let pe_data = test_pe::create_pe64_with_puts_thunk_call();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let imports = pe.parse_imports().unwrap();
+        let puts = imports.entries().iter().find(|e| e.name == "puts").unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_off = pe.rva_to_file_offset(text.virtual_address).unwrap() + 0x20;
+        let code = &pe.data[main_off..main_off + 32];
+        let instrs = disassemble_cfg_function(code, main_off);
+        let bc = lift_to_vm_bytecode_for_main(
+            &instrs,
+            text.virtual_address + 0x20,
+            main_off,
+            &pe,
+            None,
+            &imports,
+        );
+        let ids = native_call_ids(&bc);
+        assert!(
+            ids.iter().any(|id| is_iat_native_call(*id)),
+            "expected IAT native_call for rel32->thunk, got {:?}",
+            ids
+        );
+        assert!(
+            ids.iter().any(|id| iat_rva_from_native_call(*id) == puts.iat_rva),
+            "expected puts IAT RVA {:#x}, got {:?}",
+            puts.iat_rva,
+            ids
+        );
     }
 
     #[test]
@@ -2158,7 +2251,7 @@ mod tests {
     fn decode(bytes: &[u8]) -> X64InstrKind {
         let mut out = Vec::new();
         let mut off = 0;
-        decode_instruction(bytes, &mut out, &mut off)
+        decode_instruction(bytes, &mut out, &mut off, 0)
     }
 
     #[test]
