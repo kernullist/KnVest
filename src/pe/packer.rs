@@ -863,20 +863,20 @@ mod tests {
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
-        let save_rsi = [0x48u8, 0x89, 0xB5, 0x18, 0xFF, 0xFF, 0xFF];
-        let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x18, 0xFF, 0xFF, 0xFF];
+        let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
+        let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
             stub.windows(save_rsi.len()).any(|w| w == save_rsi),
-            "native_call must save bytecode rsi at [rbp-0xE8]"
+            "native_call must save bytecode rsi at [rbp-0x98]"
         );
         assert!(
             stub.windows(restore_rsi.len()).any(|w| w == restore_rsi),
-            "native_call must restore bytecode rsi from [rbp-0xE8]"
+            "native_call must restore bytecode rsi from [rbp-0x98]"
         );
-        let clobber_r3 = [0x48u8, 0x89, 0xB5, 0x98, 0xFF, 0xFF, 0xFF];
+        let rsi_on_push_depth = [0x48u8, 0x89, 0xB5, 0x18, 0xFF, 0xFF, 0xFF];
         assert!(
-            !stub.windows(clobber_r3.len()).any(|w| w == clobber_r3),
-            "native_call must not save rsi at [rbp-0x68] (VM r3)"
+            !stub.windows(rsi_on_push_depth.len()).any(|w| w == rsi_on_push_depth),
+            "bytecode rsi save must not use push-depth slot [rbp-0xE8]"
         );
     }
 
@@ -906,7 +906,7 @@ mod tests {
     fn test_jmpif_ne_uses_jne_not_je() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
         let ne_cond = [0x83u8, 0xF9, 0x02];
-        let push_flags = [0xFFu8, 0xB5, 0x20, 0xFF, 0xFF, 0xFF];
+        let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
         for i in 0..stub.len().saturating_sub(ne_cond.len() + 32) {
             if stub[i..i + 3] != ne_cond {
