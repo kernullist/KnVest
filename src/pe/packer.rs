@@ -632,8 +632,12 @@ mod tests {
     fn test_pack_real_mingw_nested_stdout_matches_unpacked() {
         use crate::pe::imports::native_call_iat_id;
         use crate::vm::VirtualMachine;
+        use std::cell::RefCell;
         use std::path::Path;
-        use std::sync::Mutex;
+
+        thread_local! {
+            static NESTED_OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        }
 
         let pe_path = Path::new("sample/nested.exe");
         if !pe_path.exists() {
@@ -645,17 +649,18 @@ mod tests {
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
         let bc = pack_function(&mut pe, None).unwrap();
 
-        static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-        OUT.lock().unwrap().clear();
+        NESTED_OUT.with(|buf| buf.borrow_mut().clear());
 
         fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
             let ch = vm.get_register(0)? as u8;
-            let mut out = OUT.lock().unwrap();
-            if ch == b'\n' {
-                out.extend_from_slice(b"\r\n");
-            } else {
-                out.push(ch);
-            }
+            NESTED_OUT.with(|buf| {
+                let mut out = buf.borrow_mut();
+                if ch == b'\n' {
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    out.push(ch);
+                }
+            });
             Ok(())
         }
 
@@ -665,13 +670,116 @@ mod tests {
         vm.register_native(3, putchar_native);
         vm.run().expect("nested VM run");
 
-        let out = OUT.lock().unwrap().clone();
+        let out = NESTED_OUT.with(|buf| buf.borrow().clone());
+        assert_eq!(
+            out.len(),
+            GOLDEN.len(),
+            "nested stdout length must match unpacked (63 bytes CRLF)"
+        );
         assert_eq!(
             out.as_slice(),
             GOLDEN,
             "packed nested stdout must match unpacked golden (got {:?})",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_loop_stdout_matches_unpacked() {
+        use crate::pe::imports::native_call_iat_id;
+        use crate::vm::VirtualMachine;
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        thread_local! {
+            static LOOP_OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        }
+
+        let pe_path = Path::new("sample/loop.exe");
+        if !pe_path.exists() {
+            return;
+        }
+
+        const GOLDEN: &[u8] = b"5\n4\n3\n2\n1\n";
+
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+
+        LOOP_OUT.with(|buf| buf.borrow_mut().clear());
+
+        fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let ch = vm.get_register(0)? as u8;
+            LOOP_OUT.with(|buf| buf.borrow_mut().push(ch));
+            Ok(())
+        }
+
+        fn printf_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let n = vm.get_register(2)?;
+            let s = format!("{n}\n");
+            for &ch in s.as_bytes() {
+                vm.set_register(0, ch as u64)?;
+                putchar_native(vm)?;
+            }
+            Ok(())
+        }
+
+        let mut vm = VirtualMachine::new(bc);
+        vm.register_native(native_call_iat_id(0x8260), putchar_native);
+        vm.register_native(2, printf_native);
+        vm.register_native(3, putchar_native);
+        vm.run().expect("loop VM run");
+
+        let out = LOOP_OUT.with(|buf| buf.borrow().clone());
+        assert_eq!(out.as_slice(), GOLDEN, "loop stdout mismatch: {:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn test_pack_real_mingw_fact_stdout_matches_unpacked() {
+        use crate::pe::imports::native_call_iat_id;
+        use crate::vm::VirtualMachine;
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        thread_local! {
+            static FACT_OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        }
+
+        let pe_path = Path::new("sample/fact.exe");
+        if !pe_path.exists() {
+            return;
+        }
+
+        const GOLDEN: &[u8] = b"120\n";
+
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+
+        FACT_OUT.with(|buf| buf.borrow_mut().clear());
+
+        fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let ch = vm.get_register(0)? as u8;
+            FACT_OUT.with(|buf| buf.borrow_mut().push(ch));
+            Ok(())
+        }
+
+        fn printf_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let n = vm.get_register(2)?;
+            let s = format!("{n}\n");
+            for &ch in s.as_bytes() {
+                vm.set_register(0, ch as u64)?;
+                putchar_native(vm)?;
+            }
+            Ok(())
+        }
+
+        let mut vm = VirtualMachine::new(bc);
+        vm.register_native(native_call_iat_id(0x8260), putchar_native);
+        vm.register_native(2, printf_native);
+        vm.register_native(3, putchar_native);
+        vm.run().expect("fact VM run");
+
+        let out = FACT_OUT.with(|buf| buf.borrow().clone());
+        assert_eq!(out.as_slice(), GOLDEN, "fact stdout mismatch: {:?}", String::from_utf8_lossy(&out));
     }
 
     #[test]
