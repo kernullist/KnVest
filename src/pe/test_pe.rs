@@ -109,6 +109,167 @@ pub fn create_pe64_with_overlay() -> Vec<u8> {
     pe
 }
 
+/// PE64 with a minimal msvcrt `puts` import for IAT unit tests.
+pub fn create_pe64_with_imports() -> Vec<u8> {
+    let mut pe = Vec::new();
+
+    pe.extend_from_slice(&create_dos_header(0x80));
+    pe.extend_from_slice(&vec![0u8; 0x80 - 64]);
+
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&create_coff_header(2));
+
+    // Import directory at RVA 0x3000
+    pe.extend_from_slice(&create_optional_header_pe32plus_with_import_dir(0x3000, 0x80));
+
+    pe.extend_from_slice(&create_section_header(
+        b".text\0\0\0",
+        0x200,
+        0x1000,
+        0x200,
+        0x400,
+    ));
+    pe.extend_from_slice(&create_section_header(
+        b".idata\0\0",
+        0x200,
+        0x3000,
+        0x200,
+        0x600,
+    ));
+
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    // main: push rbp; mov rbp,rsp; sub rsp,0x28; lea rcx,[rip+0x1000]; call [puts_iat]; xor eax,eax; leave; ret
+    let puts_iat_rva = 0x3038u32;
+    let call_disp = 0i32; // patched after main bytes are placed
+    let mut text = vec![0x90u8; 0x200];
+    let main = [
+        0x55, 0x48, 0x89, 0xE5, // push rbp; mov rbp, rsp
+        0x48, 0x83, 0xEC, 0x28, // sub rsp, 0x28
+        0x48, 0x8D, 0x0D, 0xF0, 0x0F, 0x00, 0x00, // lea rcx, [rip+0xFF0] -> .rdata str
+        0xFF, 0x15, // call [rip+disp32]
+    ];
+    text[0..main.len()].copy_from_slice(&main);
+    let call_pos = text
+        .windows(2)
+        .position(|w| w == [0xFF, 0x15])
+        .expect("call [rip+disp] in fixture");
+    let call_end_rva = 0x1000 + call_pos as u32 + 6;
+    let call_disp = (puts_iat_rva as i32) - (call_end_rva as i32);
+    text[call_pos + 2..call_pos + 6].copy_from_slice(&call_disp.to_le_bytes());
+    text[main.len() + 4] = 0x31; // xor eax,eax (xor eax,eax is 31 C0)
+    text[main.len() + 5] = 0xC0;
+    text[main.len() + 6] = 0x48; // leave-ish: add rsp,0x28; pop rbp; ret
+    text[main.len() + 7] = 0x83;
+    text[main.len() + 8] = 0xC4;
+    text[main.len() + 9] = 0x28;
+    text[main.len() + 10] = 0x5D;
+    text[main.len() + 11] = 0xC3;
+    pe.extend_from_slice(&text);
+
+    while pe.len() < 0x600 {
+        pe.push(0);
+    }
+
+    // .idata layout: descriptor(20) + null descriptor(20) + ILT + IAT + names
+    let mut idata = vec![0u8; 0x200];
+    let base_rva = 0x3000u32;
+
+    let ilt_rva = base_rva + 0x28;
+    let iat_rva = base_rva + 0x38;
+    let dll_name_rva = base_rva + 0x48;
+    let hint_name_rva = base_rva + 0x58;
+
+    // IMAGE_IMPORT_DESCRIPTOR at RVA 0x3000
+    idata[0..4].copy_from_slice(&ilt_rva.to_le_bytes());
+    idata[12..16].copy_from_slice(&dll_name_rva.to_le_bytes());
+    idata[16..20].copy_from_slice(&iat_rva.to_le_bytes());
+    // null terminator descriptor at 0x14 is already zero
+
+    // ILT: one thunk -> hint/name
+    let ilt_off = 0x28usize;
+    idata[ilt_off..ilt_off + 8].copy_from_slice(&(hint_name_rva as u64).to_le_bytes());
+
+    // IAT: placeholder pointer (filled by loader)
+    let iat_off = 0x38usize;
+    idata[iat_off..iat_off + 8].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+
+    // DLL name
+    let dll_off = 0x48usize;
+    idata[dll_off..dll_off + 11].copy_from_slice(b"msvcrt.dll\0");
+
+    // hint + name "puts"
+    let hn_off = 0x58usize;
+    idata[hn_off + 2..hn_off + 7].copy_from_slice(b"puts\0");
+
+    pe.extend_from_slice(&idata);
+
+    while pe.len() < 0x800 {
+        pe.push(0);
+    }
+
+    pe
+}
+
+/// PE64 with main calling an internal callee (CFG collection test).
+pub fn create_pe64_with_callee() -> Vec<u8> {
+    let mut pe = Vec::new();
+
+    pe.extend_from_slice(&create_dos_header(0x80));
+    pe.extend_from_slice(&vec![0u8; 0x80 - 64]);
+
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&create_coff_header(1));
+    pe.extend_from_slice(&create_optional_header_pe32plus());
+
+    pe.extend_from_slice(&create_section_header(
+        b".text\0\0\0",
+        0x400,
+        0x1000,
+        0x400,
+        0x400,
+    ));
+
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    let mut text = vec![0x90u8; 0x400];
+
+    // callee at .text+0x00: mov eax, 7; ret (prologue-less)
+    text[0x10] = 0xB8;
+    text[0x11] = 0x07;
+    text[0x12] = 0x00;
+    text[0x13] = 0x00;
+    text[0x14] = 0x00;
+    text[0x15] = 0xC3;
+
+    // main at .text+0x20: push rbp; mov rbp,rsp; call callee; pop rbp; ret
+    let main_off = 0x20usize;
+    let call_from = main_off + 4; // after push rbp + mov rbp,rsp
+    let call_end = call_from + 5;
+    let callee_off = 0x10usize;
+    let rel = (callee_off as i32) - (call_end as i32);
+    text[main_off] = 0x55;
+    text[main_off + 1] = 0x48;
+    text[main_off + 2] = 0x89;
+    text[main_off + 3] = 0xE5;
+    text[call_from] = 0xE8;
+    text[call_from + 1..call_from + 5].copy_from_slice(&rel.to_le_bytes());
+    text[call_from + 5] = 0x5D;
+    text[call_from + 6] = 0xC3;
+
+    pe.extend_from_slice(&text);
+
+    while pe.len() < 0x800 {
+        pe.push(0);
+    }
+
+    pe
+}
+
 fn create_dos_header(pe_offset: u32) -> Vec<u8> {
     let mut header = vec![0u8; 64];
     header[0] = b'M';
@@ -138,6 +299,10 @@ fn create_coff_header(num_sections: u16) -> Vec<u8> {
 }
 
 fn create_optional_header_pe32plus() -> Vec<u8> {
+    create_optional_header_pe32plus_with_import_dir(0, 0)
+}
+
+fn create_optional_header_pe32plus_with_import_dir(import_rva: u32, import_size: u32) -> Vec<u8> {
     let mut header = vec![0u8; 240];
     header[0] = 0x0B;
     header[1] = 0x02;
@@ -149,15 +314,20 @@ fn create_optional_header_pe32plus() -> Vec<u8> {
     header[18] = 0x00;
     header[19] = 0x00;
     
+    // ImageBase = 0x140000000
     header[24] = 0x00;
-    header[25] = 0x10;
+    header[25] = 0x00;
     header[26] = 0x00;
-    header[27] = 0x00;
-    
-    header[28] = 0x00;
-    header[29] = 0x10;
+    header[27] = 0x40;
+    header[28] = 0x01;
+    header[29] = 0x00;
     header[30] = 0x00;
     header[31] = 0x00;
+    
+    // Data directory[1] = Import Table
+    let import_dir_off = 112 + 8;
+    header[import_dir_off..import_dir_off + 4].copy_from_slice(&import_rva.to_le_bytes());
+    header[import_dir_off + 4..import_dir_off + 8].copy_from_slice(&import_size.to_le_bytes());
     
     header
 }

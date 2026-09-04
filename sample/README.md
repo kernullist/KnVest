@@ -1,11 +1,12 @@
 # KnVest Sample Programs
 
-Seven MinGW-style C samples demonstrating VM bytecode lifting.
+Seven MinGW-style C samples plus an IAT demonstration (`puts_hello`).
 
 ## Samples
 
-1. **hello.c** - Print "Hello, World!" (special-cased)
-2. **loop.c** - Print 5 down to 1, one number per line
+1. **hello.c** - Print "Hello, World!" via printf
+2. **puts_hello.c** - Print via `puts()` (IAT win64 native_call in packed IR)
+3. **loop.c** - Print 5 down to 1, one number per line
 3. **arith.c** - Compute (3+4)*5 with volatile variables
 4. **call.c** - Function call returning 7
 5. **nested.c** - Nested loops with character-by-character output (multiplication table 1-3)
@@ -16,8 +17,9 @@ Seven MinGW-style C samples demonstrating VM bytecode lifting.
 
 Compile with MinGW GCC:
 ```bash
-x86_64-w64-mingw32-gcc hello.c -o hello.exe
-x86_64-w64-mingw32-gcc -O0 loop.c -o loop.exe
+x86_64-w64-mingw32-gcc sample/hello.c -o sample/hello.exe
+x86_64-w64-mingw32-gcc sample/puts_hello.c -o sample/puts_hello.exe
+x86_64-w64-mingw32-gcc -O0 sample/loop.c -o sample/loop.exe
 x86_64-w64-mingw32-gcc -O0 arith.c -o arith.exe
 x86_64-w64-mingw32-gcc -O0 call.c -o call.exe
 x86_64-w64-mingw32-gcc -O0 nested.c -o nested.exe
@@ -28,6 +30,7 @@ x86_64-w64-mingw32-gcc -O0 str.c -o str.exe
 ## Expected Output
 
 - **hello**: `Hello, World!\n` exit 0
+- **puts_hello**: `IAT puts hello\n` exit 0 (verify IR shows IAT native_call)
 - **loop**: `5\n4\n3\n2\n1\n` exit 0
 - **arith**: `35\n` exit 0
 - **call**: `7\n` exit 0

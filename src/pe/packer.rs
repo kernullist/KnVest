@@ -1,6 +1,7 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::{lift_to_vm_bytecode_for_main, decode_instruction, X64Instruction, X64InstrKind};
+use super::lifter::lift_to_vm_bytecode_for_main;
 use super::vm_stub::create_vm_interpreter_stub;
+use super::cfg::{collect_cfg_entries, disassemble_cfg_function};
 use crate::vm::OpCode;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
@@ -88,155 +89,50 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
 
 fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
-    
-    if file_offset + 200 > pe.data.len() {
+
+    if file_offset + 16 > pe.data.len() {
         return Err(PEError::InvalidPE("Code section too small".to_string()));
     }
 
-    let main_code = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
-    let mut main_instrs = disassemble_until_ret(main_code, 100);
-    
-    if main_instrs.is_empty() {
-        return Err(PEError::InvalidPE("Failed to disassemble main".to_string()));
+    let text_section = pe
+        .get_section(".text")
+        .or_else(|_| pe.get_section("CODE"))?;
+    let text_start = pe.rva_to_file_offset(text_section.virtual_address)?;
+    let text_end = text_start + text_section.size_of_raw_data as usize;
+
+    let cfg_entries = collect_cfg_entries(pe, file_offset, text_start, text_end)?;
+
+    if cfg_entries.is_empty() {
+        return Err(PEError::InvalidPE("CFG found no functions to lift".to_string()));
     }
-    
-    for instr in &mut main_instrs {
-        instr.offset += file_offset;
+
+    let mut all_instrs = Vec::new();
+    for &entry in &cfg_entries {
+        let max_end = (entry + super::cfg::MAX_FUNCTION_BYTES).min(text_end);
+        let code = &pe.data[entry..max_end];
+        let mut instrs = disassemble_cfg_function(code, entry);
+        all_instrs.append(&mut instrs);
     }
-    
-    let call_targets = find_internal_call_targets(&main_instrs, file_offset);
-    
-    let mut all_instrs = main_instrs;
-    let mut processed_targets = std::collections::HashSet::new();
-    let mut pending_targets: std::collections::VecDeque<usize> =
-        call_targets.into_iter().collect();
-    
-    while let Some(target_file_offset) = pending_targets.pop_front() {
-        if processed_targets.contains(&target_file_offset) {
-            continue;
-        }
-        processed_targets.insert(target_file_offset);
-        
-        if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
-            let entry = resolve_callee_entry(&pe.data, target_file_offset, file_offset);
-            if let Some(entry) = entry {
-                let callee_code = &pe.data[entry..std::cmp::min(entry + 300, pe.data.len())];
-                let mut callee_instrs = disassemble_callee(callee_code, 100);
-                
-                for instr in &mut callee_instrs {
-                    instr.offset += entry;
-                }
-                
-                for nested_target in find_internal_call_targets(&callee_instrs, file_offset) {
-                    if nested_target < file_offset && !processed_targets.contains(&nested_target) {
-                        pending_targets.push_back(nested_target);
-                    }
-                }
-                
-                all_instrs.extend(callee_instrs);
-            }
-        }
-    }
-    
+
     all_instrs.sort_by_key(|i| i.offset);
 
+    if all_instrs.is_empty() {
+        return Err(PEError::InvalidPE("Failed to disassemble CFG functions".to_string()));
+    }
+
+    let imports = pe.parse_imports()?;
     let printf_literal = find_printf_literal_in_pe(pe);
     let bytecode = lift_to_vm_bytecode_for_main(
         &all_instrs,
         target_rva,
         file_offset,
-        &pe.data,
+        pe,
         printf_literal.as_deref(),
+        &imports,
     );
 
     Ok(bytecode)
 }
-
-fn disassemble_until_ret(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
-    disassemble_window(code, max_instrs, true)
-}
-
-/// Disassemble a pre-main callee: do not stop at the first `ret` (early-return paths),
-/// stop at the next `push rbp` prologue or instruction limit.
-fn disassemble_callee(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
-    disassemble_window(code, max_instrs, false)
-}
-
-fn disassemble_window(code: &[u8], max_instrs: usize, stop_at_first_ret: bool) -> Vec<X64Instruction> {
-    let mut instructions = Vec::new();
-    let mut offset = 0;
-
-    while offset < code.len() && instructions.len() < max_instrs {
-        if offset > 0 && code[offset] == 0x55 {
-            break;
-        }
-
-        let start_offset = offset;
-        let remaining = &code[offset..];
-
-        if remaining.is_empty() {
-            break;
-        }
-
-        let mut instr_bytes = Vec::new();
-        let kind = super::lifter::decode_instruction(remaining, &mut instr_bytes, &mut offset);
-
-        instructions.push(X64Instruction {
-            offset: start_offset,
-            bytes: instr_bytes,
-            kind: kind.clone(),
-        });
-
-        if stop_at_first_ret && matches!(kind, X64InstrKind::Ret) {
-            break;
-        }
-    }
-
-    instructions
-}
-
-fn resolve_callee_entry(pe_data: &[u8], target: usize, main_file_offset: usize) -> Option<usize> {
-    if target >= main_file_offset || main_file_offset - target >= 0x800 {
-        return None;
-    }
-    if pe_data.get(target) == Some(&0x55) {
-        return Some(target);
-    }
-    let search_start = target.saturating_sub(48);
-    for off in (search_start..target).rev() {
-        if pe_data.get(off) == Some(&0x55)
-            && pe_data.get(off + 1) == Some(&0x48)
-            && pe_data.get(off + 2) == Some(&0x89)
-            && pe_data.get(off + 3) == Some(&0xE5)
-        {
-            return Some(off);
-        }
-    }
-    None
-}
-
-fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize) -> Vec<usize> {
-    let mut targets = Vec::new();
-    
-    for instr in instrs {
-        if let X64InstrKind::Call { target_offset } = instr.kind {
-            let instr_abs_offset = instr.offset;
-            let target_abs_offset = (instr_abs_offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-            
-            // Only include targets BEFORE main (no CRT functions after main)
-            if target_abs_offset < main_file_offset {
-                let distance = main_file_offset - target_abs_offset;
-                // Allow up to 512 bytes before main (for larger functions like factorial)
-                if distance < 0x800 {
-                    targets.push(target_abs_offset);
-                }
-            }
-        }
-    }
-    
-    targets
-}
-
 
 fn find_printf_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
     const NEEDLES: &[&[u8]] = &[b"Hello, World!\n", b"Hello, World!"];
@@ -467,6 +363,30 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::pe::test_pe;
+
+    #[test]
+    fn test_pack_with_explicit_rva() {
+        let pe_data = test_pe::create_pe64_with_callee();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        pack_function(&mut pe, Some(main_rva)).unwrap();
+        let bc = extract_bytecode_from_packed(&pe).unwrap();
+        assert!(!bc.is_empty());
+        assert!(bc.contains(&(OpCode::LoadImm as u8)));
+    }
+
+    #[test]
+    fn test_cfg_collects_multiple_functions() {
+        let pe_data = test_pe::create_pe64_with_callee();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let text_start = pe.rva_to_file_offset(text.virtual_address).unwrap();
+        let text_end = text_start + text.size_of_raw_data as usize;
+        let main_off = text_start + 0x20;
+        let entries = collect_cfg_entries(&pe, main_off, text_start, text_end).unwrap();
+        assert!(entries.len() >= 2);
+    }
 
     #[test]
     fn test_pack_creates_valid_pe() {
