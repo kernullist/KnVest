@@ -451,7 +451,7 @@ impl StubEmitter {
         self.jcc_rel32(0x84, "nc_func3");
 
         self.label("nc_func2");
-        self.emit(&[0x48, 0x8B, 0x45, 0x90]);
+        self.emit(&[0x48, 0x8B, 0x45, 0x80]); // VM r0 at [rbp-0x80], not r2 at disp8 0x90
         self.emit(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x3D, 0x64, 0x00, 0x00, 0x00]);
         self.jcc_rel32(0x83, "nc_three_digit");
@@ -535,24 +535,24 @@ impl StubEmitter {
         self.label("nc_iat");
         // rax = func_id; ebx = iat_rva; r11d = low dword (ptr flag in bit 31)
         self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
-        self.emit(&[0x41, 0x89, 0xDB]); // mov ebx, r11d
+        self.emit(&[0x41, 0x89, 0xDB]); // mov ebx, r11d  (NOT 41 89 C3 = mov r11d,eax only)
         self.emit(&[0x81, 0xE3, 0xFF, 0xFF, 0xFF, 0x7F]); // and ebx, 0x7fffffff
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // PEB
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
-        self.emit(&[0x48, 0x8B, 0x00]); // resolved import -> rax
-        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3 (matches nc1/nc3 and 75ebd99 layout)
+        self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
+        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3
         self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0
         self.emit(&[0x48, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1
-        self.emit(&[0x4C, 0x8B, 0x85, 0x70, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2
-        self.emit(&[0x4C, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]); // r9  <- VM r4 slot (75ebd99)
+        self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
+        self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
         self.jcc_rel32(0x84, "nc_iat_call"); // jz — putchar / integer arg, no ptr reloc
-        self.lea_rip_rel32(0x4C, 2, "bytecode"); // lea r10, [rip+bytecode] (keep ebx free)
-        self.emit(&[0x49, 0x01, 0xD1]); // add rcx, r10
+        self.lea_rip_rel32(0x4C, 2, "bytecode"); // lea r10, [rip+bytecode]
+        self.emit(&[0x49, 0x01, 0xD1]); // add rcx, r10 — puts/printf ptr reloc only
         self.label("nc_iat_call");
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
-        self.emit(&[0xFF, 0xD0]);
+        self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
         self.jmp_rel32("nc_done");
 
@@ -771,6 +771,102 @@ mod tests {
         assert!(
             !stub.windows(rcx_from_r1.len()).any(|w| w == rcx_from_r1),
             "IAT path must not load rcx from VM r1 (breaks putchar in r0)"
+        );
+        let r8_from_r2 = [0x4Cu8, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF];
+        assert!(
+            stub.windows(r8_from_r2.len()).any(|w| w == r8_from_r2),
+            "IAT path must map x64 r8 from VM r2 [rbp-0x70] (90 FF FF FF)"
+        );
+        let r8_from_flags = [0x4Cu8, 0x8B, 0x85, 0x70, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(r8_from_flags.len()).any(|w| w == r8_from_flags),
+            "IAT path must not load r8 from cmp flags slot [rbp-0x90] (70 FF FF FF)"
+        );
+        let r9_from_r3 = [0x4Cu8, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF];
+        assert!(
+            stub.windows(r9_from_r3.len()).any(|w| w == r9_from_r3),
+            "IAT path must map x64 r9 from VM r3 [rbp-0x68] (98 FF FF FF)"
+        );
+        let r9_from_stdout = [0x4Cu8, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF];
+        assert!(
+            !stub.windows(r9_from_stdout.len()).any(|w| w == r9_from_stdout),
+            "IAT path must not load r9 from stdout slot [rbp-0xA0]"
+        );
+        let iat_load = [0x48u8, 0x8B, 0x18]; // mov rbx, [rax]
+        let iat_call = [0xFFu8, 0xD3]; // call rbx
+        let mov_ebx_r11d = [0x41u8, 0x89, 0xDB];
+        assert!(
+            stub.windows(iat_load.len()).any(|w| w == iat_load),
+            "nc_iat must load resolved import with mov rbx,[rax]"
+        );
+        assert!(
+            stub.windows(iat_call.len()).any(|w| w == iat_call),
+            "nc_iat must call through rbx (FF D3), not rax"
+        );
+        assert!(
+            stub.windows(mov_ebx_r11d.len()).any(|w| w == mov_ebx_r11d),
+            "nc_iat must use mov ebx,r11d (41 89 DB), not mov r11d,ebx"
+        );
+        assert!(
+            !stub.windows([0xFFu8, 0xD0].len()).any(|w| w == [0xFF, 0xD0]),
+            "stub must not use call rax (FF D0) — IAT target lives in rbx"
+        );
+    }
+
+    fn vm_reg_slot_disp32(reg: u8) -> [u8; 4] {
+        ((i32::from(reg) * 8) - 0x80).to_le_bytes()
+    }
+
+    /// Metadata (push/call depth, flags, rsi save) must not use VM r0..r15 frame slots.
+    #[test]
+    fn vm_stub_metadata_must_not_alias_vm_reg_slots() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let r13_slot = vm_reg_slot_disp32(13); // E8 FF FF FF = [rbp-0x18]
+        assert!(
+            !stub.windows(4).any(|w| w == r13_slot),
+            "stub must not use r13 slot disp E8 FF FF FF (fact push depth collision)"
+        );
+        assert!(
+            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0x30, 0xFF, 0xFF, 0xFF]),
+            "must not init call depth at [rbp-0xD0] (30 FF)"
+        );
+        assert!(
+            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0x28, 0xFF, 0xFF, 0xFF]),
+            "must not init push depth at [rbp-0xD8] (28 FF)"
+        );
+        assert!(
+            !stub.windows(7).any(|w| w == [0x48, 0x89, 0xB5, 0x10, 0xFF, 0xFF, 0xFF]),
+            "h_call scratch must not use char buf [rbp-0xF0] (10 FF)"
+        );
+        assert!(
+            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0xA8, 0xFF, 0xFF, 0xFF]),
+            "must not init call depth at VM r5 slot (A8 FF)"
+        );
+        assert!(
+            !stub.windows(4).any(|w| w == [0xB0, 0xFF, 0xFF, 0xFF]),
+            "must not use push depth at VM r6 slot (B0 FF)"
+        );
+        // push depth: only 18 FF FF FF; call depth: only 38 FF FF FF
+        let push_depth = [0x18u8, 0xFF, 0xFF, 0xFF];
+        let call_depth = [0x38u8, 0xFF, 0xFF, 0xFF];
+        assert!(
+            stub.windows(push_depth.len()).filter(|w| *w == push_depth).count() >= 4,
+            "h_push/h_pop must reference push depth [rbp-0xE8] (18 FF FF FF)"
+        );
+        assert!(
+            stub.windows(call_depth.len()).filter(|w| *w == call_depth).count() >= 4,
+            "h_call/h_ret must reference call depth [rbp-0xC8] (38 FF FF FF)"
+        );
+        // nc2 must read VM r0, not r2 (disp8 0x90 = [rbp-0x70])
+        let nc2_from_r0 = [0x48u8, 0x8B, 0x45, 0x80];
+        let nc2_from_r2 = [0x48u8, 0x8B, 0x45, 0x90];
+        assert!(
+            stub.windows(nc2_from_r0.len()).any(|w| w == nc2_from_r0),
+            "nc_func2 must load integer from VM r0 [rbp-0x80] (45 80)"
+        );
+        assert!(
+            !stub.windows(nc2_from_r2.len()).any(|w| w == nc2_from_r2),
+            "nc_func2 must not load from VM r2 [rbp-0x70] (45 90)"
         );
     }
 }
