@@ -919,6 +919,11 @@ fn emit_iat_native_call(
     printf_literal: Option<&[u8]>,
     string_patch_positions: &mut Vec<usize>,
 ) {
+    if import_name.is_some_and(is_putchar_import) {
+        bytecode.push(OpCode::Move as u8);
+        bytecode.push(0);
+        bytecode.push(1);
+    }
     let is_ptr = import_name.is_some_and(is_stdio_ptr_import);
     if is_ptr && printf_literal.is_some() {
         bytecode.push(OpCode::LoadImm as u8);
@@ -1041,14 +1046,23 @@ fn emit_external_call(
     string_patch_positions: &mut Vec<usize>,
     external_call_count: &mut u32,
 ) {
-    if printf_wrapper_bounds(instr, instrs, main_x64_offset).is_some() {
+    if let Some((entry, end)) = printf_wrapper_bounds(instr, instrs, main_x64_offset) {
         if is_crt_external_instr(pe, imports, instr) {
             return;
         }
         if iat_rva_for_instr(pe, imports, instr).is_some() {
             return;
         }
-        emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
+        let func_id = if printf_literal.is_some() {
+            1
+        } else if is_mingw_printf_wrapper(instrs, entry, end)
+            || caller_passes_integer_to_printf(instrs, entry, main_x64_offset)
+        {
+            2
+        } else {
+            1
+        };
+        emit_legacy_native_call(bytecode, func_id, string_patch_positions, printf_literal);
         return;
     }
 
@@ -1230,6 +1244,53 @@ fn callee_has_add_30(instrs: &[X64Instruction], entry: usize, end: usize) -> boo
         }
         matches!(&i.kind, X64InstrKind::AddRegImm { imm: 0x30, .. })
     })
+}
+
+/// True when a call site in main passes an integer in win64 rdx before calling `entry`.
+fn caller_passes_integer_to_printf(
+    instrs: &[X64Instruction],
+    callee_entry: usize,
+    main_x64_offset: usize,
+) -> bool {
+    for instr in instrs {
+        if instr.offset < main_x64_offset {
+            continue;
+        }
+        let X64InstrKind::Call { target_offset } = &instr.kind else {
+            continue;
+        };
+        let target =
+            (instr.offset as i32 + instr.bytes.len() as i32 + *target_offset) as usize;
+        if target != callee_entry {
+            continue;
+        }
+        for prev in instrs
+            .iter()
+            .filter(|i| i.offset >= main_x64_offset && i.offset < instr.offset)
+            .rev()
+            .take(24)
+        {
+            match &prev.kind {
+                X64InstrKind::MovRegReg { dst, .. }
+                    if matches!(dst, X64Reg::Rdx | X64Reg::Edx) =>
+                {
+                    return true;
+                }
+                X64InstrKind::MovRegImm { reg, .. }
+                    if matches!(reg, X64Reg::Rdx | X64Reg::Edx) =>
+                {
+                    return true;
+                }
+                X64InstrKind::MovRegMem { dst, .. }
+                    if matches!(dst, X64Reg::Rdx | X64Reg::Edx) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// True when `entry..end` looks like a MinGW `printf("%d", …)` wrapper (saves rcx+rdx, external call).

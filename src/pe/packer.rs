@@ -49,14 +49,34 @@ fn has_near_call_in_window(text_data: &[u8], offset: usize, window: usize) -> bo
     text_data[start..end].contains(&0xE8)
 }
 
-fn looks_like_user_main(text_data: &[u8], offset: usize) -> bool {
-    let end = (offset + 0x80).min(text_data.len());
+fn score_user_main(text_data: &[u8], offset: usize) -> i32 {
+    let end = (offset + 0x50).min(text_data.len());
     if offset >= end {
-        return false;
+        return 0;
     }
-    text_data[offset..end]
-        .windows(2)
-        .any(|w| w[0] == 0xC7 && w[1] == 0x45)
+    let w = &text_data[offset..end];
+    let mut score = 0i32;
+    if w.windows(2).any(|x| x[0] == 0xC7 && x[1] == 0x45) {
+        score += 10;
+    }
+    for i in 0..w.len().saturating_sub(6) {
+        if w[i] == 0xB9 && w.get(i + 5) == Some(&0xE8) {
+            score += 8;
+        }
+    }
+    for i in 0..w.len().saturating_sub(12) {
+        if w[i] == 0x48 && w.get(i + 1) == Some(&0x8D) {
+            let tail = &w[i..w.len().min(i + 16)];
+            if tail.contains(&0xE8) {
+                score += 8;
+            }
+        }
+    }
+    score
+}
+
+fn looks_like_user_main(text_data: &[u8], offset: usize) -> bool {
+    score_user_main(text_data, offset) > 0
 }
 
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
@@ -96,7 +116,14 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
         &user_main_candidates
     };
 
-    if let Some(&(rva, offset)) = pick_from.iter().min_by_key(|(_, off)| *off) {
+    if let Some(&(rva, offset)) = pick_from
+        .iter()
+        .max_by(|a, b| {
+            score_user_main(text_data, a.1)
+                .cmp(&score_user_main(text_data, b.1))
+                .then_with(|| b.1.cmp(&a.1))
+        })
+    {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
         return Ok(rva);
     }
@@ -476,6 +503,96 @@ mod tests {
             ir.contains("mul") && ir.contains("move         | r2,"),
             "main must pass computed int in r2:\n{ir}"
         );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_hello_uses_nc1() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/hello.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            ir.contains("native_call  | 0x1"),
+            "hello must use nc1 WriteFile string path:\n{ir}"
+        );
+        assert!(
+            !ir.contains("native_call  | 0x2"),
+            "hello must not use nc2 integer print:\n{ir}"
+        );
+        assert!(
+            bc.len() < 200,
+            "hello bytecode should stay compact, got {}",
+            bc.len()
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_fact_auto_main() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/fact.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+        assert!(
+            (280..=310).contains(&bc.len()),
+            "fact auto-main pack expected ~295 bytes, got {}",
+            bc.len()
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            ir.contains("call         | 0x") && ir.matches("native_call  | 0x2").count() == 1,
+            "fact must recurse via vm call and printf once via nc2:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r2, r0") || ir.matches("move         | r2, r0").count() <= 1,
+            "only main may move computed int into r2, not printf wrapper:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_nested_putchar_in_r0() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/nested.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            ir.contains("native_call  | 0x10000"),
+            "nested must use IAT putchar:\n{ir}"
+        );
+        assert!(
+            !ir.contains("native_call  | 0x180"),
+            "putchar must not use ptr-flag IAT id:\n{ir}"
+        );
+        for (idx, line) in ir.lines().enumerate() {
+            if line.contains("native_call  | 0x10000") {
+                let window = ir
+                    .lines()
+                    .skip(idx.saturating_sub(4))
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    window.contains("move         | r0, r1"),
+                    "putchar IAT must receive char in r0:\n{window}\n{ir}"
+                );
+            }
+        }
     }
 
     #[test]
