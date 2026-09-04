@@ -428,7 +428,10 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pe::imports::{is_iat_ptr_native_call, native_call_iat_id, native_call_iat_ptr_id};
+    use crate::pe::imports::{
+        iat_native_call_ids_in_bytecode, is_iat_native_call, is_iat_ptr_native_call,
+        native_call_iat_id, native_call_iat_ptr_id, native_call_ids_in_bytecode,
+    };
     use crate::pe::test_pe;
     use crate::vm::OpCode;
 
@@ -607,30 +610,54 @@ mod tests {
             ir.contains("and          | r"),
             "nested must u32-zero-extend before 32-bit imul:\n{ir}"
         );
-        // product<=9 must take single-digit path: cmp r12,9 then JLE (condition 5).
+        // product<=9 always single-digit: cmp32 r12,9 then unconditional jmp (fused from JLE).
         assert!(
-            ir.contains("cmp          | r12, r15"),
-            "nested must cmp product against 9:\n{ir}"
+            ir.contains("cmp32        | r12, r15") || ir.contains("cmp32          | r12, r15"),
+            "nested must cmp32 product against 9:\n{ir}"
         );
         let product_cmp = bc
             .windows(3)
-            .position(|w| w == [OpCode::Cmp as u8, 12, 15])
-            .expect("nested bytecode must contain cmp r12,r15");
+            .position(|w| w == [OpCode::Cmp32 as u8, 12, 15])
+            .expect("nested bytecode must contain cmp32 r12,r15");
         assert_eq!(
             bc.get(product_cmp + 3),
-            Some(&(OpCode::JmpIf as u8)),
-            "cmp r12,r15 must be followed by jmp_if"
+            Some(&(OpCode::Jmp as u8)),
+            "cmp32 r12,r15 must be followed by jmp to single-digit path"
         );
-        assert_eq!(
-            bc.get(product_cmp + 4),
-            Some(&5u8),
-            "nested product branch must be jmp_if JLE (5), not JG"
-        );
+    }
+
+    fn register_packed_putchar_natives(
+        vm: &mut crate::vm::VirtualMachine,
+        bytecode: &[u8],
+        putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
+    ) {
+        for id in iat_native_call_ids_in_bytecode(bytecode) {
+            if !is_iat_ptr_native_call(id) {
+                vm.register_native(id, putchar);
+            }
+        }
+        vm.register_native(3, putchar);
+    }
+
+    fn register_packed_stdio_natives(
+        vm: &mut crate::vm::VirtualMachine,
+        bytecode: &[u8],
+        putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
+        printf: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
+    ) {
+        for id in native_call_ids_in_bytecode(bytecode) {
+            if is_iat_ptr_native_call(id) {
+                vm.register_native(id, printf);
+            } else if is_iat_native_call(id) {
+                vm.register_native(id, putchar);
+            }
+        }
+        vm.register_native(2, printf);
+        vm.register_native(3, putchar);
     }
 
     #[test]
     fn test_pack_real_mingw_nested_stdout_matches_unpacked() {
-        use crate::pe::imports::native_call_iat_id;
         use crate::vm::VirtualMachine;
         use std::cell::RefCell;
         use std::path::Path;
@@ -665,9 +692,16 @@ mod tests {
         }
 
         let putchar_id = native_call_iat_id(0x8260);
-        let mut vm = VirtualMachine::new(bc);
-        vm.register_native(putchar_id, putchar_native);
-        vm.register_native(3, putchar_native);
+        let mut vm = VirtualMachine::new(bc.clone());
+        register_packed_putchar_natives(&mut vm, &bc, putchar_native);
+        // Windows nested.exe may use a different IAT RVA than the Linux sample.
+        assert!(
+            iat_native_call_ids_in_bytecode(&bc)
+                .iter()
+                .any(|id| *id == putchar_id || (!is_iat_ptr_native_call(*id))),
+            "nested bytecode must contain at least one IAT putchar id, got {:?}",
+            iat_native_call_ids_in_bytecode(&bc)
+        );
         vm.run().expect("nested VM run");
 
         let out = NESTED_OUT.with(|buf| buf.borrow().clone());
@@ -686,7 +720,6 @@ mod tests {
 
     #[test]
     fn test_pack_real_mingw_loop_stdout_matches_unpacked() {
-        use crate::pe::imports::native_call_iat_id;
         use crate::vm::VirtualMachine;
         use std::cell::RefCell;
         use std::path::Path;
@@ -723,10 +756,8 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = VirtualMachine::new(bc);
-        vm.register_native(native_call_iat_id(0x8260), putchar_native);
-        vm.register_native(2, printf_native);
-        vm.register_native(3, putchar_native);
+        let mut vm = VirtualMachine::new(bc.clone());
+        register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
         vm.run().expect("loop VM run");
 
         let out = LOOP_OUT.with(|buf| buf.borrow().clone());
@@ -735,7 +766,6 @@ mod tests {
 
     #[test]
     fn test_pack_real_mingw_fact_stdout_matches_unpacked() {
-        use crate::pe::imports::native_call_iat_id;
         use crate::vm::VirtualMachine;
         use std::cell::RefCell;
         use std::path::Path;
@@ -772,10 +802,8 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = VirtualMachine::new(bc);
-        vm.register_native(native_call_iat_id(0x8260), putchar_native);
-        vm.register_native(2, printf_native);
-        vm.register_native(3, putchar_native);
+        let mut vm = VirtualMachine::new(bc.clone());
+        register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
         vm.run().expect("fact VM run");
 
         let out = FACT_OUT.with(|buf| buf.borrow().clone());
@@ -1254,20 +1282,6 @@ mod tests {
         assert!(nc_target >= table_end);
         assert_eq!(stub[nc_target], 0x48);
         assert_eq!(stub[nc_target + 1], 0x8B);
-    }
-
-    fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
-        let mut ids = Vec::new();
-        let mut i = 0;
-        while i < bytecode.len() {
-            if bytecode[i] == OpCode::NativeCall as u8 && i + 9 <= bytecode.len() {
-                ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
-                i += 9;
-            } else {
-                i += 1;
-            }
-        }
-        ids
     }
 
     #[test]

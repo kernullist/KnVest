@@ -100,7 +100,7 @@ impl Instruction {
                     }
                 },
                 
-                OpCode::Cmp => {
+                OpCode::Cmp | OpCode::Cmp32 => {
                     for _ in 0..2 {
                         if offset < bytecode.len() {
                             operands.push(Operand::Register(bytecode[offset]));

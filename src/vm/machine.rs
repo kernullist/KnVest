@@ -226,6 +226,22 @@ impl VirtualMachine {
                     | (if of { 0x800 } else { 0 });
             },
 
+            OpCode::Cmp32 => {
+                let src1 = self.read_u8()?;
+                let src2 = self.read_u8()?;
+                let val1 = self.get_register(src1)? as u32 as u64;
+                let val2 = self.get_register(src2)? as u32 as u64;
+                let result = val1.wrapping_sub(val2);
+                let zf = val1 == val2;
+                let sf = (result as i64) < 0;
+                let cf = val1 < val2;
+                let of = ((val1 ^ val2) & (val1 ^ result)) >> 63 != 0;
+                self.flags = (if zf { 0x40 } else { 0 })
+                    | (if sf { 0x80 } else { 0 })
+                    | (if cf { 0x01 } else { 0 })
+                    | (if of { 0x800 } else { 0 });
+            },
+
             OpCode::Jmp => {
                 let offset = self.read_u64()? as usize;
                 self.pc = offset;

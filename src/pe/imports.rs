@@ -42,6 +42,30 @@ pub fn iat_rva_from_native_call(func_id: u64) -> u32 {
     (func_id & 0x7FFF_FFFF) as u32
 }
 
+/// Collect every `native_call` func_id embedded in lifted VM bytecode.
+pub fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
+    use crate::vm::OpCode;
+    let mut ids = Vec::new();
+    let mut i = 0usize;
+    while i < bytecode.len() {
+        if bytecode[i] == OpCode::NativeCall as u8 && i + 9 <= bytecode.len() {
+            ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
+            i += 9;
+        } else {
+            i += 1;
+        }
+    }
+    ids
+}
+
+/// IAT-tagged native_call ids (`0x100000000 | rva`) present in bytecode.
+pub fn iat_native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
+    native_call_ids_in_bytecode(bytecode)
+        .into_iter()
+        .filter(|id| is_iat_native_call(*id))
+        .collect()
+}
+
 /// Imports whose first win64 arg is a string/format pointer embedded in VM bytecode.
 pub fn is_stdio_ptr_import(name: &str) -> bool {
     name == "puts" || name.contains("printf")

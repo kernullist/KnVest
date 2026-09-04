@@ -22,6 +22,8 @@ pub enum OpCode {
     Pop = 0x10,
     LoadByte = 0x11,
     LoadStr = 0x12,
+    /// 32-bit dword compare (MinGW `cmpl` on stack locals); nested u32 only.
+    Cmp32 = 0x13,
     And = 0x14,
     Exit = 0xFF,
 }
@@ -48,6 +50,7 @@ impl OpCode {
             0x10 => Some(OpCode::Pop),
             0x11 => Some(OpCode::LoadByte),
             0x12 => Some(OpCode::LoadStr),
+            0x13 => Some(OpCode::Cmp32),
             0x14 => Some(OpCode::And),
             0xFF => Some(OpCode::Exit),
             _ => None,
@@ -75,6 +78,7 @@ impl OpCode {
             OpCode::Pop => "pop",
             OpCode::LoadByte => "load_byte",
             OpCode::LoadStr => "load_str",
+            OpCode::Cmp32 => "cmp32",
             OpCode::And => "and",
             OpCode::Exit => "exit",
         }
