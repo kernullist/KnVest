@@ -1,5 +1,7 @@
 use crate::vm::OpCode;
-use super::imports::{native_call_iat_id, ImportTable};
+use super::imports::{
+    is_stdio_ptr_import, native_call_iat_id, native_call_iat_ptr_id, ImportTable,
+};
 use super::parser::PEFile;
 use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
@@ -860,9 +862,31 @@ fn emit_add_reg_reg(bytecode: &mut Vec<u8>, dst: &X64Reg, src: &X64Reg) {
     bytecode.push(src.to_vm_reg());
 }
 
-fn emit_iat_native_call(bytecode: &mut Vec<u8>, iat_rva: u32) {
+fn has_putchar_style_callees(instrs: &[X64Instruction], main_x64_offset: usize) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    for instr in instrs {
+        if instr.offset >= main_x64_offset {
+            continue;
+        }
+        if instr.bytes.first() != Some(&0x55) || !seen.insert(instr.offset) {
+            continue;
+        }
+        let end = callee_end_for(instrs, instr.offset, main_x64_offset);
+        if callee_has_add_30(instrs, instr.offset, end) {
+            return true;
+        }
+    }
+    false
+}
+
+fn emit_iat_native_call(bytecode: &mut Vec<u8>, iat_rva: u32, import_name: Option<&str>) {
+    let id = if import_name.is_some_and(is_stdio_ptr_import) {
+        native_call_iat_ptr_id(iat_rva)
+    } else {
+        native_call_iat_id(iat_rva)
+    };
     bytecode.push(OpCode::NativeCall as u8);
-    bytecode.extend_from_slice(&native_call_iat_id(iat_rva).to_le_bytes());
+    bytecode.extend_from_slice(&id.to_le_bytes());
 }
 
 fn iat_rva_for_instr(pe: &PEFile, imports: &ImportTable, instr: &X64Instruction) -> Option<u32> {
@@ -955,12 +979,11 @@ fn emit_external_call(
     }
 
     if let Some(iat_rva) = iat_rva_for_instr(pe, imports, instr) {
-        let skip = pe
-            .resolve_iat_target(imports, iat_rva)
-            .map(|e| imports.is_crt_startup(e))
-            .unwrap_or(false);
+        let entry = pe.resolve_iat_target(imports, iat_rva);
+        let skip = entry.map(|e| imports.is_crt_startup(e)).unwrap_or(false);
         if !skip {
-            emit_iat_native_call(bytecode, iat_rva);
+            let name = entry.map(|e| e.name.as_str());
+            emit_iat_native_call(bytecode, iat_rva, name);
         }
         return;
     }
@@ -971,9 +994,10 @@ fn emit_external_call(
         return;
     }
 
+    let in_main = instr.offset >= main_x64_offset;
     let in_callee = instr.offset < main_x64_offset;
 
-    if in_callee {
+    if in_callee && !in_main {
         let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
         let end = callee_end_for(instrs, entry, main_x64_offset);
         if callee_has_add_30(instrs, entry, end) {
@@ -990,6 +1014,8 @@ fn emit_external_call(
         } else {
             emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
         }
+    } else if in_main {
+        emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
     }
 }
 
@@ -1564,27 +1590,26 @@ fn lift_to_vm_bytecode_internal_with_main(
         if instr.offset < main_x64_offset {
             continue;
         }
-        if let X64InstrKind::Call { target_offset } = instr.kind {
-            let target_x64_offset =
-                (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-            if !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset) {
+        match &instr.kind {
+            X64InstrKind::Call { target_offset } => {
+                let target_x64_offset = (instr.offset as i32
+                    + instr.bytes.len() as i32
+                    + *target_offset) as usize;
+                if !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset)
+                    || !instrs.iter().any(|i| i.offset == target_x64_offset)
+                {
+                    main_external_calls += 1;
+                }
+            }
+            X64InstrKind::CallIndRip { .. } => {
                 main_external_calls += 1;
             }
+            _ => {}
         }
     }
-    let has_putchar_callees = instrs.iter().any(|instr| {
-        if instr.offset >= main_x64_offset {
-            return false;
-        }
-        if let X64InstrKind::Call { target_offset } = instr.kind {
-            let target_x64_offset =
-                (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-            !is_lifted_internal_target(target_x64_offset, min_x64_offset, max_x64_offset)
-        } else {
-            false
-        }
-    });
-    let main_has_printf = !has_putchar_callees && main_external_calls > 1;
+    let has_putchar_callees = has_putchar_style_callees(instrs, main_x64_offset);
+    let main_has_printf = (!has_putchar_callees && main_external_calls > 1)
+        || printf_literal.is_some();
 
     let mut hit_main_ret = false;
     let lift_indices = lift_order_indices(instrs, main_x64_offset);
@@ -1842,7 +1867,8 @@ fn lift_to_vm_bytecode_internal_with_main(
                     if entry.map(|e| imports.is_crt_startup(e)).unwrap_or(false) {
                         // CRT startup — skip
                     } else {
-                        emit_iat_native_call(&mut bytecode, iat_rva);
+                        let name = entry.map(|e| e.name.as_str());
+                        emit_iat_native_call(&mut bytecode, iat_rva, name);
                     }
                 } else if is_non_liftable_target(pe, imports, raw_target) {
                     emit_external_call(
@@ -2138,7 +2164,7 @@ mod tests {
 
     #[test]
     fn puts_thunk_rel32_emits_iat_native_call() {
-        use super::super::imports::{iat_rva_from_native_call, is_iat_native_call};
+        use super::super::imports::{is_iat_ptr_native_call, native_call_iat_ptr_id};
         use super::super::cfg::disassemble_cfg_function;
 
         let pe_data = test_pe::create_pe64_with_puts_thunk_call();
@@ -2159,22 +2185,38 @@ mod tests {
         );
         let ids = native_call_ids(&bc);
         assert!(
-            ids.iter().any(|id| is_iat_native_call(*id)),
-            "expected IAT native_call for rel32->thunk, got {:?}",
+            ids.iter().any(|id| is_iat_ptr_native_call(*id)),
+            "expected IAT ptr native_call for rel32->thunk puts, got {:?}",
             ids
         );
         assert!(
-            ids.iter().any(|id| iat_rva_from_native_call(*id) == puts.iat_rva),
-            "expected puts IAT RVA {:#x}, got {:?}",
+            ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)),
+            "expected puts IAT ptr RVA {:#x}, got {:?}",
             puts.iat_rva,
             ids
         );
     }
 
     #[test]
+    fn main_printf_never_emits_nc3() {
+        let main_off = 0x400;
+        let instrs = vec![
+            call_at(main_off, 0x1000),
+            call_at(main_off + 5, 0x1000),
+            ret_at(main_off + 10),
+        ];
+        let hello = b"Hello, World!\n";
+        let bc = lift_for_test(&instrs, main_off, Some(hello));
+        assert_eq!(native_call_ids(&bc), vec![1]);
+        assert!(!native_call_ids(&bc).contains(&3));
+    }
+
+    #[test]
     fn puts_iat_call_emits_iat_native_call_id() {
         use super::super::cfg::disassemble_cfg_function;
-        use super::super::imports::{iat_rva_from_native_call, is_iat_native_call};
+        use super::super::imports::{
+            iat_rva_from_native_call, is_iat_ptr_native_call, native_call_iat_ptr_id,
+        };
 
         let pe_data = test_pe::create_pe64_with_imports();
         let pe = PEFile::from_bytes(pe_data).unwrap();
@@ -2203,12 +2245,12 @@ mod tests {
         );
         let ids = native_call_ids(&bc);
         assert!(
-            ids.iter().any(|id| is_iat_native_call(*id)),
-            "expected IAT native_call, got {:?}",
+            ids.iter().any(|id| is_iat_ptr_native_call(*id)),
+            "expected IAT ptr native_call, got {:?}",
             ids
         );
         assert!(
-            ids.iter().any(|id| iat_rva_from_native_call(*id) == puts.iat_rva),
+            ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)),
             "expected puts IAT RVA {:#x}, got {:?}",
             puts.iat_rva,
             ids

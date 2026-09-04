@@ -518,20 +518,26 @@ impl StubEmitter {
         self.jmp_rel32("nc_done");
 
         self.label("nc_iat");
-        // eax = func_id; ebx = iat_rva (low 32 bits)
-        self.emit(&[0x89, 0xC3]); // mov ebx, eax
-        self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // mov rax, gs:[0x60] PEB
-        self.emit(&[0x48, 0x8B, 0x40, 0x10]); // mov rax, [rax+0x10] ImageBase
+        // rax = func_id; r11d = low dword (ptr flag in bit 31 + iat_rva)
+        self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
+        self.emit(&[0x41, 0x89, 0xDB]); // mov ebx, r11d
+        self.emit(&[0x81, 0xE3, 0xFF, 0xFF, 0xFF, 0x7F]); // and ebx, 0x7fffffff
+        self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // PEB
+        self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
-        self.emit(&[0x48, 0x8B, 0x00]); // mov rax, [rax] resolved import
-        // win64 ABI: rcx, rdx, r8, r9 from VM r0-r3
-        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov rcx, [rbp-0x80] r0
-        self.emit(&[0x48, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF]); // mov rdx, [rbp-0x78] r1
-        self.emit(&[0x4C, 0x8B, 0x85, 0x70, 0xFF, 0xFF, 0xFF]); // mov r8,  [rbp-0x70] r2
-        self.emit(&[0x4C, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]); // mov r9,  [rbp-0x60] r4 (r3 slot saved for rsi)
-        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow
-        self.emit(&[0xFF, 0xD0]); // call rax
-        self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+        self.emit(&[0x48, 0x8B, 0x00]); // resolved import -> rax
+        self.emit(&[0x48, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF]); // rcx <- VM r1 (x64 rcx)
+        self.emit(&[0x48, 0x8B, 0x95, 0x70, 0xFF, 0xFF, 0xFF]); // rdx <- VM r2
+        self.emit(&[0x4C, 0x8B, 0x85, 0xC0, 0xFF, 0xFF, 0xFF]); // r8  <- VM r8
+        self.emit(&[0x4C, 0x8B, 0x8D, 0xB8, 0xFF, 0xFF, 0xFF]); // r9  <- VM r9
+        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
+        self.jcc_rel32(0x84, "nc_iat_call"); // jz integer arg (putchar)
+        self.lea_rip_rel32(0x48, 3, "bytecode"); // lea rbx, [rip+bytecode]
+        self.emit(&[0x48, 0x01, 0xD9]); // add rcx, rbx
+        self.label("nc_iat_call");
+        self.emit(&[0x48, 0x83, 0xEC, 0x28]);
+        self.emit(&[0xFF, 0xD0]);
+        self.emit(&[0x48, 0x83, 0xC4, 0x28]);
         self.jmp_rel32("nc_done");
 
         self.label("nc_done");
@@ -682,6 +688,22 @@ mod tests {
         assert!(
             !stub.windows(truncated.len()).any(|w| w == truncated),
             "stub must not emit truncated 6-byte mov rcx,imm64"
+        );
+    }
+
+    #[test]
+    fn iat_native_call_maps_x64_rcx_from_vm_reg1() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        // nc_iat must load win64 rcx from VM r1 slot [rbp-0x78], not r0 [rbp-0x80]
+        let rcx_from_r1 = [0x48u8, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF];
+        assert!(
+            stub.windows(rcx_from_r1.len()).any(|w| w == rcx_from_r1),
+            "IAT path must map x64 rcx from VM register 1"
+        );
+        let ptr_fixup = [0x48u8, 0x01, 0xD9]; // add rcx, rbx after lea rbx, [bytecode]
+        assert!(
+            stub.windows(ptr_fixup.len()).any(|w| w == ptr_fixup),
+            "IAT ptr path must add bytecode base to rcx"
         );
     }
 }

@@ -380,7 +380,7 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pe::imports::native_call_iat_id;
+    use crate::pe::imports::{is_iat_ptr_native_call, native_call_iat_id, native_call_iat_ptr_id};
     use crate::pe::test_pe;
     use crate::vm::OpCode;
 
@@ -879,8 +879,8 @@ mod tests {
         let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
         let ids = native_call_ids_in_bytecode(&bc);
         assert!(
-            ids.iter().any(|id| *id == native_call_iat_id(puts.iat_rva)),
-            "expected IAT puts native_call, got {:?}",
+            ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)),
+            "expected IAT puts native_call with ptr flag, got {:?}",
             ids
         );
         assert!(bc.len() < 300, "puts thunk pack should stay small, got {} bytes", bc.len());

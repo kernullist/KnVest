@@ -19,17 +19,32 @@ pub struct ImportTable {
 
 /// func_id values 1..3 are legacy WriteFile/print helpers; bit 32 marks IAT win64 calls.
 pub const NATIVE_CALL_IAT_TAG: u64 = 0x1_0000_0000;
+/// Bit 31 in the low dword marks IAT calls whose rcx (and rdx for printf) hold bytecode offsets.
+pub const NATIVE_CALL_IAT_PTR_FLAG: u64 = 0x8000_0000;
 
 pub fn native_call_iat_id(iat_rva: u32) -> u64 {
     NATIVE_CALL_IAT_TAG | (iat_rva as u64)
+}
+
+pub fn native_call_iat_ptr_id(iat_rva: u32) -> u64 {
+    NATIVE_CALL_IAT_TAG | NATIVE_CALL_IAT_PTR_FLAG | (iat_rva as u64)
 }
 
 pub fn is_iat_native_call(func_id: u64) -> bool {
     func_id >= NATIVE_CALL_IAT_TAG
 }
 
+pub fn is_iat_ptr_native_call(func_id: u64) -> bool {
+    func_id >= NATIVE_CALL_IAT_TAG && (func_id & NATIVE_CALL_IAT_PTR_FLAG) != 0
+}
+
 pub fn iat_rva_from_native_call(func_id: u64) -> u32 {
-    (func_id & 0xFFFF_FFFF) as u32
+    (func_id & 0x7FFF_FFFF) as u32
+}
+
+/// Imports whose first win64 arg is a string/format pointer embedded in VM bytecode.
+pub fn is_stdio_ptr_import(name: &str) -> bool {
+    name == "puts" || name.contains("printf")
 }
 
 /// CRT / startup imports that should not be lifted to native_call.
@@ -305,6 +320,11 @@ mod tests {
         assert!(is_iat_native_call(id));
         assert_eq!(iat_rva_from_native_call(id), 0x3000);
         assert!(!is_iat_native_call(2));
+        assert!(!is_iat_ptr_native_call(id));
+
+        let ptr_id = native_call_iat_ptr_id(0x8260);
+        assert!(is_iat_ptr_native_call(ptr_id));
+        assert_eq!(iat_rva_from_native_call(ptr_id), 0x8260);
     }
 
     #[test]
