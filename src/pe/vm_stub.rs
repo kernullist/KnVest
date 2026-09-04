@@ -287,6 +287,18 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
 
+        self.label("h_and");
+        self.emit(&[0x0F, 0xB6, 0x0E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x0F, 0xB6, 0x3E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x0F, 0xB6, 0x16]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+        self.emit(&[0x48, 0x23, 0x44, 0xD5, 0x80]);
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+        self.jmp_to_dispatch();
+
         self.label("h_cmp");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -543,14 +555,18 @@ impl StubEmitter {
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
         // win64 ABI args from VM r0..r3 before ptr test (2151211 putchar order); ptr adds base to rcx.
-        self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] — zero-extend char/offset
+        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
+        self.jcc_rel32(0x84, "nc_iat_putchar"); // jz — putchar: rcx=r0 only, no rdx/r8/r9
+        self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] offset
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
-        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
-        self.jcc_rel32(0x84, "nc_iat_call"); // jz — putchar / integer in rcx, no ptr reloc
         self.lea_rip_rel32(0x48, 0, "bytecode"); // lea rax, [bytecode]
         self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax (48 01 C1; NOT 49 01 D1 = add r9,rdx)
+        self.jmp_rel32("nc_iat_call");
+        self.label("nc_iat_putchar");
+        self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
+        self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
         self.label("nc_iat_call");
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
@@ -573,7 +589,7 @@ impl StubEmitter {
         let table_base = self
             .handler_table_start
             .expect("handler table placeholder missing");
-        let handlers: [(u8, &str); 16] = [
+        let handlers: [(u8, &str); 17] = [
             (0x00, "h_nop"),
             (0x01, "h_load_imm"),
             (0x04, "h_move"),
@@ -589,6 +605,7 @@ impl StubEmitter {
             (0x0F, "h_push"),
             (0x10, "h_pop"),
             (0x11, "h_load_byte"),
+            (0x14, "h_and"),
             (0xFF, "h_exit"),
         ];
         let default_off = self.handler_offset("h_nop", table_base);
@@ -785,7 +802,7 @@ mod tests {
                 "nc_iat must not emit {name} ({pat:02x?}) for ptr reloc"
             );
         }
-        // nc_iat: load rcx..r9 before test; ptr path lea rax + add rcx,rax (no rcx reload).
+        // nc_iat: test ptr-flag first; putchar jz uses ecx-only path with and ecx,0xff.
         let nc_iat_off = stub
             .windows(mov_r11d_eax.len())
             .position(|w| w == mov_r11d_eax)
@@ -796,19 +813,16 @@ mod tests {
             .position(|w| w == iat_load)
             .map(|p| nc_iat_off + p + iat_load.len())
             .expect("mov rbx,[rax] in nc_iat");
-        let nc_iat_tail = &stub[after_mov_rbx..after_mov_rbx + 35];
-        assert!(
-            nc_iat_tail.starts_with(&rcx_from_r0),
-            "nc_iat must mov ecx from VM r0 before test (putchar path)"
-        );
         let test_r11d = [0x41u8, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80];
-        let test_pos = nc_iat_tail
-            .windows(test_r11d.len())
-            .position(|w| w == test_r11d)
-            .expect("nc_iat test r11d");
         assert_eq!(
-            test_pos, 27,
-            "nc_iat must load ecx,rdx,r8,r9 (27 bytes) before test r11d"
+            &stub[after_mov_rbx..after_mov_rbx + test_r11d.len()],
+            test_r11d,
+            "nc_iat must test r11d immediately after resolving import"
+        );
+        let putchar_mask = [0x83u8, 0xE1, 0xFF];
+        assert!(
+            stub.windows(putchar_mask.len()).any(|w| w == putchar_mask),
+            "putchar nc_iat path must and ecx,0xff"
         );
         let rcx_from_r1 = [0x48u8, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF];
         assert!(

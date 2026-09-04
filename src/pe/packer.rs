@@ -597,6 +597,16 @@ mod tests {
                 );
             }
         }
+        // Main→callee calls must spill only main rbp locals (r10..r12), not callee +0x10 slot r13.
+        let push_r13_before_print = ir.match_indices("push         | r13").count();
+        assert_eq!(
+            push_r13_before_print, 0,
+            "main internal calls must not push callee spill r13:\n{ir}"
+        );
+        assert!(
+            ir.contains("and          | r"),
+            "nested must u32-zero-extend before 32-bit imul:\n{ir}"
+        );
     }
 
     #[test]

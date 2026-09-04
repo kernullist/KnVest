@@ -757,7 +757,7 @@ fn vm_instruction_len(bytecode: &[u8], pos: usize) -> Option<usize> {
         OpCode::Nop | OpCode::Ret => 0,
         OpCode::LoadImm => 9,
         OpCode::LoadMem | OpCode::StoreMem | OpCode::Move | OpCode::Cmp => 2,
-        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor => 3,
+        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => 3,
         OpCode::Jmp | OpCode::Call | OpCode::NativeCall | OpCode::LoadStr => 8,
         OpCode::JmpIf => 9,
         OpCode::Push | OpCode::Pop | OpCode::Exit | OpCode::LoadByte => 1,
@@ -873,6 +873,38 @@ pub fn alloc_stack_spill_reg(next_stack_reg: &mut u8) -> u8 {
         *next_stack_reg = next_stack_reg.saturating_add(1);
     }
     reg
+}
+
+/// x86-32 `mov reg, [rbp+disp]` zero-extends; match that before wider math.
+fn is_x86_32bit_rbp_load(instr: &X64Instruction) -> bool {
+    matches!(
+        instr.kind,
+        X64InstrKind::MovRegMem {
+            base: X64Reg::Rbp | X64Reg::Ebp,
+            ..
+        }
+    ) && instr.bytes.first() == Some(&0x8B)
+}
+
+/// `imul r32, [rbp+disp]` without REX.W — 32-bit multiply.
+fn is_x86_32bit_imul_mem(instr: &X64Instruction) -> bool {
+    matches!(
+        instr.kind,
+        X64InstrKind::ImulRegMem {
+            base: X64Reg::Rbp | X64Reg::Ebp,
+            ..
+        }
+    ) && instr.bytes.starts_with(&[0x0F, 0xAF])
+}
+
+fn emit_u32_zext(bytecode: &mut Vec<u8>, reg: u8) {
+    bytecode.push(OpCode::LoadImm as u8);
+    bytecode.push(15);
+    bytecode.extend_from_slice(&0xFFFF_FFFFu64.to_le_bytes());
+    bytecode.push(OpCode::And as u8);
+    bytecode.push(reg);
+    bytecode.push(reg);
+    bytecode.push(15);
 }
 
 fn has_putchar_style_callees(instrs: &[X64Instruction], main_x64_offset: usize) -> bool {
@@ -993,11 +1025,18 @@ fn is_crt_external_instr(pe: &PEFile, imports: &ImportTable, instr: &X64Instruct
 
 fn emit_internal_vm_call(
     stack_map: &std::collections::HashMap<i32, u8>,
+    call_instr: &X64Instruction,
+    main_x64_offset: usize,
     target_x64_offset: usize,
     bytecode: &mut Vec<u8>,
     pending_jumps: &mut Vec<(usize, usize, bool)>,
 ) {
-    let mut active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
+    let from_main = call_instr.offset >= main_x64_offset;
+    let mut active_stack_regs: Vec<u8> = stack_map
+        .iter()
+        .filter(|(off, _)| !from_main || **off < 0)
+        .map(|(_, reg)| *reg)
+        .collect();
     active_stack_regs.sort_unstable();
     for &reg in &active_stack_regs {
         bytecode.push(OpCode::Push as u8);
@@ -1519,6 +1558,8 @@ fn lift_to_vm_bytecode_internal(
 
     let mut external_call_count = 0;
 
+    let u32_semantics = false;
+
     for instr in instrs {
         label_map.insert(instr.offset, bytecode.len());
 
@@ -1551,6 +1592,9 @@ fn lift_to_vm_bytecode_internal(
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(stack_reg);
+                    if u32_semantics && is_x86_32bit_rbp_load(instr) {
+                        emit_u32_zext(&mut bytecode, dst.to_vm_reg());
+                    }
                 }
             }
             X64InstrKind::MovMemReg { base, offset, src } => {
@@ -1632,9 +1676,14 @@ fn lift_to_vm_bytecode_internal(
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
                         alloc_stack_spill_reg(&mut next_stack_reg)
                     });
+                    let dst_vm = dst.to_vm_reg();
+                    if u32_semantics && is_x86_32bit_imul_mem(instr) {
+                        emit_u32_zext(&mut bytecode, dst_vm);
+                        emit_u32_zext(&mut bytecode, stack_reg);
+                    }
                     bytecode.push(OpCode::Mul as u8);
-                    bytecode.push(dst.to_vm_reg());
-                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(dst_vm);
+                    bytecode.push(dst_vm);
                     bytecode.push(stack_reg);
                 }
             }
@@ -1896,6 +1945,7 @@ fn lift_to_vm_bytecode_internal_with_main(
     let has_putchar_callees = has_putchar_style_callees(instrs, main_x64_offset);
     let main_has_printf = (!has_putchar_callees && main_external_calls > 1)
         || printf_literal.is_some();
+    let u32_semantics = has_putchar_callees;
 
     let mut hit_main_ret = false;
     let lift_indices = lift_order_indices(instrs, main_x64_offset);
@@ -1996,6 +2046,9 @@ fn lift_to_vm_bytecode_internal_with_main(
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(dst.to_vm_reg());
                     bytecode.push(stack_reg);
+                    if u32_semantics && is_x86_32bit_rbp_load(instr) {
+                        emit_u32_zext(&mut bytecode, dst.to_vm_reg());
+                    }
                 }
             }
             X64InstrKind::MovMemReg { base, offset, src } => {
@@ -2077,9 +2130,14 @@ fn lift_to_vm_bytecode_internal_with_main(
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
                         alloc_stack_spill_reg(&mut next_stack_reg)
                     });
+                    let dst_vm = dst.to_vm_reg();
+                    if u32_semantics && is_x86_32bit_imul_mem(instr) {
+                        emit_u32_zext(&mut bytecode, dst_vm);
+                        emit_u32_zext(&mut bytecode, stack_reg);
+                    }
                     bytecode.push(OpCode::Mul as u8);
-                    bytecode.push(dst.to_vm_reg());
-                    bytecode.push(dst.to_vm_reg());
+                    bytecode.push(dst_vm);
+                    bytecode.push(dst_vm);
                     bytecode.push(stack_reg);
                 }
             }
@@ -2250,6 +2308,8 @@ fn lift_to_vm_bytecode_internal_with_main(
                     } else {
                         emit_internal_vm_call(
                             &stack_map,
+                            instr,
+                            main_x64_offset,
                             target_x64_offset,
                             &mut bytecode,
                             &mut pending_jumps,
@@ -2258,6 +2318,8 @@ fn lift_to_vm_bytecode_internal_with_main(
                 } else {
                     emit_internal_vm_call(
                         &stack_map,
+                        instr,
+                        main_x64_offset,
                         target_x64_offset,
                         &mut bytecode,
                         &mut pending_jumps,
@@ -2473,7 +2535,7 @@ mod tests {
             OpCode::LoadImm => 10,
             OpCode::LoadMem | OpCode::StoreMem => 3,
             OpCode::Move => 3,
-            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor => 4,
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => 4,
             OpCode::Cmp => 3,
             OpCode::Jmp | OpCode::Call => 9,
             OpCode::JmpIf => 10,
