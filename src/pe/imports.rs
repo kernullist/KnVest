@@ -47,6 +47,11 @@ pub fn is_stdio_ptr_import(name: &str) -> bool {
     name == "puts" || name.contains("printf")
 }
 
+/// True for character-at-a-time CRT output (legacy nc3), not printf/puts.
+pub fn is_putchar_import(name: &str) -> bool {
+    matches!(name, "putchar" | "_putchar" | "_fputchar" | "__p__putchar")
+}
+
 /// CRT / startup imports that should not be lifted to native_call.
 pub const CRT_SKIP_NAMES: &[&str] = &[
     "__main",

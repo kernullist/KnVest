@@ -1,6 +1,7 @@
 use crate::vm::OpCode;
 use super::imports::{
-    is_stdio_ptr_import, native_call_iat_id, native_call_iat_ptr_id, ImportTable,
+    is_putchar_import, is_stdio_ptr_import, native_call_iat_id, native_call_iat_ptr_id,
+    ImportTable,
 };
 use super::parser::PEFile;
 use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
@@ -862,6 +863,18 @@ fn emit_add_reg_reg(bytecode: &mut Vec<u8>, dst: &X64Reg, src: &X64Reg) {
     bytecode.push(src.to_vm_reg());
 }
 
+/// VM spill slots for rbp-relative locals: regs 10..=15 map to [rbp-0x80 + reg*8].
+pub const VM_STACK_SPILL_REG_FIRST: u8 = 10;
+pub const VM_MAX_REG: u8 = 15;
+
+pub fn alloc_stack_spill_reg(next_stack_reg: &mut u8) -> u8 {
+    let reg = (*next_stack_reg).min(VM_MAX_REG);
+    if *next_stack_reg <= VM_MAX_REG {
+        *next_stack_reg = next_stack_reg.saturating_add(1);
+    }
+    reg
+}
+
 fn has_putchar_style_callees(instrs: &[X64Instruction], main_x64_offset: usize) -> bool {
     let mut seen = std::collections::HashSet::new();
     for instr in instrs {
@@ -877,6 +890,26 @@ fn has_putchar_style_callees(instrs: &[X64Instruction], main_x64_offset: usize) 
         }
     }
     false
+}
+
+fn callee_stdio_import<'a>(
+    instrs: &[X64Instruction],
+    pe: &PEFile,
+    imports: &'a ImportTable,
+    entry: usize,
+    end: usize,
+) -> Option<(&'a str, u32)> {
+    for instr in instrs {
+        if instr.offset < entry || instr.offset >= end {
+            continue;
+        }
+        let iat_rva = iat_rva_for_instr(pe, imports, instr)?;
+        let entry = pe.resolve_iat_target(imports, iat_rva)?;
+        if is_stdio_ptr_import(&entry.name) || is_putchar_import(&entry.name) {
+            return Some((entry.name.as_str(), entry.iat_rva));
+        }
+    }
+    None
 }
 
 fn emit_iat_native_call(bytecode: &mut Vec<u8>, iat_rva: u32, import_name: Option<&str>) {
@@ -940,6 +973,27 @@ fn is_crt_external_instr(pe: &PEFile, imports: &ImportTable, instr: &X64Instruct
     false
 }
 
+fn emit_internal_vm_call(
+    stack_map: &std::collections::HashMap<i32, u8>,
+    target_x64_offset: usize,
+    bytecode: &mut Vec<u8>,
+    pending_jumps: &mut Vec<(usize, usize, bool)>,
+) {
+    let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
+    for &reg in &active_stack_regs {
+        bytecode.push(OpCode::Push as u8);
+        bytecode.push(reg);
+    }
+    bytecode.push(OpCode::Call as u8);
+    let placeholder_pos = bytecode.len();
+    bytecode.extend_from_slice(&0u64.to_le_bytes());
+    pending_jumps.push((placeholder_pos, target_x64_offset, false));
+    for &reg in active_stack_regs.iter().rev() {
+        bytecode.push(OpCode::Pop as u8);
+        bytecode.push(reg);
+    }
+}
+
 fn emit_legacy_native_call(
     bytecode: &mut Vec<u8>,
     func_id: u64,
@@ -989,8 +1043,8 @@ fn emit_external_call(
     }
 
     *external_call_count += 1;
-    if *external_call_count == 1 {
-        // Legacy rel32 __main / CRT startup outside IAT
+    // Only skip CRT __main in main; callee externals (e.g. printf inside a stub) must not be dropped.
+    if *external_call_count == 1 && instr.offset >= main_x64_offset {
         return;
     }
 
@@ -1000,13 +1054,23 @@ fn emit_external_call(
     if in_callee && !in_main {
         let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
         let end = callee_end_for(instrs, entry, main_x64_offset);
-        if callee_has_add_30(instrs, entry, end) {
+        let import_name = iat_rva_for_instr(pe, imports, instr)
+            .and_then(|rva| pe.resolve_iat_target(imports, rva))
+            .map(|e| e.name.as_str());
+
+        if import_name.is_some_and(is_putchar_import)
+            || (import_name.is_none() && callee_has_add_30(instrs, entry, end))
+        {
+            if !callee_has_add_30(instrs, entry, end) {
+                bytecode.push(OpCode::Move as u8);
+                bytecode.push(0);
+                bytecode.push(1);
+            }
             emit_legacy_native_call(bytecode, 3, string_patch_positions, printf_literal);
+        } else if printf_literal.is_some() {
+            emit_legacy_native_call(bytecode, 1, string_patch_positions, printf_literal);
         } else {
-            bytecode.push(OpCode::Move as u8);
-            bytecode.push(0);
-            bytecode.push(1);
-            emit_legacy_native_call(bytecode, 3, string_patch_positions, printf_literal);
+            emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
         }
     } else if main_has_printf || printf_literal.is_some() {
         if printf_literal.is_some() {
@@ -1032,9 +1096,7 @@ fn fuse_load_operand(
             offset,
         } if *base == X64Reg::Rbp || *base == X64Reg::Ebp => {
             let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                let r = *next_stack_reg;
-                *next_stack_reg += 1;
-                r
+                alloc_stack_spill_reg(next_stack_reg)
             });
             Some((*dst, stack_reg))
         }
@@ -1234,9 +1296,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::MovMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(stack_reg);
@@ -1246,9 +1306,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::MovRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -1258,9 +1316,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::MovMemReg { base, offset, src } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(stack_reg);
@@ -1291,9 +1347,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::SubMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1316,9 +1370,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::AddMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1338,9 +1390,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::ImulRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::Mul as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -1364,9 +1414,7 @@ fn lift_to_vm_bytecode_internal(
             X64InstrKind::CmpMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1481,9 +1529,7 @@ fn lift_to_vm_bytecode_internal(
                     bytecode.push(base.to_vm_reg());
                 } else if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadByte as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -1676,9 +1722,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::MovMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(stack_reg);
@@ -1688,9 +1732,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::MovRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -1700,9 +1742,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::MovMemReg { base, offset, src } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::Move as u8);
                     bytecode.push(stack_reg);
@@ -1733,9 +1773,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::SubMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1758,9 +1796,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::AddMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1780,9 +1816,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::ImulRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::Mul as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -1806,9 +1840,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::CmpMemImm { base, offset, imm } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(15);
@@ -1909,23 +1941,42 @@ fn lift_to_vm_bytecode_internal_with_main(
                         &mut string_patch_positions,
                         &mut external_call_count,
                     );
+                } else if instr.offset >= main_x64_offset {
+                    let callee_end =
+                        callee_end_for(instrs, target_x64_offset, main_x64_offset);
+                    let hoisted = callee_stdio_import(
+                        instrs,
+                        pe,
+                        imports,
+                        target_x64_offset,
+                        callee_end,
+                    )
+                    .and_then(|(name, iat_rva)| {
+                        pe.resolve_iat_target(imports, iat_rva).and_then(|entry| {
+                            if imports.is_crt_startup(entry) {
+                                None
+                            } else {
+                                Some((name, iat_rva))
+                            }
+                        })
+                    });
+                    if let Some((name, iat_rva)) = hoisted {
+                        emit_iat_native_call(&mut bytecode, iat_rva, Some(name));
+                    } else {
+                        emit_internal_vm_call(
+                            &stack_map,
+                            target_x64_offset,
+                            &mut bytecode,
+                            &mut pending_jumps,
+                        );
+                    }
                 } else {
-                    let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
-
-                    for &reg in &active_stack_regs {
-                        bytecode.push(OpCode::Push as u8);
-                        bytecode.push(reg);
-                    }
-
-                    bytecode.push(OpCode::Call as u8);
-                    let placeholder_pos = bytecode.len();
-                    bytecode.extend_from_slice(&0u64.to_le_bytes());
-                    pending_jumps.push((placeholder_pos, target_x64_offset, false));
-
-                    for &reg in active_stack_regs.iter().rev() {
-                        bytecode.push(OpCode::Pop as u8);
-                        bytecode.push(reg);
-                    }
+                    emit_internal_vm_call(
+                        &stack_map,
+                        target_x64_offset,
+                        &mut bytecode,
+                        &mut pending_jumps,
+                    );
                 }
                 }
             }
@@ -1998,9 +2049,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                     bytecode.push(base.to_vm_reg());
                 } else if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
                     let stack_reg = *stack_map.entry(*offset).or_insert_with(|| {
-                        let r = next_stack_reg;
-                        next_stack_reg += 1;
-                        r
+                        alloc_stack_spill_reg(&mut next_stack_reg)
                     });
                     bytecode.push(OpCode::LoadByte as u8);
                     bytecode.push(dst.to_vm_reg());
@@ -2146,6 +2195,38 @@ mod tests {
             }
         }
         ids
+    }
+
+    #[test]
+    fn callee_printf_stub_emits_nc1_not_nc3() {
+        let callee = 0x300usize;
+        let main = 0x400usize;
+        let rel = (callee as i32) - (main as i32 + 5);
+        let instrs = vec![
+            call_at(callee, 0x1000),
+            ret_at(callee + 5),
+            call_at(main, rel),
+            ret_at(main + 5),
+        ];
+        let hello = b"Hello, World!\n";
+        let bc = lift_for_test(&instrs, main, Some(hello));
+        assert!(
+            native_call_ids(&bc).contains(&1),
+            "printf stub callee must emit nc1, got {:?}",
+            native_call_ids(&bc)
+        );
+        assert!(
+            !native_call_ids(&bc).contains(&3),
+            "printf stub must not emit putchar nc3"
+        );
+    }
+
+    #[test]
+    fn alloc_stack_spill_reg_never_exceeds_vm_max() {
+        let mut next = VM_STACK_SPILL_REG_FIRST;
+        let regs: Vec<u8> = (0..32).map(|_| alloc_stack_spill_reg(&mut next)).collect();
+        assert!(regs.iter().all(|&r| r <= VM_MAX_REG));
+        assert_eq!(regs.last().copied(), Some(VM_MAX_REG));
     }
 
     #[test]
