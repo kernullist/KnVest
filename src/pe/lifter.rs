@@ -997,7 +997,8 @@ fn emit_internal_vm_call(
     bytecode: &mut Vec<u8>,
     pending_jumps: &mut Vec<(usize, usize, bool)>,
 ) {
-    let active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
+    let mut active_stack_regs: Vec<u8> = stack_map.values().copied().collect();
+    active_stack_regs.sort_unstable();
     for &reg in &active_stack_regs {
         bytecode.push(OpCode::Push as u8);
         bytecode.push(reg);

@@ -542,20 +542,16 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
-        // win64 ABI args; ptr-flag puts mirrors nc_func1 (lea base + add r0 offset).
-        // Must not reload rcx after ptr add — jmp skips use_raw_r0's mov rcx.
-        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
-        self.jcc_rel32(0x84, "nc_iat_use_raw_r0"); // jz — putchar / integer in r0
-        self.lea_rip_rel32(0x48, 0, "bytecode"); // lea rax, [bytecode]
-        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov rcx, [rbp-0x80] offset
-        self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax (48 01 C1; NOT 49 01 D1 = add r9,rdx)
-        self.jmp_rel32("nc_iat_do_call");
-        self.label("nc_iat_use_raw_r0");
-        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov rcx, [rbp-0x80] char/int
-        self.label("nc_iat_do_call");
+        // win64 ABI args from VM r0..r3 before ptr test (2151211 putchar order); ptr adds base to rcx.
+        self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] — zero-extend char/offset
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
+        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
+        self.jcc_rel32(0x84, "nc_iat_call"); // jz — putchar / integer in rcx, no ptr reloc
+        self.lea_rip_rel32(0x48, 0, "bytecode"); // lea rax, [bytecode]
+        self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax (48 01 C1; NOT 49 01 D1 = add r9,rdx)
+        self.label("nc_iat_call");
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
@@ -756,8 +752,8 @@ mod tests {
     #[test]
     fn iat_native_call_maps_x64_rcx_from_vm_reg0() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
-        // nc_iat must load win64 rcx from VM r0 slot [rbp-0x80] (string/char arg)
-        let rcx_from_r0 = [0x48u8, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF];
+        // nc_iat must load win64 rcx from VM r0 slot [rbp-0x80] (zero-extended via mov ecx)
+        let rcx_from_r0 = [0x8Bu8, 0x8D, 0x80, 0xFF, 0xFF, 0xFF];
         assert!(
             stub.windows(rcx_from_r0.len()).any(|w| w == rcx_from_r0),
             "IAT path must map x64 rcx from VM register 0"
@@ -778,6 +774,8 @@ mod tests {
             "IAT ptr path must add bytecode base to rcx via rax (48 01 C1 add rcx,rax)"
         );
         // 49 01 D1 = add r9, rdx (wrong REX); 4C 01 D1 = add rcx, r10 (wrong reg for nc_func1 path)
+        let mov_r11d_eax = [0x41u8, 0x89, 0xC3];
+        let mov_ebx_r11d = [0x44u8, 0x89, 0xDB];
         for (name, pat) in [
             ("add_r9_rdx", [0x49u8, 0x01, 0xD1]),
             ("add_rcx_r10", [0x4Cu8, 0x01, 0xD1]),
@@ -787,15 +785,31 @@ mod tests {
                 "nc_iat must not emit {name} ({pat:02x?}) for ptr reloc"
             );
         }
-        // Ptr branch: add rcx,rax must be immediately followed by jmp over use_raw_r0
-        if let Some(add_at) = stub.windows(ptr_fixup.len()).position(|w| w == ptr_fixup) {
-            let after_add = add_at + ptr_fixup.len();
-            assert_eq!(
-                stub.get(after_add),
-                Some(&0xE9),
-                "after add rcx,rax ptr reloc must jmp to do_call (not fall through to mov rcx)"
-            );
-        }
+        // nc_iat: load rcx..r9 before test; ptr path lea rax + add rcx,rax (no rcx reload).
+        let nc_iat_off = stub
+            .windows(mov_r11d_eax.len())
+            .position(|w| w == mov_r11d_eax)
+            .expect("nc_iat mov r11d,eax");
+        let iat_load = [0x48u8, 0x8B, 0x18];
+        let after_mov_rbx = stub[nc_iat_off..]
+            .windows(iat_load.len())
+            .position(|w| w == iat_load)
+            .map(|p| nc_iat_off + p + iat_load.len())
+            .expect("mov rbx,[rax] in nc_iat");
+        let nc_iat_tail = &stub[after_mov_rbx..after_mov_rbx + 35];
+        assert!(
+            nc_iat_tail.starts_with(&rcx_from_r0),
+            "nc_iat must mov ecx from VM r0 before test (putchar path)"
+        );
+        let test_r11d = [0x41u8, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80];
+        let test_pos = nc_iat_tail
+            .windows(test_r11d.len())
+            .position(|w| w == test_r11d)
+            .expect("nc_iat test r11d");
+        assert_eq!(
+            test_pos, 27,
+            "nc_iat must load ecx,rdx,r8,r9 (27 bytes) before test r11d"
+        );
         let rcx_from_r1 = [0x48u8, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF];
         assert!(
             !stub.windows(rcx_from_r1.len()).any(|w| w == rcx_from_r1),
@@ -821,10 +835,7 @@ mod tests {
             !stub.windows(r9_from_stdout.len()).any(|w| w == r9_from_stdout),
             "IAT path must not load r9 from stdout slot [rbp-0xA0]"
         );
-        let iat_load = [0x48u8, 0x8B, 0x18]; // mov rbx, [rax]
         let iat_call = [0xFFu8, 0xD3]; // call rbx
-        let mov_r11d_eax = [0x41u8, 0x89, 0xC3];
-        let mov_ebx_r11d = [0x44u8, 0x89, 0xDB];
         let wrong_mov_r11d_ebx = [0x41u8, 0x89, 0xDB];
         assert!(
             stub.windows(iat_load.len()).any(|w| w == iat_load),
@@ -835,10 +846,6 @@ mod tests {
             "nc_iat must call through rbx (FF D3), not rax"
         );
         // Byte-exact nc_iat prologue: eax→r11d, then ebx←r11d (not reversed)
-        let nc_iat_off = stub
-            .windows(mov_r11d_eax.len())
-            .position(|w| w == mov_r11d_eax)
-            .expect("nc_iat mov r11d,eax");
         assert_eq!(
             &stub[nc_iat_off + mov_r11d_eax.len()..nc_iat_off + mov_r11d_eax.len() + mov_ebx_r11d.len()],
             mov_ebx_r11d,
