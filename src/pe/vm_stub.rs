@@ -15,7 +15,7 @@ use std::collections::HashMap;
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
 //   ret addrs      [rbp + depth*8 - 0x200]
-//   data stack     [rbp + idx*8 - 0x480]  (must not alias ret slots; fact needs 16+ pushes)
+//   data stack     [rbp + idx*8 - 0x380]  (idx 16 must stay below ret[0] at -0x200; fits 0x400 frame)
 pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
     let mut e = StubEmitter::new();
     e.emit_prologue_and_api_resolve();
@@ -97,7 +97,7 @@ impl StubEmitter {
     fn emit_prologue_and_api_resolve(&mut self) {
         self.emit(&[0x55]);
         self.emit(&[0x48, 0x89, 0xE5]);
-        self.emit(&[0x48, 0x81, 0xEC, 0x00, 0x03, 0x00, 0x00]);
+        self.emit(&[0x48, 0x81, 0xEC, 0x00, 0x04, 0x00, 0x00]);
         self.emit(&[0x48, 0x83, 0xE4, 0xF0]);
         // Zero L2 call depth [rbp-0xC8] and push depth [rbp-0xE8]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
@@ -347,7 +347,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFB, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
@@ -358,7 +358,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xCA]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFB, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
 
@@ -452,7 +452,7 @@ impl StubEmitter {
         self.jcc_rel32(0x84, "nc_func3");
 
         self.label("nc_func2");
-        self.emit(&[0x48, 0x8B, 0x45, 0x80]); // VM r0 at [rbp-0x80], not r2 at disp8 0x90
+        self.emit(&[0x48, 0x8B, 0x45, 0x90]); // VM r2 at [rbp-0x70] (disp8 0x90); lifter leaves int in r2
         self.emit(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x3D, 0x64, 0x00, 0x00, 0x00]);
         self.jcc_rel32(0x83, "nc_three_digit");
@@ -542,15 +542,19 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
-        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3 (disp32 = signed offset, not hex low byte)
-        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0 [rbp-0x80]
+        // win64 ABI args; ptr-flag puts mirrors nc_func1 (lea base + add r0 offset)
+        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
+        self.jcc_rel32(0x84, "nc_iat_nopr"); // jz — putchar / integer in r0, no ptr reloc
+        self.lea_rip_rel32(0x48, 0, "bytecode"); // lea rax, [bytecode]
+        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov rcx, [rbp-0x80] offset
+        self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax
+        self.jmp_rel32("nc_iat_args");
+        self.label("nc_iat_nopr");
+        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0 (char/int)
+        self.label("nc_iat_args");
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
-        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
-        self.jcc_rel32(0x84, "nc_iat_call"); // jz — putchar / integer arg, no ptr reloc
-        self.lea_rip_rel32(0x4C, 2, "bytecode"); // lea r10, [rip+bytecode]
-        self.emit(&[0x49, 0x01, 0xD1]); // add rcx, r10 — puts/printf ptr reloc only
         self.label("nc_iat_call");
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
@@ -768,10 +772,15 @@ mod tests {
             !stub.windows(rdx_wrong_gap.len()).any(|w| w == rdx_wrong_gap),
             "IAT rdx must not use 78 FF FF FF ([rbp-0x88] gap, not r1)"
         );
-        let ptr_fixup = [0x49u8, 0x01, 0xD1]; // add rcx, r10 after lea r10, [bytecode]
+        let ptr_fixup = [0x48u8, 0x01, 0xC1]; // add rcx, rax after lea rax,[bytecode] (nc_func1 style)
         assert!(
             stub.windows(ptr_fixup.len()).any(|w| w == ptr_fixup),
-            "IAT ptr path must add bytecode base to rcx via r10"
+            "IAT ptr path must add bytecode base to rcx via rax (add rcx,rax)"
+        );
+        let ptr_fixup_r10 = [0x49u8, 0x01, 0xD1];
+        assert!(
+            !stub.windows(ptr_fixup_r10.len()).any(|w| w == ptr_fixup_r10),
+            "IAT ptr path must not use add rcx,r10"
         );
         let rcx_from_r1 = [0x48u8, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -875,26 +884,30 @@ mod tests {
             stub.windows(call_depth.len()).filter(|w| *w == call_depth).count() >= 4,
             "h_call/h_ret must reference call depth [rbp-0xC8] (38 FF FF FF)"
         );
-        // nc2 must read VM r0, not r2 (disp8 0x90 = [rbp-0x70])
-        let nc2_from_r0 = [0x48u8, 0x8B, 0x45, 0x80];
+        // nc2 reads VM r2 (arith/loop/call/str leave printed int in r2 before nc2)
         let nc2_from_r2 = [0x48u8, 0x8B, 0x45, 0x90];
         assert!(
-            stub.windows(nc2_from_r0.len()).any(|w| w == nc2_from_r0),
-            "nc_func2 must load integer from VM r0 [rbp-0x80] (45 80)"
+            stub.windows(nc2_from_r2.len()).any(|w| w == nc2_from_r2),
+            "nc_func2 must load integer from VM r2 [rbp-0x70] (45 90)"
         );
-        assert!(
-            !stub.windows(nc2_from_r2.len()).any(|w| w == nc2_from_r2),
-            "nc_func2 must not load from VM r2 [rbp-0x70] (45 90)"
-        );
-        // fact(5) does 4 pushes × 4 recursive frames → push idx 16; old -0x280 base aliased ret[0]
-        let data_stack_disp = [0x80u8, 0xFB, 0xFF, 0xFF];
+        // fact(5): 4 pushes × 4 frames → idx 16 at [rbp-0x300]; ret[0] at [rbp-0x200]
+        let data_stack_disp = [0x80u8, 0xF6, 0xFF, 0xFF];
         assert!(
             stub.windows(data_stack_disp.len()).filter(|w| *w == data_stack_disp).count() >= 2,
-            "h_push/h_pop data stack must use [rbp-0x480] (80 FB FF FF)"
+            "h_push/h_pop data stack must use [rbp-0x380] (80 F6 FF FF)"
+        );
+        assert!(
+            !stub.windows(4).any(|w| w == [0x80, 0xFB, 0xFF, 0xFF]),
+            "data stack must not use [rbp-0x480] (out of frame)"
         );
         assert!(
             !stub.windows(4).any(|w| w == [0x80, 0xFD, 0xFF, 0xFF]),
-            "data stack must not use old [rbp-0x280] base (aliases ret stack at idx 16)"
+            "data stack must not use old [rbp-0x280] base (aliases ret at idx 16)"
+        );
+        let prologue_alloc = [0x48u8, 0x81, 0xEC, 0x00, 0x04, 0x00, 0x00];
+        assert!(
+            stub.windows(prologue_alloc.len()).any(|w| w == prologue_alloc),
+            "prologue must allocate >= 0x400 bytes for L2 frame including data stack"
         );
     }
 }
