@@ -542,20 +542,20 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
-        // win64 ABI args; ptr-flag puts mirrors nc_func1 (lea base + add r0 offset)
+        // win64 ABI args; ptr-flag puts mirrors nc_func1 (lea base + add r0 offset).
+        // Must not reload rcx after ptr add — jmp skips use_raw_r0's mov rcx.
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
-        self.jcc_rel32(0x84, "nc_iat_nopr"); // jz — putchar / integer in r0, no ptr reloc
+        self.jcc_rel32(0x84, "nc_iat_use_raw_r0"); // jz — putchar / integer in r0
         self.lea_rip_rel32(0x48, 0, "bytecode"); // lea rax, [bytecode]
         self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov rcx, [rbp-0x80] offset
-        self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax
-        self.jmp_rel32("nc_iat_args");
-        self.label("nc_iat_nopr");
-        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0 (char/int)
-        self.label("nc_iat_args");
+        self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax (48 01 C1; NOT 49 01 D1 = add r9,rdx)
+        self.jmp_rel32("nc_iat_do_call");
+        self.label("nc_iat_use_raw_r0");
+        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov rcx, [rbp-0x80] char/int
+        self.label("nc_iat_do_call");
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
-        self.label("nc_iat_call");
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
@@ -772,16 +772,30 @@ mod tests {
             !stub.windows(rdx_wrong_gap.len()).any(|w| w == rdx_wrong_gap),
             "IAT rdx must not use 78 FF FF FF ([rbp-0x88] gap, not r1)"
         );
-        let ptr_fixup = [0x48u8, 0x01, 0xC1]; // add rcx, rax after lea rax,[bytecode] (nc_func1 style)
+        let ptr_fixup = [0x48u8, 0x01, 0xC1]; // add rcx, rax after lea rax,[bytecode]
         assert!(
             stub.windows(ptr_fixup.len()).any(|w| w == ptr_fixup),
-            "IAT ptr path must add bytecode base to rcx via rax (add rcx,rax)"
+            "IAT ptr path must add bytecode base to rcx via rax (48 01 C1 add rcx,rax)"
         );
-        let ptr_fixup_r10 = [0x49u8, 0x01, 0xD1];
-        assert!(
-            !stub.windows(ptr_fixup_r10.len()).any(|w| w == ptr_fixup_r10),
-            "IAT ptr path must not use add rcx,r10"
-        );
+        // 49 01 D1 = add r9, rdx (wrong REX); 4C 01 D1 = add rcx, r10 (wrong reg for nc_func1 path)
+        for (name, pat) in [
+            ("add_r9_rdx", [0x49u8, 0x01, 0xD1]),
+            ("add_rcx_r10", [0x4Cu8, 0x01, 0xD1]),
+        ] {
+            assert!(
+                !stub.windows(pat.len()).any(|w| w == pat),
+                "nc_iat must not emit {name} ({pat:02x?}) for ptr reloc"
+            );
+        }
+        // Ptr branch: add rcx,rax must be immediately followed by jmp over use_raw_r0
+        if let Some(add_at) = stub.windows(ptr_fixup.len()).position(|w| w == ptr_fixup) {
+            let after_add = add_at + ptr_fixup.len();
+            assert_eq!(
+                stub.get(after_add),
+                Some(&0xE9),
+                "after add rcx,rax ptr reloc must jmp to do_call (not fall through to mov rcx)"
+            );
+        }
         let rcx_from_r1 = [0x48u8, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF];
         assert!(
             !stub.windows(rcx_from_r1.len()).any(|w| w == rcx_from_r1),
