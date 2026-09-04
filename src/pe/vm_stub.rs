@@ -300,14 +300,15 @@ impl StubEmitter {
         self.jmp_to_dispatch();
 
         self.label("h_cmp");
+        // MinGW nested uses 32-bit cmpl on stack locals; compare low dwords only.
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
-        self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
-        self.emit(&[0x9C]);
-        self.emit(&[0x58]);
+        self.emit(&[0x8B, 0x44, 0x8D, 0x80]); // mov eax, dword [rbp+rcx*8-0x80]
+        self.emit(&[0x3B, 0x44, 0xBD, 0x80]); // cmp eax, dword [rbp+rdi*8-0x80]
+        self.emit(&[0x9C]); // pushfq
+        self.emit(&[0x58]); // pop rax
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
         self.emit(&[0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
@@ -441,8 +442,8 @@ impl StubEmitter {
     }
 
     fn emit_push_flags_and_jcc(&mut self, jcc: u8) {
-        self.emit(&[0xFF, 0xB5, 0x70, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x9D]);
+        self.emit(&[0x48, 0xFF, 0xB5, 0x70, 0xFF, 0xFF, 0xFF]); // push qword [rbp-0x90]
+        self.emit(&[0x9D]); // popfq
         self.jcc_rel32(jcc, "jmpif_taken");
         self.jmp_rel32("jmpif_not_taken");
     }
@@ -568,9 +569,16 @@ impl StubEmitter {
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
         self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
         self.label("nc_iat_call");
+        // Preserve nested loop spill slots (VM r10..r12) across win64 shadow + putchar.
+        self.emit(&[0xFF, 0x75, 0xD0]); // push qword [rbp-0x30] (r10)
+        self.emit(&[0xFF, 0x75, 0xD8]); // push qword [rbp-0x28] (r11)
+        self.emit(&[0xFF, 0x75, 0xE0]); // push qword [rbp-0x20] (r12)
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
+        self.emit(&[0x8F, 0x45, 0xE0]); // pop qword [rbp-0x20] (r12)
+        self.emit(&[0x8F, 0x45, 0xD8]); // pop qword [rbp-0x28] (r11)
+        self.emit(&[0x8F, 0x45, 0xD0]); // pop qword [rbp-0x30] (r10)
         self.jmp_rel32("nc_done");
 
         self.label("nc_done");
@@ -943,6 +951,21 @@ mod tests {
         assert!(
             stub.windows(prologue_alloc.len()).any(|w| w == prologue_alloc),
             "prologue must allocate >= 0x400 bytes for L2 frame including data stack"
+        );
+        let dword_cmp = [0x8Bu8, 0x44, 0x8D, 0x80, 0x3B, 0x44, 0xBD, 0x80];
+        assert!(
+            stub.windows(dword_cmp.len()).any(|w| w == dword_cmp),
+            "h_cmp must use 32-bit dword compare (MinGW cmpl semantics)"
+        );
+        let spill_push_r10 = [0xFFu8, 0x75, 0xD0];
+        assert!(
+            stub.windows(spill_push_r10.len()).any(|w| w == spill_push_r10),
+            "nc_iat putchar must push VM r10 [rbp-0x30] before external call"
+        );
+        let jmpif_popfq = [0x48u8, 0xFF, 0xB5, 0x70, 0xFF, 0xFF, 0xFF, 0x9D];
+        assert!(
+            stub.windows(jmpif_popfq.len()).any(|w| w == jmpif_popfq),
+            "jmp_if must restore flags via push qword [rbp-0x90] + popfq"
         );
     }
 }

@@ -607,6 +607,71 @@ mod tests {
             ir.contains("and          | r"),
             "nested must u32-zero-extend before 32-bit imul:\n{ir}"
         );
+        // product<=9 must take single-digit path: cmp r12,9 then JLE (condition 5).
+        assert!(
+            ir.contains("cmp          | r12, r15"),
+            "nested must cmp product against 9:\n{ir}"
+        );
+        let product_cmp = bc
+            .windows(3)
+            .position(|w| w == [OpCode::Cmp as u8, 12, 15])
+            .expect("nested bytecode must contain cmp r12,r15");
+        assert_eq!(
+            bc.get(product_cmp + 3),
+            Some(&(OpCode::JmpIf as u8)),
+            "cmp r12,r15 must be followed by jmp_if"
+        );
+        assert_eq!(
+            bc.get(product_cmp + 4),
+            Some(&5u8),
+            "nested product branch must be jmp_if JLE (5), not JG"
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_nested_stdout_matches_unpacked() {
+        use crate::pe::imports::native_call_iat_id;
+        use crate::vm::VirtualMachine;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        let pe_path = Path::new("sample/nested.exe");
+        if !pe_path.exists() {
+            return;
+        }
+
+        const GOLDEN: &[u8] = b"1x1=1\r\n1x2=2\r\n1x3=3\r\n2x1=2\r\n2x2=4\r\n2x3=6\r\n3x1=3\r\n3x2=6\r\n3x3=9\r\n";
+
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+
+        static OUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+        OUT.lock().unwrap().clear();
+
+        fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let ch = vm.get_register(0)? as u8;
+            let mut out = OUT.lock().unwrap();
+            if ch == b'\n' {
+                out.extend_from_slice(b"\r\n");
+            } else {
+                out.push(ch);
+            }
+            Ok(())
+        }
+
+        let putchar_id = native_call_iat_id(0x8260);
+        let mut vm = VirtualMachine::new(bc);
+        vm.register_native(putchar_id, putchar_native);
+        vm.register_native(3, putchar_native);
+        vm.run().expect("nested VM run");
+
+        let out = OUT.lock().unwrap().clone();
+        assert_eq!(
+            out.as_slice(),
+            GOLDEN,
+            "packed nested stdout must match unpacked golden (got {:?})",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     #[test]
