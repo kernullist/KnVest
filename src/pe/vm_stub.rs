@@ -14,9 +14,9 @@ use std::collections::HashMap;
 //   bytes written  [rbp-0xD0]  bytes 30 FF FF FF  (WriteFile out; do not clobber)
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
-//   nc_iat spill   [rbp-0x1E8..-0x1D8]          (VM r10..r12 save across IAT call)
-//   ret addrs      [rbp + depth*8 - 0x200]
-//   data stack     [rbp + idx*8 - 0x380]  (idx 16 must stay below ret[0] at -0x200; fits 0x400 frame)
+//   ret addrs      [rbp + depth*8 - 0x200]       (depth 3 → -0x1E8; must not use for scratch)
+//   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
+//   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
 pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
     let mut e = StubEmitter::new();
     e.emit_prologue_and_api_resolve();
@@ -98,7 +98,7 @@ impl StubEmitter {
     fn emit_prologue_and_api_resolve(&mut self) {
         self.emit(&[0x55]);
         self.emit(&[0x48, 0x89, 0xE5]);
-        self.emit(&[0x48, 0x81, 0xEC, 0x00, 0x04, 0x00, 0x00]);
+        self.emit(&[0x48, 0x81, 0xEC, 0x20, 0x05, 0x00, 0x00]); // sub rsp, 0x520 (frame incl. nc_iat scratch)
         self.emit(&[0x48, 0x83, 0xE4, 0xF0]);
         // Zero L2 call depth [rbp-0xC8] and push depth [rbp-0xE8]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
@@ -582,22 +582,21 @@ impl StubEmitter {
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
         self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
         self.label("nc_iat_call");
-        // Preserve VM r10..r12 in frame scratch (not CPU stack — CRT may clobber stack
-        // above shadow space across repeated putchar calls; not r12–r14 — IAT path).
+        // Preserve VM r10..r12 in frame scratch below ret/data stacks (not [-0x200,-0x80]).
         self.emit(&[0x48, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x30] VM r10
-        self.emit(&[0x48, 0x89, 0x85, 0xE8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x1E8], rax
+        self.emit(&[0x48, 0x89, 0x85, 0x00, 0xFD, 0xFF, 0xFF]); // mov [rbp-0x500], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xD8, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x28] VM r11
-        self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x1E0], rax
+        self.emit(&[0x48, 0x89, 0x85, 0x08, 0xFD, 0xFF, 0xFF]); // mov [rbp-0x508], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x20] VM r12
-        self.emit(&[0x48, 0x89, 0x85, 0xD8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x1D8], rax
+        self.emit(&[0x48, 0x89, 0x85, 0x10, 0xFD, 0xFF, 0xFF]); // mov [rbp-0x510], rax
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
-        self.emit(&[0x48, 0x8B, 0x85, 0xD8, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp-0x1D8]
+        self.emit(&[0x48, 0x8B, 0x85, 0x10, 0xFD, 0xFF, 0xFF]); // mov rax, [rbp-0x510]
         self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x20], rax
-        self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp-0x1E0]
+        self.emit(&[0x48, 0x8B, 0x85, 0x08, 0xFD, 0xFF, 0xFF]); // mov rax, [rbp-0x508]
         self.emit(&[0x48, 0x89, 0x85, 0xD8, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x28], rax
-        self.emit(&[0x48, 0x8B, 0x85, 0xE8, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp-0x1E8]
+        self.emit(&[0x48, 0x8B, 0x85, 0x00, 0xFD, 0xFF, 0xFF]); // mov rax, [rbp-0x500]
         self.emit(&[0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x30], rax
         self.jmp_rel32("nc_done");
 
@@ -968,10 +967,10 @@ mod tests {
             !stub.windows(4).any(|w| w == [0x80, 0xFD, 0xFF, 0xFF]),
             "data stack must not use old [rbp-0x280] base (aliases ret at idx 16)"
         );
-        let prologue_alloc = [0x48u8, 0x81, 0xEC, 0x00, 0x04, 0x00, 0x00];
+        let prologue_alloc = [0x48u8, 0x81, 0xEC, 0x20, 0x05, 0x00, 0x00];
         assert!(
             stub.windows(prologue_alloc.len()).any(|w| w == prologue_alloc),
-            "prologue must allocate >= 0x400 bytes for L2 frame including data stack"
+            "prologue must allocate >= 0x520 bytes (ret/data/nc_iat scratch)"
         );
         let qword_cmp = [0x48u8, 0x8B, 0x44, 0xCD, 0x80, 0x48, 0x3B, 0x44, 0xFD, 0x80];
         assert!(
@@ -983,12 +982,12 @@ mod tests {
             stub.windows(dword_cmp32.len()).any(|w| w == dword_cmp32),
             "h_cmp32 must use 32-bit dword compare for nested u32 cmpl"
         );
-        let spill_save_r10 = [0x48u8, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xE8, 0xFE, 0xFF, 0xFF];
+        let spill_save_r10 = [0x48u8, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0x00, 0xFD, 0xFF, 0xFF];
         assert!(
             stub.windows(spill_save_r10.len()).any(|w| w == spill_save_r10),
-            "nc_iat_call must save VM r10 to frame scratch [rbp-0x1E8] before external call"
+            "nc_iat_call must save VM r10 to frame scratch [rbp-0x500] before external call"
         );
-        let spill_restore_r10 = [0x48u8, 0x8B, 0x85, 0xE8, 0xFE, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF];
+        let spill_restore_r10 = [0x48u8, 0x8B, 0x85, 0x00, 0xFD, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF];
         assert!(
             stub.windows(spill_restore_r10.len()).any(|w| w == spill_restore_r10),
             "nc_iat_call must restore VM r10 from frame scratch after external call"
@@ -998,6 +997,35 @@ mod tests {
                 && !stub.windows(3).any(|w| w == [0x8F, 0x45, 0xD0]),
             "nc_iat_call must not spill VM regs on CPU stack (CRT clobbers above shadow)"
         );
+        // nc_iat scratch must not alias ret stack [-0x200..] or VM regs [-0x80..].
+        let scratch_disps: [[u8; 4]; 3] = [
+            [0x00, 0xFD, 0xFF, 0xFF], // -0x500
+            [0x08, 0xFD, 0xFF, 0xFF], // -0x508
+            [0x10, 0xFD, 0xFF, 0xFF], // -0x510
+        ];
+        for disp in scratch_disps {
+            assert!(
+                stub.windows(7)
+                    .any(|w| w[0] == 0x48 && (w[1] == 0x89 || w[1] == 0x8B) && w[2] == 0x85 && w[3..7] == disp),
+                "nc_iat scratch must use [rbp-0x500..-0x510], missing disp {disp:02x?}"
+            );
+        }
+        let ret_stack_band: [[u8; 4]; 3] = [
+            [0xE8, 0xFE, 0xFF, 0xFF], // -0x1E8 depth 3
+            [0xE0, 0xFE, 0xFF, 0xFF], // -0x1E0 depth 4
+            [0xD8, 0xFE, 0xFF, 0xFF], // -0x1D8 depth 5
+        ];
+        for bad in ret_stack_band {
+            assert!(
+                !stub.windows(7).any(|w| {
+                    w[0] == 0x48
+                        && (w[1] == 0x89 || w[1] == 0x8B)
+                        && w[2] == 0x85
+                        && w[3..7] == bad
+                }),
+                "nc_iat scratch must not use ret-stack band disp {bad:02x?} ([rbp-0x200..-0x80])"
+            );
+        }
         // nc_iat resolve sequence must stay intact (no r12–r14 spill in prologue).
         let iat_resolve = [
             0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // PEB
