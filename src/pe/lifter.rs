@@ -1017,7 +1017,6 @@ fn emit_legacy_native_call(
     func_id: u64,
     string_patch_positions: &mut Vec<usize>,
     printf_literal: Option<&[u8]>,
-    nc2_int_vm_reg: Option<u8>,
 ) {
     if func_id == 1 {
         if let Some(str_bytes) = printf_literal {
@@ -1028,13 +1027,6 @@ fn emit_legacy_native_call(
             bytecode.push(OpCode::LoadImm as u8);
             bytecode.push(1);
             bytecode.extend_from_slice(&(str_bytes.len() as u64).to_le_bytes());
-        }
-    }
-    if func_id == 2 {
-        if let Some(reg) = nc2_int_vm_reg {
-            bytecode.push(OpCode::Move as u8);
-            bytecode.push(2);
-            bytecode.push(reg);
         }
     }
     bytecode.push(OpCode::NativeCall as u8);
@@ -1098,27 +1090,20 @@ fn emit_external_call(
                 bytecode.push(0);
                 bytecode.push(1);
             }
-            emit_legacy_native_call(bytecode, 3, string_patch_positions, printf_literal, None);
+            emit_legacy_native_call(bytecode, 3, string_patch_positions, printf_literal);
         } else if printf_literal.is_some() {
-            emit_legacy_native_call(bytecode, 1, string_patch_positions, printf_literal, None);
+            emit_legacy_native_call(bytecode, 1, string_patch_positions, printf_literal);
         } else {
-            let saved_int = callee_saved_printf_int_vm_reg(instrs, entry, end);
-            emit_legacy_native_call(
-                bytecode,
-                2,
-                string_patch_positions,
-                printf_literal,
-                saved_int,
-            );
+            emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
         }
     } else if main_has_printf || printf_literal.is_some() {
         if printf_literal.is_some() {
-            emit_legacy_native_call(bytecode, 1, string_patch_positions, printf_literal, None);
+            emit_legacy_native_call(bytecode, 1, string_patch_positions, printf_literal);
         } else {
-            emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal, None);
+            emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
         }
     } else if in_main {
-        emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal, None);
+        emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
     }
 }
 
@@ -1147,12 +1132,14 @@ fn try_fuse_index_base_mov_pair(
     instrs: &[X64Instruction],
     lift_indices: &[usize],
     pos: usize,
+    main_x64_offset: usize,
     stack_map: &mut std::collections::HashMap<i32, u8>,
     next_stack_reg: &mut u8,
     bytecode: &mut Vec<u8>,
 ) -> Option<usize> {
     let idx = lift_indices[pos];
-    let (dst, index_vm) = fuse_load_operand(&instrs[idx].kind, stack_map, next_stack_reg)?;
+    let instr = &instrs[idx];
+    let (dst, index_vm) = fuse_load_operand(&instr.kind, stack_map, next_stack_reg)?;
 
     let mut next_pos = pos + 1;
     while next_pos < lift_indices.len() {
@@ -1165,9 +1152,28 @@ fn try_fuse_index_base_mov_pair(
     if next_pos >= lift_indices.len() {
         return None;
     }
-    let (dst2, base_vm) = fuse_load_operand(&instrs[lift_indices[next_pos]].kind, stack_map, next_stack_reg)?;
+    let next_instr = &instrs[lift_indices[next_pos]];
+    let (dst2, base_vm) = fuse_load_operand(&next_instr.kind, stack_map, next_stack_reg)?;
     if dst.to_vm_reg() != dst2.to_vm_reg() || index_vm == base_vm {
         return None;
+    }
+
+    // MinGW printf wrappers save rdx then clobber the spill with r8/r9 shuffles. Fusing
+    // `mov r15,rdx; mov r15,r8` into `mov r15,r8; add r15,r15,r2` breaks nc2 (r2 must
+    // keep the caller's integer through the stub).
+    if instr.offset < main_x64_offset {
+        let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+        let end = callee_end_for(instrs, entry, main_x64_offset);
+        if callee_saved_printf_int_vm_reg(instrs, entry, end).is_some()
+            && matches!(
+                &instr.kind,
+                X64InstrKind::MovRegReg { src, .. }
+                    if matches!(src, X64Reg::Rdx | X64Reg::Edx)
+            )
+            && skip_printf_stub_arg_shuffle(next_instr, instrs, entry, end)
+        {
+            return None;
+        }
     }
 
     let mut end_pos = next_pos;
@@ -1249,22 +1255,29 @@ fn skip_printf_stub_arg_shuffle(
     entry: usize,
     end: usize,
 ) -> bool {
-    let Some(saved_int) = callee_saved_printf_int_vm_reg(instrs, entry, end) else {
+    if callee_saved_printf_int_vm_reg(instrs, entry, end).is_none() {
         return false;
-    };
+    }
     match &instr.kind {
-        X64InstrKind::MovRegReg { dst, src } => {
-            let dst_vm = dst.to_vm_reg();
-            let src_vm = src.to_vm_reg();
-            if dst_vm == saved_int && (src_vm == 8 || src_vm == 9) {
-                return true;
-            }
-            // `mov rdx, rax` / `mov r2, r0` restoring format into the nc2 value slot.
-            if dst_vm == 2 && matches!(src, X64Reg::Rax | X64Reg::Eax | X64Reg::Rcx | X64Reg::Ecx) {
-                return true;
-            }
-            false
-        }
+        X64InstrKind::MovRegReg { dst, src } => matches!(
+            (dst, src),
+            (X64Reg::R15, X64Reg::R8)
+                | (X64Reg::R15, X64Reg::R9)
+                | (X64Reg::R14, X64Reg::R8)
+                | (X64Reg::R14, X64Reg::R9)
+                | (X64Reg::Rdx, X64Reg::Rax)
+                | (X64Reg::Rdx, X64Reg::Eax)
+                | (X64Reg::Rdx, X64Reg::Rcx)
+                | (X64Reg::Rdx, X64Reg::Ecx)
+                | (X64Reg::Rdx, X64Reg::R14)
+                | (X64Reg::Rdx, X64Reg::R15)
+                | (X64Reg::Edx, X64Reg::Rax)
+                | (X64Reg::Edx, X64Reg::Eax)
+                | (X64Reg::Edx, X64Reg::Rcx)
+                | (X64Reg::Edx, X64Reg::Ecx)
+                | (X64Reg::Edx, X64Reg::R14)
+                | (X64Reg::Edx, X64Reg::R15)
+        ),
         _ => false,
     }
 }
@@ -1758,6 +1771,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             instrs,
             &lift_indices,
             pos,
+            main_x64_offset,
             &mut stack_map,
             &mut next_stack_reg,
             &mut bytecode,
@@ -2528,6 +2542,44 @@ mod tests {
     }
 
     #[test]
+    fn mingw_printf_stub_shuffle_detection() {
+        let stub = 0x300usize;
+        let main = 0x500usize;
+        let mov = |o, d, s| X64Instruction {
+            offset: o,
+            bytes: vec![0x48, 0x89, 0xC0],
+            kind: X64InstrKind::MovRegReg { dst: d, src: s },
+        };
+        let instrs = vec![
+            X64Instruction {
+                offset: stub,
+                bytes: vec![0x55],
+                kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+            },
+            mov(stub + 1, X64Reg::R14, X64Reg::Rcx),
+            mov(stub + 4, X64Reg::R15, X64Reg::Rdx),
+            mov(stub + 7, X64Reg::R15, X64Reg::R8),
+            mov(stub + 19, X64Reg::Rdx, X64Reg::Rax),
+        ];
+        assert_eq!(
+            super::callee_saved_printf_int_vm_reg(&instrs, stub, main),
+            Some(15)
+        );
+        assert!(super::skip_printf_stub_arg_shuffle(
+            &instrs[3],
+            &instrs,
+            stub,
+            main
+        ));
+        assert!(super::skip_printf_stub_arg_shuffle(
+            &instrs[4],
+            &instrs,
+            stub,
+            main
+        ));
+    }
+
+    #[test]
     fn mingw_printf_stub_restores_int_to_r2_before_nc2() {
         let stub = 0x300usize;
         let main = 0x500usize;
@@ -2577,20 +2629,105 @@ mod tests {
         let nc_pos = bc
             .windows(9)
             .enumerate()
-            .find(|(_, w)| w[0] == OpCode::NativeCall as u8 && u64::from_le_bytes(w[1..9].try_into().unwrap()) == 2)
+            .find(|(_, w)| {
+                w[0] == OpCode::NativeCall as u8
+                    && u64::from_le_bytes(w[1..9].try_into().unwrap()) == 2
+            })
             .map(|(i, _)| i)
             .expect("nc2");
         assert!(
-            nc_pos >= 3
-                && bc[nc_pos - 3] == OpCode::Move as u8
-                && bc[nc_pos - 2] == 2
-                && bc[nc_pos - 1] == 15,
-            "nc2 must be preceded by move r2, r15 (saved int), got {:?}",
-            &bc[nc_pos.saturating_sub(6)..nc_pos + 2]
+            !bc.windows(3).any(|w| w[0] == OpCode::Move as u8 && w[1] == 15 && w[2] == 8),
+            "must not lift r15<-r8 shuffle"
         );
         assert!(
             !bc.windows(3).any(|w| w[0] == OpCode::Move as u8 && w[1] == 2 && w[2] == 0),
-            "nc2 must not load format offset into r2 via move r2, r0"
+            "must not load format offset into r2 before nc2"
+        );
+        assert!(
+            bc.windows(3).any(|w| w[0] == OpCode::Move as u8 && w[1] == 15 && w[2] == 2),
+            "must preserve int save mov r15, r2"
+        );
+        let before_nc = &bc[..nc_pos];
+        assert!(
+            before_nc
+                .windows(10)
+                .any(|w| w[0] == OpCode::LoadImm as u8 && w[1] == 2 && w[2] == 35),
+            "main must load computed int into r2"
+        );
+        assert!(
+            !before_nc.windows(3).any(|w| {
+                w[0] == OpCode::Move as u8 && w[1] == 2
+                    || (w[0] == OpCode::Add as u8 && w[1] == 2)
+            }),
+            "stub must not clobber r2 before nc2"
+        );
+    }
+
+    #[test]
+    fn mingw_arith_main_load_imm_format_calls_printf_stub() {
+        let stub = 0x300usize;
+        let main = 0x500usize;
+        let rel = (stub as i32) - (main as i32 + 5);
+        let instrs = vec![
+            X64Instruction {
+                offset: stub,
+                bytes: vec![0x55],
+                kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+            },
+            mov_rr(stub + 1, X64Reg::R14, X64Reg::Rcx),
+            mov_rr(stub + 4, X64Reg::R15, X64Reg::Rdx),
+            mov_rr(stub + 7, X64Reg::R15, X64Reg::R8),
+            mov_rr(stub + 10, X64Reg::R15, X64Reg::R9),
+            mov_rr(stub + 13, X64Reg::Rax, X64Reg::R14),
+            mov_rr(stub + 16, X64Reg::Rdx, X64Reg::Rax),
+            call_at(stub + 19, 0x1000),
+            ret_at(stub + 24),
+            X64Instruction {
+                offset: main,
+                bytes: vec![0x55],
+                kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+            },
+            X64Instruction {
+                offset: main + 1,
+                bytes: vec![0xBA, 0x23, 0, 0, 0],
+                kind: X64InstrKind::MovRegImm {
+                    reg: X64Reg::Edx,
+                    imm: 35,
+                },
+            },
+            X64Instruction {
+                offset: main + 6,
+                bytes: vec![0xB8, 0xF0, 0, 0, 0],
+                kind: X64InstrKind::MovRegImm {
+                    reg: X64Reg::Eax,
+                    imm: 0xF0,
+                },
+            },
+            mov_rr(main + 11, X64Reg::Rcx, X64Reg::Rax),
+            call_at(main + 14, rel),
+            ret_at(main + 19),
+        ];
+        let bc = lift_for_test(&instrs, main, None);
+        assert_eq!(native_call_ids(&bc), vec![2]);
+        let nc_pos = bc
+            .windows(9)
+            .enumerate()
+            .find(|(_, w)| {
+                w[0] == OpCode::NativeCall as u8
+                    && u64::from_le_bytes(w[1..9].try_into().unwrap()) == 2
+            })
+            .map(|(i, _)| i)
+            .expect("nc2");
+        let before_nc = &bc[..nc_pos];
+        assert!(
+            before_nc
+                .windows(10)
+                .any(|w| w[0] == OpCode::LoadImm as u8 && w[1] == 2 && w[2] == 35),
+            "computed int must remain in r2 through stub"
+        );
+        assert!(
+            !before_nc.windows(3).any(|w| w[0] == OpCode::Move as u8 && w[1] == 2),
+            "format offset must not be moved into r2"
         );
     }
 
