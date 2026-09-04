@@ -624,6 +624,24 @@ mod tests {
             Some(&(OpCode::Jmp as u8)),
             "cmp32 r12,r15 must be followed by jmp to single-digit path"
         );
+        let jle_after_product_nine = bc
+            .windows(13)
+            .position(|w| {
+                w[0] == OpCode::LoadImm as u8
+                    && w[1] == 15
+                    && u64::from_le_bytes(w[2..10].try_into().unwrap()) == 9
+                    && w[10] == OpCode::Cmp32 as u8
+                    && w[11] == 12
+                    && w[12] == 15
+            })
+            .and_then(|p| {
+                let after = p + 13;
+                (after < bc.len() && bc[after] == OpCode::JmpIf as u8).then_some(after)
+            });
+        assert!(
+            jle_after_product_nine.is_none(),
+            "product<=9 must not use jmp_if JLE into two-digit path"
+        );
     }
 
     fn register_packed_putchar_natives(

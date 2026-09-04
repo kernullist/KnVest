@@ -14,6 +14,7 @@ use std::collections::HashMap;
 //   bytes written  [rbp-0xD0]  bytes 30 FF FF FF  (WriteFile out; do not clobber)
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
+//   nc_iat spill   [rbp-0x1E8..-0x1D8]          (VM r10..r12 save across IAT call)
 //   ret addrs      [rbp + depth*8 - 0x200]
 //   data stack     [rbp + idx*8 - 0x380]  (idx 16 must stay below ret[0] at -0x200; fits 0x400 frame)
 pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
@@ -581,17 +582,23 @@ impl StubEmitter {
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
         self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
         self.label("nc_iat_call");
-        // Preserve VM r10..r12 on the CPU stack (full qword); do not use r12–r14 here
-        // (nc_iat already uses rax/rbx/r11 for IAT resolve and win64 args).
-        self.emit(&[0xFF, 0x75, 0xD0]); // push qword [rbp-0x30] VM r10
-        self.emit(&[0xFF, 0x75, 0xD8]); // push qword [rbp-0x28] VM r11
-        self.emit(&[0xFF, 0x75, 0xE0]); // push qword [rbp-0x20] VM r12
+        // Preserve VM r10..r12 in frame scratch (not CPU stack — CRT may clobber stack
+        // above shadow space across repeated putchar calls; not r12–r14 — IAT path).
+        self.emit(&[0x48, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x30] VM r10
+        self.emit(&[0x48, 0x89, 0x85, 0xE8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x1E8], rax
+        self.emit(&[0x48, 0x8B, 0x85, 0xD8, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x28] VM r11
+        self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x1E0], rax
+        self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x20] VM r12
+        self.emit(&[0x48, 0x89, 0x85, 0xD8, 0xFE, 0xFF, 0xFF]); // mov [rbp-0x1D8], rax
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
-        self.emit(&[0x8F, 0x45, 0xE0]); // pop qword [rbp-0x20] VM r12
-        self.emit(&[0x8F, 0x45, 0xD8]); // pop qword [rbp-0x28] VM r11
-        self.emit(&[0x8F, 0x45, 0xD0]); // pop qword [rbp-0x30] VM r10
+        self.emit(&[0x48, 0x8B, 0x85, 0xD8, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp-0x1D8]
+        self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x20], rax
+        self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp-0x1E0]
+        self.emit(&[0x48, 0x89, 0x85, 0xD8, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x28], rax
+        self.emit(&[0x48, 0x8B, 0x85, 0xE8, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp-0x1E8]
+        self.emit(&[0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x30], rax
         self.jmp_rel32("nc_done");
 
         self.label("nc_done");
@@ -976,15 +983,20 @@ mod tests {
             stub.windows(dword_cmp32.len()).any(|w| w == dword_cmp32),
             "h_cmp32 must use 32-bit dword compare for nested u32 cmpl"
         );
-        let spill_push_r10 = [0xFFu8, 0x75, 0xD0];
+        let spill_save_r10 = [0x48u8, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xE8, 0xFE, 0xFF, 0xFF];
         assert!(
-            stub.windows(spill_push_r10.len()).any(|w| w == spill_push_r10),
-            "nc_iat_call must push VM r10 slot before external call"
+            stub.windows(spill_save_r10.len()).any(|w| w == spill_save_r10),
+            "nc_iat_call must save VM r10 to frame scratch [rbp-0x1E8] before external call"
         );
-        let spill_pop_r10 = [0x8Fu8, 0x45, 0xD0];
+        let spill_restore_r10 = [0x48u8, 0x8B, 0x85, 0xE8, 0xFE, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF];
         assert!(
-            stub.windows(spill_pop_r10.len()).any(|w| w == spill_pop_r10),
-            "nc_iat_call must pop VM r10 slot after external call"
+            stub.windows(spill_restore_r10.len()).any(|w| w == spill_restore_r10),
+            "nc_iat_call must restore VM r10 from frame scratch after external call"
+        );
+        assert!(
+            !stub.windows(3).any(|w| w == [0xFF, 0x75, 0xD0])
+                && !stub.windows(3).any(|w| w == [0x8F, 0x45, 0xD0]),
+            "nc_iat_call must not spill VM regs on CPU stack (CRT clobbers above shadow)"
         );
         // nc_iat resolve sequence must stay intact (no r12–r14 spill in prologue).
         let iat_resolve = [
