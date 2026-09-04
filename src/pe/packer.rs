@@ -149,8 +149,8 @@ fn translate_to_vm_bytecode(
 
 fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
     const NEEDLES: &[&[u8]] = &[
-        b"IAT puts hello\n",
         b"IAT puts hello\0",
+        b"IAT puts hello\n",
         b"Hello, World!\n",
         b"Hello, World!",
     ];

@@ -518,7 +518,7 @@ impl StubEmitter {
         self.jmp_rel32("nc_done");
 
         self.label("nc_iat");
-        // rax = func_id; ebx = iat_rva (low 31 bits); r11d = low dword (ptr flag in bit 31)
+        // rax = func_id; ebx = iat_rva; r11d = low dword (ptr flag in bit 31)
         self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
         self.emit(&[0x41, 0x89, 0xDB]); // mov ebx, r11d
         self.emit(&[0x81, 0xE3, 0xFF, 0xFF, 0xFF, 0x7F]); // and ebx, 0x7fffffff
@@ -526,15 +526,15 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x00]); // resolved import -> rax
-        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3 (matches nc1/nc3 string/char in r0)
+        // win64 ABI: rcx, rdx, r8, r9 from VM r0..r3 (matches nc1/nc3 and 75ebd99 layout)
         self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0
         self.emit(&[0x48, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1
         self.emit(&[0x4C, 0x8B, 0x85, 0x70, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2
-        self.emit(&[0x4C, 0x8B, 0x8D, 0x68, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3
+        self.emit(&[0x4C, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]); // r9  <- VM r4 slot (75ebd99)
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
         self.jcc_rel32(0x84, "nc_iat_call"); // jz — putchar / integer arg, no ptr reloc
-        self.lea_rip_rel32(0x48, 3, "bytecode"); // lea rbx, [rip+bytecode]
-        self.emit(&[0x48, 0x01, 0xD9]); // add rcx, rbx (puts/printf string only)
+        self.lea_rip_rel32(0x4C, 2, "bytecode"); // lea r10, [rip+bytecode] (keep ebx free)
+        self.emit(&[0x49, 0x01, 0xD1]); // add rcx, r10
         self.label("nc_iat_call");
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD0]);
@@ -706,10 +706,10 @@ mod tests {
             stub.windows(rdx_from_r1.len()).any(|w| w == rdx_from_r1),
             "IAT path must map x64 rdx from VM register 1"
         );
-        let ptr_fixup = [0x48u8, 0x01, 0xD9]; // add rcx, rbx after lea rbx, [bytecode]
+        let ptr_fixup = [0x49u8, 0x01, 0xD1]; // add rcx, r10 after lea r10, [bytecode]
         assert!(
             stub.windows(ptr_fixup.len()).any(|w| w == ptr_fixup),
-            "IAT ptr path must add bytecode base to rcx only"
+            "IAT ptr path must add bytecode base to rcx via r10"
         );
         let rcx_from_r1 = [0x48u8, 0x8B, 0x8D, 0x78, 0xFF, 0xFF, 0xFF];
         assert!(
