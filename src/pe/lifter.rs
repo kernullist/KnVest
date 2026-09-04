@@ -912,8 +912,26 @@ fn callee_stdio_import<'a>(
     None
 }
 
-fn emit_iat_native_call(bytecode: &mut Vec<u8>, iat_rva: u32, import_name: Option<&str>) {
-    let id = if import_name.is_some_and(is_stdio_ptr_import) {
+fn emit_iat_native_call(
+    bytecode: &mut Vec<u8>,
+    iat_rva: u32,
+    import_name: Option<&str>,
+    printf_literal: Option<&[u8]>,
+    string_patch_positions: &mut Vec<usize>,
+) {
+    let is_ptr = import_name.is_some_and(is_stdio_ptr_import);
+    if is_ptr && printf_literal.is_some() {
+        bytecode.push(OpCode::LoadImm as u8);
+        bytecode.push(0);
+        string_patch_positions.push(bytecode.len());
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
+    } else if import_name.is_some_and(is_putchar_import) {
+        // win64 rcx = VM r1 after sign-ext; stub loads VM r0 — mirror legacy nc3.
+        bytecode.push(OpCode::Move as u8);
+        bytecode.push(0);
+        bytecode.push(1);
+    }
+    let id = if is_ptr {
         native_call_iat_ptr_id(iat_rva)
     } else {
         native_call_iat_id(iat_rva)
@@ -1037,7 +1055,13 @@ fn emit_external_call(
         let skip = entry.map(|e| imports.is_crt_startup(e)).unwrap_or(false);
         if !skip {
             let name = entry.map(|e| e.name.as_str());
-            emit_iat_native_call(bytecode, iat_rva, name);
+            emit_iat_native_call(
+                bytecode,
+                iat_rva,
+                name,
+                printf_literal,
+                string_patch_positions,
+            );
         }
         return;
     }
@@ -1900,7 +1924,13 @@ fn lift_to_vm_bytecode_internal_with_main(
                         // CRT startup — skip
                     } else {
                         let name = entry.map(|e| e.name.as_str());
-                        emit_iat_native_call(&mut bytecode, iat_rva, name);
+                        emit_iat_native_call(
+                            &mut bytecode,
+                            iat_rva,
+                            name,
+                            printf_literal,
+                            &mut string_patch_positions,
+                        );
                     }
                 } else if is_non_liftable_target(pe, imports, raw_target) {
                     emit_external_call(
@@ -1961,7 +1991,13 @@ fn lift_to_vm_bytecode_internal_with_main(
                         })
                     });
                     if let Some((name, iat_rva)) = hoisted {
-                        emit_iat_native_call(&mut bytecode, iat_rva, Some(name));
+                        emit_iat_native_call(
+                            &mut bytecode,
+                            iat_rva,
+                            Some(name),
+                            printf_literal,
+                            &mut string_patch_positions,
+                        );
                     } else {
                         emit_internal_vm_call(
                             &stack_map,
@@ -2015,11 +2051,17 @@ fn lift_to_vm_bytecode_internal_with_main(
                 bytecode.push(reg.to_vm_reg());
             }
             X64InstrKind::LeaRipRel { dst, offset: _ } => {
-                let skip_for_hello_printf = instr.offset >= main_x64_offset
+                let in_main = instr.offset >= main_x64_offset;
+                let skip_for_embedded_string =
+                    in_main && main_has_printf && printf_literal.is_some();
+                let skip_format_lea_for_nc2 = in_main
                     && main_has_printf
-                    && printf_literal.is_some()
-                    && printf_literal.is_some_and(|s| s.starts_with(b"Hello"));
-                if !skip_for_hello_printf {
+                    && printf_literal.is_none()
+                    && matches!(
+                        dst,
+                        X64Reg::Rcx | X64Reg::Ecx | X64Reg::Rdx | X64Reg::Edx
+                    );
+                if !skip_for_embedded_string && !skip_format_lea_for_nc2 {
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(dst.to_vm_reg());
                     string_patch_positions.push(bytecode.len());
@@ -2290,6 +2332,77 @@ mod tests {
         let bc = lift_for_test(&instrs, main_off, Some(hello));
         assert_eq!(native_call_ids(&bc), vec![1]);
         assert!(!native_call_ids(&bc).contains(&3));
+    }
+
+    #[test]
+    fn integer_printf_skips_format_lea_in_rcx() {
+        let main_off = 0x400;
+        let instrs = vec![
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0x48, 0x8D, 0x0D, 0, 0, 0, 0],
+                kind: X64InstrKind::LeaRipRel {
+                    dst: X64Reg::Rcx,
+                    offset: 0,
+                },
+            },
+            X64Instruction {
+                offset: main_off + 7,
+                bytes: vec![0x8B, 0x55, 0xFC],
+                kind: X64InstrKind::MovRegMem {
+                    dst: X64Reg::Edx,
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                },
+            },
+            call_at(main_off + 10, 0x1000),
+            call_at(main_off + 15, 0x1000),
+            ret_at(main_off + 20),
+        ];
+        let bc = lift_for_test(&instrs, main_off, None);
+        assert_eq!(native_call_ids(&bc), vec![2]);
+        assert!(
+            !bc.windows(3).any(|w| w[0] == OpCode::LoadImm as u8 && w[1] == 1),
+            "integer nc2 must not load format offset into rcx/r1"
+        );
+    }
+
+    #[test]
+    fn iat_puts_with_literal_loads_string_in_r0() {
+        use super::super::imports::{is_iat_ptr_native_call, native_call_iat_ptr_id};
+        use super::super::cfg::disassemble_cfg_function;
+
+        let pe_data = test_pe::create_pe64_with_puts_thunk_call();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let imports = pe.parse_imports().unwrap();
+        let puts = imports.entries().iter().find(|e| e.name == "puts").unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_off = pe.rva_to_file_offset(text.virtual_address).unwrap() + 0x20;
+        let code = &pe.data[main_off..main_off + 32];
+        let instrs = disassemble_cfg_function(code, main_off);
+        let msg = b"IAT puts hello\0";
+        let bc = lift_to_vm_bytecode_for_main(
+            &instrs,
+            text.virtual_address + 0x20,
+            main_off,
+            &pe,
+            Some(msg),
+            &imports,
+        );
+        let ids = native_call_ids(&bc);
+        assert!(ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)));
+        assert!(ids.iter().any(|id| is_iat_ptr_native_call(*id)));
+        let nc_pos = bc
+            .iter()
+            .position(|&b| b == OpCode::NativeCall as u8)
+            .expect("native_call");
+        assert!(
+            nc_pos >= 10,
+            "IAT puts must load_imm r0 before native_call"
+        );
+        assert_eq!(bc[nc_pos - 10], OpCode::LoadImm as u8);
+        assert_eq!(bc[nc_pos - 9], 0);
+        assert!(bc.windows(msg.len()).any(|w| w == msg));
     }
 
     #[test]
