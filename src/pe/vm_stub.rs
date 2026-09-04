@@ -93,7 +93,6 @@ impl StubEmitter {
 
         self.emit(&[0x49, 0x8B, 0x0B]);
         self.label("module_loop");
-        self.emit(&[0x48, 0x8B, 0x09]);
         self.emit(&[0x49, 0x39, 0xCB]);
         self.jcc_rel32(0x84, "module_fail");
 
@@ -427,7 +426,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
 
         // IAT win64 ABI path when func_id >= 0x100000000
-        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x01]); // mov rcx, 0x100000000
+        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]); // mov rcx, 0x100000000
         self.emit(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
         self.jcc_rel32(0x83, "nc_iat"); // jae nc_iat
 
@@ -627,5 +626,62 @@ impl StubEmitter {
         }
         let size = self.code.len();
         (self.code, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_vm_interpreter_stub;
+
+    /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
+    /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
+    #[test]
+    fn peb_module_walk_single_advance_per_iteration() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let init = [0x49u8, 0x8B, 0x0B]; // mov rcx, [r11] — first module
+        let done = [0x48u8, 0x8B, 0x59, 0x30]; // name_cmp_done: mov rbx, [rcx+0x30]
+        let advance = [0x48u8, 0x8B, 0x09]; // mov rcx, [rcx]
+
+        let start = stub
+            .windows(init.len())
+            .position(|w| w == init)
+            .expect("PEB walk init mov rcx,[r11]");
+        let end = stub[start..]
+            .windows(done.len())
+            .position(|w| w == done)
+            .map(|p| start + p)
+            .expect("PEB walk name_cmp_done");
+        let walk_region = &stub[start..end];
+        let advances = walk_region
+            .windows(advance.len())
+            .filter(|w| *w == advance)
+            .count();
+        assert_eq!(
+            advances, 1,
+            "module list walk must contain exactly one mov rcx,[rcx] advance before match"
+        );
+        assert_ne!(
+            &walk_region[init.len()..init.len() + advance.len()],
+            advance,
+            "module_loop must not advance rcx before comparing the current entry"
+        );
+    }
+
+    #[test]
+    fn iat_native_call_threshold_uses_full_mov_rcx_imm64() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let pattern = [
+            0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rcx, 0x100000000
+            0x48, 0x39, 0xC8, // cmp rax, rcx
+        ];
+        assert!(
+            stub.windows(pattern.len()).any(|w| w == pattern),
+            "IAT threshold check must use 10-byte mov rcx,imm64 followed by cmp rax,rcx"
+        );
+        let truncated = [0x48u8, 0xB9, 0x00, 0x00, 0x00, 0x01];
+        assert!(
+            !stub.windows(truncated.len()).any(|w| w == truncated),
+            "stub must not emit truncated 6-byte mov rcx,imm64"
+        );
     }
 }
