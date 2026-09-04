@@ -925,11 +925,6 @@ fn emit_iat_native_call(
         bytecode.push(0);
         string_patch_positions.push(bytecode.len());
         bytecode.extend_from_slice(&0u64.to_le_bytes());
-    } else if import_name.is_some_and(is_putchar_import) {
-        // win64 rcx = VM r1 after sign-ext; stub loads VM r0 — mirror legacy nc3.
-        bytecode.push(OpCode::Move as u8);
-        bytecode.push(0);
-        bytecode.push(1);
     }
     let id = if is_ptr {
         native_call_iat_ptr_id(iat_rva)
@@ -1164,14 +1159,7 @@ fn try_fuse_index_base_mov_pair(
     if instr.offset < main_x64_offset {
         let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
         let end = callee_end_for(instrs, entry, main_x64_offset);
-        if callee_saved_printf_int_vm_reg(instrs, entry, end).is_some()
-            && matches!(
-                &instr.kind,
-                X64InstrKind::MovRegReg { src, .. }
-                    if matches!(src, X64Reg::Rdx | X64Reg::Edx)
-            )
-            && skip_printf_stub_arg_shuffle(next_instr, instrs, entry, end)
-        {
+        if is_mingw_printf_wrapper(instrs, entry, end) {
             return None;
         }
     }
@@ -1233,6 +1221,66 @@ fn callee_has_add_30(instrs: &[X64Instruction], entry: usize, end: usize) -> boo
     })
 }
 
+/// True when `entry..end` looks like a MinGW `printf("%d", …)` wrapper (saves rcx+rdx, external call).
+fn is_mingw_printf_wrapper(instrs: &[X64Instruction], entry: usize, end: usize) -> bool {
+    let mut saves_format = false;
+    let mut saves_int = false;
+    let mut has_call = false;
+    for instr in instrs {
+        if instr.offset < entry || instr.offset >= end {
+            continue;
+        }
+        if let X64InstrKind::MovRegReg { dst, src } = &instr.kind {
+            if matches!(
+                (dst, src),
+                (X64Reg::R14, X64Reg::Rcx) | (X64Reg::R14, X64Reg::Ecx)
+            ) {
+                saves_format = true;
+            }
+            if matches!(src, X64Reg::Rdx | X64Reg::Edx) {
+                saves_int = true;
+            }
+        }
+        if matches!(instr.kind, X64InstrKind::Call { .. }) {
+            has_call = true;
+        }
+    }
+    saves_format && saves_int && has_call
+}
+
+fn is_printf_wrapper_save_mov(dst: &X64Reg, src: &X64Reg) -> bool {
+    matches!(
+        (dst, src),
+        (X64Reg::R14, X64Reg::Rcx)
+            | (X64Reg::R14, X64Reg::Ecx)
+            | (X64Reg::R15, X64Reg::Rdx)
+            | (X64Reg::R15, X64Reg::Edx)
+    )
+}
+
+/// In a MinGW printf wrapper only emit the two ABI saves; skip all other reg-reg shuffles so r2
+/// (win64 rdx / VM int arg) stays untouched through `native_call 0x2`.
+fn skip_emit_in_printf_wrapper(
+    instr: &X64Instruction,
+    instrs: &[X64Instruction],
+    main_x64_offset: usize,
+) -> bool {
+    if instr.offset >= main_x64_offset {
+        return false;
+    }
+    let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+    let end = callee_end_for(instrs, entry, main_x64_offset);
+    if !is_mingw_printf_wrapper(instrs, entry, end) {
+        return false;
+    }
+    match &instr.kind {
+        X64InstrKind::MovRegReg { dst, src } => !is_printf_wrapper_save_mov(dst, src),
+        // ABI setup immediates (e.g. mov ecx, 1 for WriteFile length) are not needed for nc2.
+        X64InstrKind::MovRegImm { .. } => true,
+        _ => false,
+    }
+}
+
 /// VM register that holds the saved win64 2nd-arg (rdx) in a MinGW `printf` wrapper stub.
 fn callee_saved_printf_int_vm_reg(instrs: &[X64Instruction], entry: usize, end: usize) -> Option<u8> {
     for instr in instrs {
@@ -1252,34 +1300,11 @@ fn callee_saved_printf_int_vm_reg(instrs: &[X64Instruction], entry: usize, end: 
 fn skip_printf_stub_arg_shuffle(
     instr: &X64Instruction,
     instrs: &[X64Instruction],
-    entry: usize,
-    end: usize,
+    _entry: usize,
+    _end: usize,
+    main_x64_offset: usize,
 ) -> bool {
-    if callee_saved_printf_int_vm_reg(instrs, entry, end).is_none() {
-        return false;
-    }
-    match &instr.kind {
-        X64InstrKind::MovRegReg { dst, src } => matches!(
-            (dst, src),
-            (X64Reg::R15, X64Reg::R8)
-                | (X64Reg::R15, X64Reg::R9)
-                | (X64Reg::R14, X64Reg::R8)
-                | (X64Reg::R14, X64Reg::R9)
-                | (X64Reg::Rdx, X64Reg::Rax)
-                | (X64Reg::Rdx, X64Reg::Eax)
-                | (X64Reg::Rdx, X64Reg::Rcx)
-                | (X64Reg::Rdx, X64Reg::Ecx)
-                | (X64Reg::Rdx, X64Reg::R14)
-                | (X64Reg::Rdx, X64Reg::R15)
-                | (X64Reg::Edx, X64Reg::Rax)
-                | (X64Reg::Edx, X64Reg::Eax)
-                | (X64Reg::Edx, X64Reg::Rcx)
-                | (X64Reg::Edx, X64Reg::Ecx)
-                | (X64Reg::Edx, X64Reg::R14)
-                | (X64Reg::Edx, X64Reg::R15)
-        ),
-        _ => false,
-    }
+    skip_emit_in_printf_wrapper(instr, instrs, main_x64_offset)
 }
 
 fn callee_has_recursive_internal_call(
@@ -1786,19 +1811,26 @@ fn lift_to_vm_bytecode_internal_with_main(
 
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
+                if skip_emit_in_printf_wrapper(instr, instrs, main_x64_offset) {
+                    continue;
+                }
+                let in_main = instr.offset >= main_x64_offset;
+                if in_main && printf_literal.is_some() && reg.to_vm_reg() == 0 {
+                    bytecode.push(OpCode::LoadImm as u8);
+                    bytecode.push(0);
+                    string_patch_positions.push(bytecode.len());
+                    bytecode.extend_from_slice(&0u64.to_le_bytes());
+                    continue;
+                }
                 bytecode.push(OpCode::LoadImm as u8);
                 bytecode.push(reg.to_vm_reg());
                 bytecode.extend_from_slice(&imm.to_le_bytes());
             }
             X64InstrKind::MovRegReg { dst, src } => {
-                let in_callee = instr.offset < main_x64_offset;
-                if in_callee {
-                    let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
-                    let end = callee_end_for(instrs, entry, main_x64_offset);
-                    if skip_printf_stub_arg_shuffle(instr, instrs, entry, end) {
-                        continue;
-                    }
+                if skip_printf_stub_arg_shuffle(instr, instrs, 0, 0, main_x64_offset) {
+                    continue;
                 }
+                let in_callee = instr.offset < main_x64_offset;
                 let is_ecx_from_eax = matches!(
                     (dst, src),
                     (X64Reg::Rcx | X64Reg::Ecx, X64Reg::Rax | X64Reg::Eax)
@@ -2560,21 +2592,26 @@ mod tests {
             mov(stub + 4, X64Reg::R15, X64Reg::Rdx),
             mov(stub + 7, X64Reg::R15, X64Reg::R8),
             mov(stub + 19, X64Reg::Rdx, X64Reg::Rax),
+            call_at(stub + 22, 0x1000),
+            ret_at(stub + 27),
         ];
         assert_eq!(
             super::callee_saved_printf_int_vm_reg(&instrs, stub, main),
             Some(15)
         );
+        assert!(super::is_mingw_printf_wrapper(&instrs, stub, main));
         assert!(super::skip_printf_stub_arg_shuffle(
             &instrs[3],
             &instrs,
             stub,
+            main,
             main
         ));
         assert!(super::skip_printf_stub_arg_shuffle(
             &instrs[4],
             &instrs,
             stub,
+            main,
             main
         ));
     }
@@ -2660,6 +2697,78 @@ mod tests {
                     || (w[0] == OpCode::Add as u8 && w[1] == 2)
             }),
             "stub must not clobber r2 before nc2"
+        );
+    }
+
+    #[test]
+    fn mingw_printf_stub_windows_clobber_chain_not_emitted() {
+        let stub = 0x300usize;
+        let main = 0x500usize;
+        let rel = (stub as i32) - (main as i32 + 5);
+        let instrs = vec![
+            X64Instruction {
+                offset: stub,
+                bytes: vec![0x55],
+                kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+            },
+            mov_rr(stub + 1, X64Reg::R14, X64Reg::Rcx),
+            mov_rr(stub + 4, X64Reg::R15, X64Reg::Rdx),
+            mov_rr(stub + 7, X64Reg::R15, X64Reg::R8),
+            mov_rr(stub + 10, X64Reg::R15, X64Reg::R9),
+            mov_rr(stub + 13, X64Reg::R13, X64Reg::Rax),
+            mov_rr(stub + 16, X64Reg::Rbx, X64Reg::R13),
+            X64Instruction {
+                offset: stub + 19,
+                bytes: vec![0xB9, 0x01, 0, 0, 0],
+                kind: X64InstrKind::MovRegImm {
+                    reg: X64Reg::Ecx,
+                    imm: 1,
+                },
+            },
+            mov_rr(stub + 24, X64Reg::Rax, X64Reg::R14),
+            mov_rr(stub + 27, X64Reg::R8, X64Reg::Rbx),
+            mov_rr(stub + 30, X64Reg::Rdx, X64Reg::Rax),
+            call_at(stub + 33, 0x1000),
+            ret_at(stub + 38),
+            X64Instruction {
+                offset: main,
+                bytes: vec![0x55],
+                kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+            },
+            X64Instruction {
+                offset: main + 1,
+                bytes: vec![0xBA, 0x23, 0, 0, 0],
+                kind: X64InstrKind::MovRegImm {
+                    reg: X64Reg::Edx,
+                    imm: 35,
+                },
+            },
+            X64Instruction {
+                offset: main + 6,
+                bytes: vec![0xB8, 0xF0, 0, 0, 0],
+                kind: X64InstrKind::MovRegImm {
+                    reg: X64Reg::Eax,
+                    imm: 0xF0,
+                },
+            },
+            mov_rr(main + 11, X64Reg::Rcx, X64Reg::Rax),
+            call_at(main + 14, rel),
+            ret_at(main + 19),
+        ];
+        let bc = lift_for_test(&instrs, main, None);
+        let ir = crate::ir::Instruction::pretty_print(&crate::ir::Instruction::disassemble(&bc));
+        assert_eq!(native_call_ids(&bc), vec![2]);
+        assert!(
+            !ir.contains("move r15, r8"),
+            "must not emit r15<-r8 shuffle:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r2, r0"),
+            "must not reload format into r2:\n{ir}"
+        );
+        assert!(
+            ir.contains("r2, 0x23"),
+            "int must remain in r2 from main:\n{ir}"
         );
     }
 

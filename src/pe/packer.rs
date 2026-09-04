@@ -385,6 +385,34 @@ mod tests {
     use crate::vm::OpCode;
 
     #[test]
+    fn test_pack_mingw_printf_stub_skips_clobber_chain() {
+        use crate::ir::Instruction;
+
+        let pe_data = test_pe::create_pe64_with_mingw_printf_stub();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x400;
+        let bc = pack_function(&mut pe, Some(main_rva)).unwrap();
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            !ir.contains("move r15, r8"),
+            "packed printf stub must not emit r15<-r8:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r2, r0"),
+            "packed printf stub must not reload format into r2:\n{ir}"
+        );
+        assert!(
+            ir.contains("r2, 0x23"),
+            "packed main must keep int in r2:\n{ir}"
+        );
+        assert!(
+            ir.contains("r14, r1") && ir.contains("r15, r2"),
+            "packed printf stub must keep only format/int saves:\n{ir}"
+        );
+    }
+
+    #[test]
     fn test_pack_with_explicit_rva() {
         let pe_data = test_pe::create_pe64_with_callee();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();

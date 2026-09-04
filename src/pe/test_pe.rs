@@ -270,6 +270,103 @@ pub fn create_pe64_with_callee() -> Vec<u8> {
     pe
 }
 
+/// PE64 with a MinGW-shaped `printf` wrapper callee (saves rcx/rdx, ABI shuffles, external call).
+pub fn create_pe64_with_mingw_printf_stub() -> Vec<u8> {
+    let mut pe = Vec::new();
+
+    pe.extend_from_slice(&create_dos_header(0x80));
+    pe.extend_from_slice(&vec![0u8; 0x80 - 64]);
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&create_coff_header(1));
+    pe.extend_from_slice(&create_optional_header_pe32plus());
+    pe.extend_from_slice(&create_section_header(
+        b".text\0\0\0",
+        0x800,
+        0x1000,
+        0x800,
+        0x400,
+    ));
+
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    let mut text = vec![0x90u8; 0x800];
+
+    // fake printf import target at .text+0x200
+    let fake_printf = 0x200usize;
+    text[fake_printf] = 0xC3; // ret
+
+    // printf wrapper stub at .text+0x100
+    let stub = 0x100usize;
+    let mut o = stub;
+    // push rbp; mov rbp, rsp
+    text[o..o + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+    o += 4;
+    // mov r14, rcx
+    text[o..o + 3].copy_from_slice(&[0x49, 0x89, 0xCE]);
+    o += 3;
+    // mov r15, rdx
+    text[o..o + 3].copy_from_slice(&[0x49, 0x89, 0xD7]);
+    o += 3;
+    // mov r15, r8
+    text[o..o + 3].copy_from_slice(&[0x4D, 0x89, 0xC7]);
+    o += 3;
+    // mov r15, r9
+    text[o..o + 3].copy_from_slice(&[0x4D, 0x89, 0xCF]);
+    o += 3;
+    // mov rax, r14
+    text[o..o + 3].copy_from_slice(&[0x4C, 0x89, 0xF0]);
+    o += 3;
+    // mov rdx, rax
+    text[o..o + 3].copy_from_slice(&[0x48, 0x89, 0xC2]);
+    o += 3;
+    // call fake_printf
+    let call_from = o;
+    text[call_from] = 0xE8;
+    let call_end = call_from + 5;
+    let rel = (fake_printf as i32) - (call_end as i32);
+    text[call_from + 1..call_from + 5].copy_from_slice(&rel.to_le_bytes());
+    o = call_end;
+    text[o] = 0xC3; // ret
+
+    // main at .text+0x400 (matches detect_main window)
+    let main = 0x400usize;
+    text[main] = 0x55;
+    text[main + 1] = 0x48;
+    text[main + 2] = 0x89;
+    text[main + 3] = 0xE5;
+    text[main + 4] = 0x48;
+    text[main + 5] = 0x83;
+    text[main + 6] = 0xEC;
+    text[main + 7] = 0x20;
+    // mov edx, 35
+    text[main + 8..main + 13].copy_from_slice(&[0xBA, 0x23, 0, 0, 0]);
+    // mov eax, 0xf0
+    text[main + 13..main + 18].copy_from_slice(&[0xB8, 0xF0, 0, 0, 0]);
+    // mov ecx, eax
+    text[main + 18..main + 20].copy_from_slice(&[0x89, 0xC1]);
+    let main_call = main + 20;
+    text[main_call] = 0xE8;
+    let main_call_end = main_call + 5;
+    let main_rel = (stub as i32) - (main_call_end as i32);
+    text[main_call + 1..main_call + 5].copy_from_slice(&main_rel.to_le_bytes());
+    text[main_call_end] = 0x31; // xor eax,eax
+    text[main_call_end + 1] = 0xC0;
+    text[main_call_end + 2] = 0x48;
+    text[main_call_end + 3] = 0x83;
+    text[main_call_end + 4] = 0xC4;
+    text[main_call_end + 5] = 0x20;
+    text[main_call_end + 6] = 0x5D;
+    text[main_call_end + 7] = 0xC3;
+
+    pe.extend_from_slice(&text);
+    while pe.len() < 0xC00 {
+        pe.push(0);
+    }
+    pe
+}
+
 /// PE64 with main that `call rel32`s forward into fake CRT — must not be CFG-collected.
 pub fn create_pe64_with_forward_crt_call() -> Vec<u8> {
     let mut pe = Vec::new();
