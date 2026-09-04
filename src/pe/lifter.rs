@@ -1932,7 +1932,7 @@ fn lift_to_vm_bytecode_internal_with_main(
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
                 let in_main = instr.offset >= main_x64_offset;
-                if in_main && printf_literal.is_some() && reg.to_vm_reg() == 0 {
+                if in_main && printf_literal.is_some() && reg.to_vm_reg() == 0 && *imm != 0 {
                     bytecode.push(OpCode::LoadImm as u8);
                     bytecode.push(0);
                     string_patch_positions.push(bytecode.len());
@@ -1944,11 +1944,17 @@ fn lift_to_vm_bytecode_internal_with_main(
                 bytecode.extend_from_slice(&imm.to_le_bytes());
             }
             X64InstrKind::MovRegReg { dst, src } => {
+                let in_main = instr.offset >= main_x64_offset;
                 let in_callee = instr.offset < main_x64_offset;
                 let is_ecx_from_eax = matches!(
                     (dst, src),
                     (X64Reg::Rcx | X64Reg::Ecx, X64Reg::Rax | X64Reg::Eax)
                 );
+                let skip_format_rcx_from_rax =
+                    in_main && printf_literal.is_some() && is_ecx_from_eax;
+                if skip_format_rcx_from_rax {
+                    continue;
+                }
                 if in_callee && is_ecx_from_eax {
                     let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
                     let end = callee_end_for(instrs, entry, main_x64_offset);

@@ -526,6 +526,10 @@ mod tests {
             "hello must not use nc2 integer print:\n{ir}"
         );
         assert!(
+            !ir.contains("move         | r1, r0"),
+            "hello must not shuffle unset rcx from rax after skipped format lea:\n{ir}"
+        );
+        assert!(
             bc.len() < 200,
             "hello bytecode should stay compact, got {}",
             bc.len()
@@ -859,15 +863,15 @@ mod tests {
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
-        let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
-        let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
+        let save_rsi = [0x48u8, 0x89, 0xB5, 0xC0, 0xFF, 0xFF, 0xFF];
+        let restore_rsi = [0x48u8, 0x8B, 0xB5, 0xC0, 0xFF, 0xFF, 0xFF];
         assert!(
             stub.windows(save_rsi.len()).any(|w| w == save_rsi),
-            "native_call must save bytecode rsi at [rbp-0x68]"
+            "native_call must save bytecode rsi at [rbp-0xC0]"
         );
         assert!(
             stub.windows(restore_rsi.len()).any(|w| w == restore_rsi),
-            "native_call must restore bytecode rsi from [rbp-0x68]"
+            "native_call must restore bytecode rsi from [rbp-0xC0]"
         );
         let clobber_r3 = [0x48u8, 0x89, 0x85, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -902,7 +906,7 @@ mod tests {
     fn test_jmpif_ne_uses_jne_not_je() {
         let (stub, _) = create_vm_interpreter_stub(0, 0);
         let ne_cond = [0x83u8, 0xF9, 0x02];
-        let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
+        let push_flags = [0xFFu8, 0xB5, 0xB8, 0xFF, 0xFF, 0xFF];
         let mut found = false;
         for i in 0..stub.len().saturating_sub(ne_cond.len() + 32) {
             if stub[i..i + 3] != ne_cond {
