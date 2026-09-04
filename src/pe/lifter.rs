@@ -1041,6 +1041,17 @@ fn emit_external_call(
     string_patch_positions: &mut Vec<usize>,
     external_call_count: &mut u32,
 ) {
+    if printf_wrapper_bounds(instr, instrs, main_x64_offset).is_some() {
+        if is_crt_external_instr(pe, imports, instr) {
+            return;
+        }
+        if iat_rva_for_instr(pe, imports, instr).is_some() {
+            return;
+        }
+        emit_legacy_native_call(bytecode, 2, string_patch_positions, printf_literal);
+        return;
+    }
+
     if is_crt_external_instr(pe, imports, instr) {
         return;
     }
@@ -1230,22 +1241,73 @@ fn is_mingw_printf_wrapper(instrs: &[X64Instruction], entry: usize, end: usize) 
         if instr.offset < entry || instr.offset >= end {
             continue;
         }
-        if let X64InstrKind::MovRegReg { dst, src } = &instr.kind {
-            if matches!(
-                (dst, src),
-                (X64Reg::R14, X64Reg::Rcx) | (X64Reg::R14, X64Reg::Ecx)
-            ) {
-                saves_format = true;
+        match &instr.kind {
+            X64InstrKind::MovRegReg { dst, src } => {
+                if matches!(
+                    (dst, src),
+                    (X64Reg::R14, X64Reg::Rcx) | (X64Reg::R14, X64Reg::Ecx)
+                ) {
+                    saves_format = true;
+                }
+                if matches!(src, X64Reg::Rdx | X64Reg::Edx) {
+                    saves_int = true;
+                }
             }
-            if matches!(src, X64Reg::Rdx | X64Reg::Edx) {
-                saves_int = true;
+            X64InstrKind::MovMemReg {
+                base,
+                offset: _,
+                src,
+            } if matches!(base, X64Reg::Rbp | X64Reg::Ebp) => {
+                if matches!(src, X64Reg::Rcx | X64Reg::Ecx) {
+                    saves_format = true;
+                }
+                if matches!(src, X64Reg::Rdx | X64Reg::Edx) {
+                    saves_int = true;
+                }
             }
-        }
-        if matches!(instr.kind, X64InstrKind::Call { .. }) {
-            has_call = true;
+            X64InstrKind::Call { .. } | X64InstrKind::CallIndRip { .. } => {
+                has_call = true;
+            }
+            _ => {}
         }
     }
     saves_format && saves_int && has_call
+}
+
+fn printf_wrapper_bounds(
+    instr: &X64Instruction,
+    instrs: &[X64Instruction],
+    main_x64_offset: usize,
+) -> Option<(usize, usize)> {
+    if instr.offset >= main_x64_offset {
+        return None;
+    }
+    let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+    let end = callee_end_for(instrs, entry, main_x64_offset);
+    if is_mingw_printf_wrapper(instrs, entry, end) {
+        Some((entry, end))
+    } else {
+        None
+    }
+}
+
+/// Frame setup/teardown in a real MinGW printf stub (push/pop, rsp adjust, ret).
+fn keep_printf_wrapper_frame_instr(kind: &X64InstrKind) -> bool {
+    match kind {
+        X64InstrKind::Push { reg } | X64InstrKind::Pop { reg } => matches!(
+            reg,
+            X64Reg::Rbp
+                | X64Reg::Rbx
+                | X64Reg::Ebp
+                | X64Reg::Esp
+                | X64Reg::Rsp
+        ),
+        X64InstrKind::SubRegImm { reg, .. } | X64InstrKind::AddRegImm { reg, .. } => {
+            matches!(reg, X64Reg::Rsp | X64Reg::Esp)
+        }
+        X64InstrKind::Ret => true,
+        _ => false,
+    }
 }
 
 fn is_printf_wrapper_save_mov(dst: &X64Reg, src: &X64Reg) -> bool {
@@ -1258,27 +1320,20 @@ fn is_printf_wrapper_save_mov(dst: &X64Reg, src: &X64Reg) -> bool {
     )
 }
 
-/// In a MinGW printf wrapper only emit the two ABI saves; skip all other reg-reg shuffles so r2
-/// (win64 rdx / VM int arg) stays untouched through `native_call 0x2`.
+/// In a MinGW printf wrapper collapse the body to frame ops + `native_call 0x2` so r2
+/// (win64 rdx / VM int arg) stays untouched from the caller.
 fn skip_emit_in_printf_wrapper(
     instr: &X64Instruction,
     instrs: &[X64Instruction],
     main_x64_offset: usize,
 ) -> bool {
-    if instr.offset >= main_x64_offset {
-        return false;
-    }
-    let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
-    let end = callee_end_for(instrs, entry, main_x64_offset);
-    if !is_mingw_printf_wrapper(instrs, entry, end) {
-        return false;
-    }
-    match &instr.kind {
-        X64InstrKind::MovRegReg { dst, src } => !is_printf_wrapper_save_mov(dst, src),
-        // ABI setup immediates (e.g. mov ecx, 1 for WriteFile length) are not needed for nc2.
-        X64InstrKind::MovRegImm { .. } => true,
-        _ => false,
-    }
+    printf_wrapper_bounds(instr, instrs, main_x64_offset).is_some_and(|_| {
+        !keep_printf_wrapper_frame_instr(&instr.kind)
+            && !matches!(
+                instr.kind,
+                X64InstrKind::Call { .. } | X64InstrKind::CallIndRip { .. }
+            )
+    })
 }
 
 /// VM register that holds the saved win64 2nd-arg (rdx) in a MinGW `printf` wrapper stub.
@@ -1809,11 +1864,12 @@ fn lift_to_vm_bytecode_internal_with_main(
             continue;
         }
 
+        if skip_emit_in_printf_wrapper(instr, instrs, main_x64_offset) {
+            continue;
+        }
+
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
-                if skip_emit_in_printf_wrapper(instr, instrs, main_x64_offset) {
-                    continue;
-                }
                 let in_main = instr.offset >= main_x64_offset;
                 if in_main && printf_literal.is_some() && reg.to_vm_reg() == 0 {
                     bytecode.push(OpCode::LoadImm as u8);
@@ -1827,9 +1883,6 @@ fn lift_to_vm_bytecode_internal_with_main(
                 bytecode.extend_from_slice(&imm.to_le_bytes());
             }
             X64InstrKind::MovRegReg { dst, src } => {
-                if skip_printf_stub_arg_shuffle(instr, instrs, 0, 0, main_x64_offset) {
-                    continue;
-                }
                 let in_callee = instr.offset < main_x64_offset;
                 let is_ecx_from_eax = matches!(
                     (dst, src),
@@ -2029,6 +2082,20 @@ fn lift_to_vm_bytecode_internal_with_main(
                 pending_jumps.push((placeholder_pos, target_x64_offset, false));
             }
             X64InstrKind::Call { target_offset } => {
+                if printf_wrapper_bounds(instr, instrs, main_x64_offset).is_some() {
+                    emit_external_call(
+                        instr,
+                        instrs,
+                        pe,
+                        imports,
+                        main_x64_offset,
+                        main_has_printf,
+                        printf_literal,
+                        &mut bytecode,
+                        &mut string_patch_positions,
+                        &mut external_call_count,
+                    );
+                } else {
                 let raw_target =
                     (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
 
@@ -2129,8 +2196,23 @@ fn lift_to_vm_bytecode_internal_with_main(
                     );
                 }
                 }
+                }
             }
             X64InstrKind::CallIndRip { .. } => {
+                if printf_wrapper_bounds(instr, instrs, main_x64_offset).is_some() {
+                    emit_external_call(
+                        instr,
+                        instrs,
+                        pe,
+                        imports,
+                        main_x64_offset,
+                        main_has_printf,
+                        printf_literal,
+                        &mut bytecode,
+                        &mut string_patch_positions,
+                        &mut external_call_count,
+                    );
+                } else {
                 emit_external_call(
                     instr,
                     instrs,
@@ -2143,6 +2225,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                     &mut string_patch_positions,
                     &mut external_call_count,
                 );
+                }
             }
             X64InstrKind::Ret => {
                 if instr.offset == main_end_offset && !hit_main_ret {
@@ -2679,10 +2762,6 @@ mod tests {
         assert!(
             !bc.windows(3).any(|w| w[0] == OpCode::Move as u8 && w[1] == 2 && w[2] == 0),
             "must not load format offset into r2 before nc2"
-        );
-        assert!(
-            bc.windows(3).any(|w| w[0] == OpCode::Move as u8 && w[1] == 15 && w[2] == 2),
-            "must preserve int save mov r15, r2"
         );
         let before_nc = &bc[..nc_pos];
         assert!(

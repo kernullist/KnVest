@@ -49,6 +49,16 @@ fn has_near_call_in_window(text_data: &[u8], offset: usize, window: usize) -> bo
     text_data[start..end].contains(&0xE8)
 }
 
+fn looks_like_user_main(text_data: &[u8], offset: usize) -> bool {
+    let end = (offset + 0x80).min(text_data.len());
+    if offset >= end {
+        return false;
+    }
+    text_data[offset..end]
+        .windows(2)
+        .any(|w| w[0] == 0xC7 && w[1] == 0x45)
+}
+
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     let text_section = pe
         .get_section(".text")
@@ -75,7 +85,18 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
         }
     }
 
-    if let Some(&(rva, offset)) = candidates.iter().max_by_key(|(_, off)| *off) {
+    let user_main_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|(_, off)| looks_like_user_main(text_data, *off))
+        .copied()
+        .collect();
+    let pick_from = if user_main_candidates.is_empty() {
+        &candidates
+    } else {
+        &user_main_candidates
+    };
+
+    if let Some(&(rva, offset)) = pick_from.iter().min_by_key(|(_, off)| *off) {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
         return Ok(rva);
     }
@@ -407,8 +428,53 @@ mod tests {
             "packed main must keep int in r2:\n{ir}"
         );
         assert!(
-            ir.contains("r14, r1") && ir.contains("r15, r2"),
-            "packed printf stub must keep only format/int saves:\n{ir}"
+            ir.contains("native_call  | 0x2"),
+            "packed printf stub must emit nc2:\n{ir}"
+        );
+        assert!(
+            bc.len() < 247,
+            "real-style collapse should shrink bytecode, got {} bytes",
+            bc.len()
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_arith_preserves_nc2_int() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/arith.exe");
+        if !pe_path.exists() {
+            eprintln!("skip test_pack_real_mingw_arith: sample/arith.exe missing");
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x4d4;
+        let bc = pack_function(&mut pe, Some(main_rva)).unwrap();
+        assert!(
+            bc.len() < 247,
+            "packed real arith bytecode should shrink from 247, got {}",
+            bc.len()
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let lines: Vec<&str> = ir.lines().collect();
+        let nc2_idx = lines
+            .iter()
+            .position(|l| l.contains("native_call") && l.contains("0x2"))
+            .expect("nc2 in packed real arith IR");
+        let window = &lines[nc2_idx.saturating_sub(8)..nc2_idx];
+        assert!(
+            !window.iter().any(|l| l.contains("move r2, r0")),
+            "printf wrapper must not reload format into r2 before nc2:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r14, r1") && !ir.contains("move r15, r2"),
+            "stack-based MinGW printf must not emit register-save shuffles:\n{ir}"
+        );
+        assert!(
+            ir.contains("mul") && ir.contains("move         | r2,"),
+            "main must pass computed int in r2:\n{ir}"
         );
     }
 
@@ -694,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_main_prefers_high_candidate() {
+    fn test_detect_main_prefers_user_main_pattern() {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let text = pe.get_section(".text").unwrap();
@@ -706,7 +772,10 @@ mod tests {
         }
         let crt = [0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x28, 0xE8, 0x05, 0x00, 0x00, 0x00, 0x90, 0xC3];
         pe.data[text_off + 0x380..text_off + 0x380 + crt.len()].copy_from_slice(&crt);
-        let mainfn = [0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x10, 0x00, 0x00, 0x00, 0xC3];
+        let mainfn = [
+            0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xC7, 0x45, 0xFC, 0x03, 0x00, 0x00,
+            0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x10, 0x00, 0x00, 0x00, 0xC3,
+        ];
         pe.data[text_off + 0x400..text_off + 0x400 + mainfn.len()].copy_from_slice(&mainfn);
         let rva = super::detect_main_rva(&pe).unwrap();
         assert_eq!(rva, text.virtual_address + 0x400);
