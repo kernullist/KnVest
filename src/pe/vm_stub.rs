@@ -581,16 +581,17 @@ impl StubEmitter {
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
         self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
         self.label("nc_iat_call");
-        // Preserve VM r10..r12 in win64 callee-saved hw regs (64-bit mov, not dword).
-        self.emit(&[0x49, 0x8B, 0x65, 0xD0]); // mov r12, [rbp-0x30] VM r10
-        self.emit(&[0x49, 0x8B, 0x6D, 0xD8]); // mov r13, [rbp-0x28] VM r11
-        self.emit(&[0x49, 0x8B, 0x75, 0xE0]); // mov r14, [rbp-0x20] VM r12
+        // Preserve VM r10..r12 on the CPU stack (full qword); do not use r12–r14 here
+        // (nc_iat already uses rax/rbx/r11 for IAT resolve and win64 args).
+        self.emit(&[0xFF, 0x75, 0xD0]); // push qword [rbp-0x30] VM r10
+        self.emit(&[0xFF, 0x75, 0xD8]); // push qword [rbp-0x28] VM r11
+        self.emit(&[0xFF, 0x75, 0xE0]); // push qword [rbp-0x20] VM r12
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
-        self.emit(&[0x4D, 0x89, 0x75, 0xE0]); // mov [rbp-0x20], r14
-        self.emit(&[0x4D, 0x89, 0x6D, 0xD8]); // mov [rbp-0x28], r13
-        self.emit(&[0x49, 0x89, 0x65, 0xD0]); // mov [rbp-0x30], r12
+        self.emit(&[0x8F, 0x45, 0xE0]); // pop qword [rbp-0x20] VM r12
+        self.emit(&[0x8F, 0x45, 0xD8]); // pop qword [rbp-0x28] VM r11
+        self.emit(&[0x8F, 0x45, 0xD0]); // pop qword [rbp-0x30] VM r10
         self.jmp_rel32("nc_done");
 
         self.label("nc_done");
@@ -975,15 +976,31 @@ mod tests {
             stub.windows(dword_cmp32.len()).any(|w| w == dword_cmp32),
             "h_cmp32 must use 32-bit dword compare for nested u32 cmpl"
         );
-        let spill_to_r12 = [0x49u8, 0x8B, 0x65, 0xD0];
+        let spill_push_r10 = [0xFFu8, 0x75, 0xD0];
         assert!(
-            stub.windows(spill_to_r12.len()).any(|w| w == spill_to_r12),
-            "nc_iat_call must save VM r10 into callee-saved r12 (64-bit mov) before external call"
+            stub.windows(spill_push_r10.len()).any(|w| w == spill_push_r10),
+            "nc_iat_call must push VM r10 slot before external call"
         );
-        let restore_r12 = [0x49u8, 0x89, 0x65, 0xD0];
+        let spill_pop_r10 = [0x8Fu8, 0x45, 0xD0];
         assert!(
-            stub.windows(restore_r12.len()).any(|w| w == restore_r12),
-            "nc_iat_call must restore VM r10 from r12 after external call"
+            stub.windows(spill_pop_r10.len()).any(|w| w == spill_pop_r10),
+            "nc_iat_call must pop VM r10 slot after external call"
+        );
+        // nc_iat resolve sequence must stay intact (no r12–r14 spill in prologue).
+        let iat_resolve = [
+            0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00, // PEB
+            0x48, 0x8B, 0x40, 0x10, // ImageBase
+            0x48, 0x01, 0xD8, // add rax, rbx
+            0x48, 0x8B, 0x18, // mov rbx, [rax]
+        ];
+        assert!(
+            stub.windows(iat_resolve.len()).any(|w| w == iat_resolve),
+            "nc_iat ImageBase/IAT/rbx resolve sequence must be unchanged"
+        );
+        assert!(
+            !stub.windows(4).any(|w| w == [0x49, 0x8B, 0x65, 0xD0])
+                && !stub.windows(4).any(|w| w == [0x4C, 0x8B, 0x65, 0xD0]),
+            "nc_iat_call must not spill via r12 (clashes with IAT path)"
         );
     }
 }
