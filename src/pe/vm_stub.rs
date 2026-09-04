@@ -373,7 +373,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
@@ -384,7 +384,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xCA]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
 
@@ -954,10 +954,15 @@ mod tests {
             "nc_func2 must load integer from VM r2 [rbp-0x70] (45 90)"
         );
         // fact(5): 4 pushes × 4 frames → idx 16 at [rbp-0x300]; ret[0] at [rbp-0x200]
-        let data_stack_disp = [0x80u8, 0xF6, 0xFF, 0xFF];
+        let data_stack_disp = [0x80u8, 0xFC, 0xFF, 0xFF];
+        assert_eq!(i32::from_le_bytes(data_stack_disp), -0x380);
         assert!(
             stub.windows(data_stack_disp.len()).filter(|w| *w == data_stack_disp).count() >= 2,
-            "h_push/h_pop data stack must use [rbp-0x380] (80 F6 FF FF)"
+            "h_push/h_pop data stack must use [rbp-0x380] (80 FC FF FF)"
+        );
+        assert!(
+            !stub.windows(4).any(|w| w == [0x80, 0xF6, 0xFF, 0xFF]),
+            "data stack must not use [rbp-0x980] (80 F6 FF FF — out of frame)"
         );
         assert!(
             !stub.windows(4).any(|w| w == [0x80, 0xFB, 0xFF, 0xFF]),
@@ -1081,5 +1086,141 @@ mod tests {
                 && !stub.windows(4).any(|w| w == [0x4C, 0x8B, 0x65, 0xD0]),
             "nc_iat_call must not spill via r12 (clashes with IAT path)"
         );
+    }
+
+    /// Mirrors stub addressing: reg n → [rbp+n*8-0x80], data stack idx → [rbp+idx*8-0x380].
+    #[derive(Default)]
+    struct StubFrame {
+        slots: std::collections::HashMap<i32, u64>,
+    }
+
+    impl StubFrame {
+        fn reg_slot(reg: u8) -> i32 {
+            i32::from(reg) * 8 - 0x80
+        }
+
+        fn data_slot(idx: i32) -> i32 {
+            idx * 8 - 0x380
+        }
+
+        fn get(&self, disp: i32) -> u64 {
+            self.slots.get(&disp).copied().unwrap_or(0)
+        }
+
+        fn set(&mut self, disp: i32, val: u64) {
+            self.slots.insert(disp, val);
+        }
+
+        fn stub_push(&mut self, reg: u8) {
+            let val = self.get(Self::reg_slot(reg));
+            let depth = self.get(-0xE8) as i32;
+            self.set(Self::data_slot(depth), val);
+            self.set(-0xE8, (depth + 1) as u64);
+        }
+
+        fn stub_pop(&mut self, reg: u8) {
+            let mut depth = self.get(-0xE8) as i32;
+            depth -= 1;
+            self.set(-0xE8, depth as u64);
+            let val = self.get(Self::data_slot(depth));
+            self.set(Self::reg_slot(reg), val);
+        }
+
+        fn nc_iat_preserve_r10_r12(&mut self) {
+            self.set(-0x500, self.get(Self::reg_slot(10)));
+            self.set(-0x508, self.get(Self::reg_slot(11)));
+            self.set(-0x510, self.get(Self::reg_slot(12)));
+        }
+
+        fn nc_iat_restore_r10_r12(&mut self) {
+            self.set(Self::reg_slot(12), self.get(-0x510));
+            self.set(Self::reg_slot(11), self.get(-0x508));
+            self.set(Self::reg_slot(10), self.get(-0x500));
+        }
+    }
+
+    fn scale_from_sib(sib: u8) -> u8 {
+        1 << ((sib >> 6) & 3)
+    }
+
+    /// Every SIB used for VM reg [rbp+idx*scale-0x80] in handlers must be scale*8 (CD/FD/D5).
+    #[test]
+    fn vm_reg_sib_must_be_scale8_in_handlers() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let forbidden_sib = [
+            (0x8D, "rcx scale*4"),
+            (0xBD, "rdi scale*4"),
+            (0x95, "rdx scale*4"),
+        ];
+        for (sib, name) in forbidden_sib {
+            assert_eq!(scale_from_sib(sib), 4, "{name} must be scale*4 sentinel");
+            for prefix in [0x8Bu8, 0x89, 0x03, 0x2B, 0x3B] {
+                let pat = [prefix, 0x44, sib, 0x80];
+                assert!(
+                    !stub.windows(pat.len()).any(|w| w == pat),
+                    "handler must not use {name} SIB in {:02x} 44 {:02x} 80 VM reg access",
+                    prefix,
+                    sib
+                );
+            }
+            let pat_q = [0x48, 0x8B, 0x44, sib, 0x80];
+            assert!(
+                !stub.windows(pat_q.len()).any(|w| w == pat_q),
+                "handler must not use {name} in qword VM reg load"
+            );
+            let pat_af = [0x48, 0x0F, 0xAF, 0x44, sib, 0x80];
+            assert!(
+                !stub.windows(pat_af.len()).any(|w| w == pat_af),
+                "handler must not use {name} in imul VM reg access"
+            );
+        }
+        let required: [&[u8]; 7] = [
+            &[0x8B, 0x44, 0xCD, 0x80, 0x3B, 0x44, 0xFD, 0x80],
+            &[0x48, 0x8B, 0x44, 0xCD, 0x80],
+            &[0x48, 0x89, 0x44, 0xCD, 0x80],
+            &[0x48, 0x8B, 0x44, 0xFD, 0x80],
+            &[0x48, 0x03, 0x44, 0xD5, 0x80],
+            &[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF],
+            &[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF],
+        ];
+        for pat in required {
+            assert!(
+                stub.windows(pat.len()).any(|w| w == pat),
+                "missing required scale*8 pattern {:02x?}",
+                pat
+            );
+        }
+    }
+
+    /// After main spill push/pop around one putchar, r10 must not pick up r4 (0x10) or depth.
+    #[test]
+    fn nested_stub_frame_push_pop_preserves_r10_across_putchar_spill() {
+        let mut frame = StubFrame::default();
+        frame.set(-0xE8, 0);
+        frame.set(StubFrame::reg_slot(4), 0x40);
+        frame.set(StubFrame::reg_slot(5), 0x40);
+        frame.set(StubFrame::reg_slot(10), 1);
+        frame.set(StubFrame::reg_slot(11), 2);
+        frame.set(StubFrame::reg_slot(12), 3);
+        frame.stub_push(5);
+        frame.set(StubFrame::reg_slot(4), 0x10); // main sub r4, r4, 0x30
+
+        // One print_char spill trio + callee r5 + nc_iat + restore pops.
+        frame.stub_push(10);
+        frame.stub_push(11);
+        frame.stub_push(12);
+        frame.stub_push(5);
+        frame.nc_iat_preserve_r10_r12();
+        frame.nc_iat_restore_r10_r12();
+        frame.stub_pop(5);
+        frame.stub_pop(12);
+        frame.stub_pop(11);
+        frame.stub_pop(10);
+
+        assert_eq!(frame.get(StubFrame::reg_slot(10)), 1);
+        assert_eq!(frame.get(StubFrame::reg_slot(11)), 2);
+        assert_eq!(frame.get(StubFrame::reg_slot(12)), 3);
+        assert_eq!(frame.get(-0xE8), 1, "only main r5 remains on data stack");
+        assert_eq!(frame.get(StubFrame::data_slot(1)), 1, "stack[1] holds spilled r10");
     }
 }
