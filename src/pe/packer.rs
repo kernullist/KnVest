@@ -1,20 +1,21 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::{lift_to_vm_bytecode_for_main, decode_instruction, X64Instruction, X64InstrKind};
+use super::lifter::lift_to_vm_bytecode_for_main;
 use super::vm_stub::create_vm_interpreter_stub;
-use crate::vm::OpCode;
+use super::cfg::{collect_cfg_entries, disassemble_cfg_function};
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
 const FILE_ALIGNMENT: u32 = 0x200;
 
 pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec<u8>> {
+    let explicit_rva = function_rva.is_some();
     let target_rva = if let Some(rva) = function_rva {
         rva
     } else {
         detect_main_rva(pe)?
     };
     let original_entry_rva = pe.entry_point_rva;
-    
-    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva)?;
+
+    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva, explicit_rva)?;
     
     add_vm_section(pe, &[], &bytecode)?;
     
@@ -48,6 +49,36 @@ fn has_near_call_in_window(text_data: &[u8], offset: usize, window: usize) -> bo
     text_data[start..end].contains(&0xE8)
 }
 
+fn score_user_main(text_data: &[u8], offset: usize) -> i32 {
+    let end = (offset + 0x50).min(text_data.len());
+    if offset >= end {
+        return 0;
+    }
+    let w = &text_data[offset..end];
+    let mut score = 0i32;
+    if w.windows(2).any(|x| x[0] == 0xC7 && x[1] == 0x45) {
+        score += 10;
+    }
+    for i in 0..w.len().saturating_sub(6) {
+        if w[i] == 0xB9 && w.get(i + 5) == Some(&0xE8) {
+            score += 8;
+        }
+    }
+    for i in 0..w.len().saturating_sub(12) {
+        if w[i] == 0x48 && w.get(i + 1) == Some(&0x8D) {
+            let tail = &w[i..w.len().min(i + 16)];
+            if tail.contains(&0xE8) {
+                score += 8;
+            }
+        }
+    }
+    score
+}
+
+fn looks_like_user_main(text_data: &[u8], offset: usize) -> bool {
+    score_user_main(text_data, offset) > 0
+}
+
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     let text_section = pe
         .get_section(".text")
@@ -74,7 +105,25 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
         }
     }
 
-    if let Some(&(rva, offset)) = candidates.iter().max_by_key(|(_, off)| *off) {
+    let user_main_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|(_, off)| looks_like_user_main(text_data, *off))
+        .copied()
+        .collect();
+    let pick_from = if user_main_candidates.is_empty() {
+        &candidates
+    } else {
+        &user_main_candidates
+    };
+
+    if let Some(&(rva, offset)) = pick_from
+        .iter()
+        .max_by(|a, b| {
+            score_user_main(text_data, a.1)
+                .cmp(&score_user_main(text_data, b.1))
+                .then_with(|| b.1.cmp(&a.1))
+        })
+    {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
         return Ok(rva);
     }
@@ -86,160 +135,73 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     Ok(pe.entry_point_rva)
 }
 
-fn translate_to_vm_bytecode(pe: &PEFile, target_rva: u32, _original_entry: u32) -> PEResult<Vec<u8>> {
+fn translate_to_vm_bytecode(
+    pe: &PEFile,
+    target_rva: u32,
+    _original_entry: u32,
+    explicit_rva: bool,
+) -> PEResult<Vec<u8>> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
-    
-    if file_offset + 200 > pe.data.len() {
+
+    if file_offset + 16 > pe.data.len() {
         return Err(PEError::InvalidPE("Code section too small".to_string()));
     }
 
-    let main_code = &pe.data[file_offset..std::cmp::min(file_offset + 500, pe.data.len())];
-    let mut main_instrs = disassemble_until_ret(main_code, 100);
-    
-    if main_instrs.is_empty() {
-        return Err(PEError::InvalidPE("Failed to disassemble main".to_string()));
+    let text_section = pe
+        .get_section(".text")
+        .or_else(|_| pe.get_section("CODE"))?;
+    let text_start = pe.rva_to_file_offset(text_section.virtual_address)?;
+    let text_end = text_start + text_section.size_of_raw_data as usize;
+
+    let imports = pe.parse_imports()?;
+    let cfg_entries = collect_cfg_entries(
+        pe,
+        file_offset,
+        file_offset,
+        text_start,
+        text_end,
+        &imports,
+        explicit_rva,
+    )?;
+
+    if cfg_entries.is_empty() {
+        return Err(PEError::InvalidPE("CFG found no functions to lift".to_string()));
     }
-    
-    for instr in &mut main_instrs {
-        instr.offset += file_offset;
+
+    let mut all_instrs = Vec::new();
+    for &entry in &cfg_entries {
+        let max_end = (entry + super::cfg::MAX_FUNCTION_BYTES).min(text_end);
+        let code = &pe.data[entry..max_end];
+        let mut instrs = disassemble_cfg_function(code, entry);
+        all_instrs.append(&mut instrs);
     }
-    
-    let call_targets = find_internal_call_targets(&main_instrs, file_offset);
-    
-    let mut all_instrs = main_instrs;
-    let mut processed_targets = std::collections::HashSet::new();
-    let mut pending_targets: std::collections::VecDeque<usize> =
-        call_targets.into_iter().collect();
-    
-    while let Some(target_file_offset) = pending_targets.pop_front() {
-        if processed_targets.contains(&target_file_offset) {
-            continue;
-        }
-        processed_targets.insert(target_file_offset);
-        
-        if target_file_offset < file_offset && target_file_offset + 100 <= pe.data.len() {
-            let entry = resolve_callee_entry(&pe.data, target_file_offset, file_offset);
-            if let Some(entry) = entry {
-                let callee_code = &pe.data[entry..std::cmp::min(entry + 300, pe.data.len())];
-                let mut callee_instrs = disassemble_callee(callee_code, 100);
-                
-                for instr in &mut callee_instrs {
-                    instr.offset += entry;
-                }
-                
-                for nested_target in find_internal_call_targets(&callee_instrs, file_offset) {
-                    if nested_target < file_offset && !processed_targets.contains(&nested_target) {
-                        pending_targets.push_back(nested_target);
-                    }
-                }
-                
-                all_instrs.extend(callee_instrs);
-            }
-        }
-    }
-    
+
     all_instrs.sort_by_key(|i| i.offset);
 
-    let printf_literal = find_printf_literal_in_pe(pe);
+    if all_instrs.is_empty() {
+        return Err(PEError::InvalidPE("Failed to disassemble CFG functions".to_string()));
+    }
+
+    let string_literal = find_string_literal_in_pe(pe);
     let bytecode = lift_to_vm_bytecode_for_main(
         &all_instrs,
         target_rva,
         file_offset,
-        &pe.data,
-        printf_literal.as_deref(),
+        pe,
+        string_literal.as_deref(),
+        &imports,
     );
 
     Ok(bytecode)
 }
 
-fn disassemble_until_ret(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
-    disassemble_window(code, max_instrs, true)
-}
-
-/// Disassemble a pre-main callee: do not stop at the first `ret` (early-return paths),
-/// stop at the next `push rbp` prologue or instruction limit.
-fn disassemble_callee(code: &[u8], max_instrs: usize) -> Vec<X64Instruction> {
-    disassemble_window(code, max_instrs, false)
-}
-
-fn disassemble_window(code: &[u8], max_instrs: usize, stop_at_first_ret: bool) -> Vec<X64Instruction> {
-    let mut instructions = Vec::new();
-    let mut offset = 0;
-
-    while offset < code.len() && instructions.len() < max_instrs {
-        if offset > 0 && code[offset] == 0x55 {
-            break;
-        }
-
-        let start_offset = offset;
-        let remaining = &code[offset..];
-
-        if remaining.is_empty() {
-            break;
-        }
-
-        let mut instr_bytes = Vec::new();
-        let kind = super::lifter::decode_instruction(remaining, &mut instr_bytes, &mut offset);
-
-        instructions.push(X64Instruction {
-            offset: start_offset,
-            bytes: instr_bytes,
-            kind: kind.clone(),
-        });
-
-        if stop_at_first_ret && matches!(kind, X64InstrKind::Ret) {
-            break;
-        }
-    }
-
-    instructions
-}
-
-fn resolve_callee_entry(pe_data: &[u8], target: usize, main_file_offset: usize) -> Option<usize> {
-    if target >= main_file_offset || main_file_offset - target >= 0x800 {
-        return None;
-    }
-    if pe_data.get(target) == Some(&0x55) {
-        return Some(target);
-    }
-    let search_start = target.saturating_sub(48);
-    for off in (search_start..target).rev() {
-        if pe_data.get(off) == Some(&0x55)
-            && pe_data.get(off + 1) == Some(&0x48)
-            && pe_data.get(off + 2) == Some(&0x89)
-            && pe_data.get(off + 3) == Some(&0xE5)
-        {
-            return Some(off);
-        }
-    }
-    None
-}
-
-fn find_internal_call_targets(instrs: &[X64Instruction], main_file_offset: usize) -> Vec<usize> {
-    let mut targets = Vec::new();
-    
-    for instr in instrs {
-        if let X64InstrKind::Call { target_offset } = instr.kind {
-            let instr_abs_offset = instr.offset;
-            let target_abs_offset = (instr_abs_offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
-            
-            // Only include targets BEFORE main (no CRT functions after main)
-            if target_abs_offset < main_file_offset {
-                let distance = main_file_offset - target_abs_offset;
-                // Allow up to 512 bytes before main (for larger functions like factorial)
-                if distance < 0x800 {
-                    targets.push(target_abs_offset);
-                }
-            }
-        }
-    }
-    
-    targets
-}
-
-
-fn find_printf_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
-    const NEEDLES: &[&[u8]] = &[b"Hello, World!\n", b"Hello, World!"];
+fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
+    const NEEDLES: &[&[u8]] = &[
+        b"IAT puts hello\0",
+        b"IAT puts hello\n",
+        b"Hello, World!\n",
+        b"Hello, World!",
+    ];
     for name in [".rdata", ".rdata$zzz", ".rodata", ".data"] {
         if let Ok(sec) = pe.get_section(name) {
             let start = sec.pointer_to_raw_data as usize;
@@ -466,7 +428,438 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pe::imports::{
+        iat_native_call_ids_in_bytecode, is_iat_native_call, is_iat_ptr_native_call,
+        native_call_iat_id, native_call_iat_ptr_id, native_call_ids_in_bytecode,
+    };
     use crate::pe::test_pe;
+    use crate::vm::OpCode;
+
+    #[test]
+    fn test_pack_mingw_printf_stub_skips_clobber_chain() {
+        use crate::ir::Instruction;
+
+        let pe_data = test_pe::create_pe64_with_mingw_printf_stub();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x400;
+        let bc = pack_function(&mut pe, Some(main_rva)).unwrap();
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            !ir.contains("move r15, r8"),
+            "packed printf stub must not emit r15<-r8:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r2, r0"),
+            "packed printf stub must not reload format into r2:\n{ir}"
+        );
+        assert!(
+            ir.contains("r2, 0x23"),
+            "packed main must keep int in r2:\n{ir}"
+        );
+        assert!(
+            ir.contains("native_call  | 0x2"),
+            "packed printf stub must emit nc2:\n{ir}"
+        );
+        assert!(
+            bc.len() < 247,
+            "real-style collapse should shrink bytecode, got {} bytes",
+            bc.len()
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_arith_preserves_nc2_int() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/arith.exe");
+        if !pe_path.exists() {
+            eprintln!("skip test_pack_real_mingw_arith: sample/arith.exe missing");
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x4d4;
+        let bc = pack_function(&mut pe, Some(main_rva)).unwrap();
+        assert!(
+            bc.len() < 247,
+            "packed real arith bytecode should shrink from 247, got {}",
+            bc.len()
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let lines: Vec<&str> = ir.lines().collect();
+        let nc2_idx = lines
+            .iter()
+            .position(|l| l.contains("native_call") && l.contains("0x2"))
+            .expect("nc2 in packed real arith IR");
+        let window = &lines[nc2_idx.saturating_sub(8)..nc2_idx];
+        assert!(
+            !window.iter().any(|l| l.contains("move r2, r0")),
+            "printf wrapper must not reload format into r2 before nc2:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r14, r1") && !ir.contains("move r15, r2"),
+            "stack-based MinGW printf must not emit register-save shuffles:\n{ir}"
+        );
+        assert!(
+            ir.contains("mul") && ir.contains("move         | r2,"),
+            "main must pass computed int in r2:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_hello_uses_nc1() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/hello.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            ir.contains("native_call  | 0x1"),
+            "hello must use nc1 WriteFile string path:\n{ir}"
+        );
+        assert!(
+            !ir.contains("native_call  | 0x2"),
+            "hello must not use nc2 integer print:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move         | r1, r0"),
+            "hello must not shuffle unset rcx from rax after skipped format lea:\n{ir}"
+        );
+        assert!(
+            bc.len() < 200,
+            "hello bytecode should stay compact, got {}",
+            bc.len()
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_fact_auto_main() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/fact.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+        assert!(
+            (280..=310).contains(&bc.len()),
+            "fact auto-main pack expected ~295 bytes, got {}",
+            bc.len()
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            ir.contains("call         | 0x") && ir.matches("native_call  | 0x2").count() == 1,
+            "fact must recurse via vm call and printf once via nc2:\n{ir}"
+        );
+        assert!(
+            !ir.contains("move r2, r0") || ir.matches("move         | r2, r0").count() <= 1,
+            "only main may move computed int into r2, not printf wrapper:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_nested_putchar_in_r0() {
+        use crate::ir::Instruction;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/nested.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        assert!(
+            ir.contains("native_call  | 0x10000"),
+            "nested must use IAT putchar:\n{ir}"
+        );
+        assert!(
+            !ir.contains("native_call  | 0x180"),
+            "putchar must not use ptr-flag IAT id:\n{ir}"
+        );
+        for (idx, line) in ir.lines().enumerate() {
+            if line.contains("native_call  | 0x10000") {
+                let window = ir
+                    .lines()
+                    .skip(idx.saturating_sub(4))
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    window.contains("move         | r0, r1"),
+                    "putchar IAT must receive char in r0:\n{window}\n{ir}"
+                );
+            }
+        }
+        // Main→callee calls must spill only main rbp locals (r10..r12), not callee +0x10 slot r13.
+        let push_r13_before_print = ir.match_indices("push         | r13").count();
+        assert_eq!(
+            push_r13_before_print, 0,
+            "main internal calls must not push callee spill r13:\n{ir}"
+        );
+        assert!(
+            ir.contains("and          | r"),
+            "nested must u32-zero-extend before 32-bit imul:\n{ir}"
+        );
+        // product<=9 always single-digit: cmp32 r12,9 then unconditional jmp (fused from JLE).
+        assert!(
+            ir.contains("cmp32        | r12, r15") || ir.contains("cmp32          | r12, r15"),
+            "nested must cmp32 product against 9:\n{ir}"
+        );
+        let product_cmp = bc
+            .windows(3)
+            .position(|w| w == [OpCode::Cmp32 as u8, 12, 15])
+            .expect("nested bytecode must contain cmp32 r12,r15");
+        assert_eq!(
+            bc.get(product_cmp + 3),
+            Some(&(OpCode::Jmp as u8)),
+            "cmp32 r12,r15 must be followed by jmp to single-digit path"
+        );
+        let jle_after_product_nine = bc
+            .windows(13)
+            .position(|w| {
+                w[0] == OpCode::LoadImm as u8
+                    && w[1] == 15
+                    && u64::from_le_bytes(w[2..10].try_into().unwrap()) == 9
+                    && w[10] == OpCode::Cmp32 as u8
+                    && w[11] == 12
+                    && w[12] == 15
+            })
+            .and_then(|p| {
+                let after = p + 13;
+                (after < bc.len() && bc[after] == OpCode::JmpIf as u8).then_some(after)
+            });
+        assert!(
+            jle_after_product_nine.is_none(),
+            "product<=9 must not use jmp_if JLE into two-digit path"
+        );
+    }
+
+    fn register_packed_putchar_natives(
+        vm: &mut crate::vm::VirtualMachine,
+        bytecode: &[u8],
+        putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
+    ) {
+        for id in iat_native_call_ids_in_bytecode(bytecode) {
+            if !is_iat_ptr_native_call(id) {
+                vm.register_native(id, putchar);
+            }
+        }
+        vm.register_native(3, putchar);
+    }
+
+    fn register_packed_stdio_natives(
+        vm: &mut crate::vm::VirtualMachine,
+        bytecode: &[u8],
+        putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
+        printf: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
+    ) {
+        for id in native_call_ids_in_bytecode(bytecode) {
+            if is_iat_ptr_native_call(id) {
+                vm.register_native(id, printf);
+            } else if is_iat_native_call(id) {
+                vm.register_native(id, putchar);
+            }
+        }
+        vm.register_native(2, printf);
+        vm.register_native(3, putchar);
+    }
+
+    #[test]
+    fn test_pack_real_mingw_nested_stdout_matches_unpacked() {
+        use crate::vm::VirtualMachine;
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        thread_local! {
+            static NESTED_OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        }
+
+        let pe_path = Path::new("sample/nested.exe");
+        if !pe_path.exists() {
+            return;
+        }
+
+        const GOLDEN: &[u8] = b"1x1=1\r\n1x2=2\r\n1x3=3\r\n2x1=2\r\n2x2=4\r\n2x3=6\r\n3x1=3\r\n3x2=6\r\n3x3=9\r\n";
+
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+
+        NESTED_OUT.with(|buf| buf.borrow_mut().clear());
+
+        fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let ch = vm.get_register(0)? as u8;
+            NESTED_OUT.with(|buf| {
+                let mut out = buf.borrow_mut();
+                if ch == b'\n' {
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    out.push(ch);
+                }
+            });
+            Ok(())
+        }
+
+        let putchar_id = native_call_iat_id(0x8260);
+        let mut vm = VirtualMachine::new(bc.clone());
+        register_packed_putchar_natives(&mut vm, &bc, putchar_native);
+        // Windows nested.exe may use a different IAT RVA than the Linux sample.
+        assert!(
+            iat_native_call_ids_in_bytecode(&bc)
+                .iter()
+                .any(|id| *id == putchar_id || (!is_iat_ptr_native_call(*id))),
+            "nested bytecode must contain at least one IAT putchar id, got {:?}",
+            iat_native_call_ids_in_bytecode(&bc)
+        );
+        vm.run().expect("nested VM run");
+
+        let out = NESTED_OUT.with(|buf| buf.borrow().clone());
+        assert_eq!(
+            out.len(),
+            GOLDEN.len(),
+            "nested stdout length must match unpacked (63 bytes CRLF)"
+        );
+        assert_eq!(
+            out.as_slice(),
+            GOLDEN,
+            "packed nested stdout must match unpacked golden (got {:?})",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn test_pack_real_mingw_loop_stdout_matches_unpacked() {
+        use crate::vm::VirtualMachine;
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        thread_local! {
+            static LOOP_OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        }
+
+        let pe_path = Path::new("sample/loop.exe");
+        if !pe_path.exists() {
+            return;
+        }
+
+        const GOLDEN: &[u8] = b"5\n4\n3\n2\n1\n";
+
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+
+        LOOP_OUT.with(|buf| buf.borrow_mut().clear());
+
+        fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let ch = vm.get_register(0)? as u8;
+            LOOP_OUT.with(|buf| buf.borrow_mut().push(ch));
+            Ok(())
+        }
+
+        fn printf_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let n = vm.get_register(2)?;
+            let s = format!("{n}\n");
+            for &ch in s.as_bytes() {
+                vm.set_register(0, ch as u64)?;
+                putchar_native(vm)?;
+            }
+            Ok(())
+        }
+
+        let mut vm = VirtualMachine::new(bc.clone());
+        register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
+        vm.run().expect("loop VM run");
+
+        let out = LOOP_OUT.with(|buf| buf.borrow().clone());
+        assert_eq!(out.as_slice(), GOLDEN, "loop stdout mismatch: {:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn test_pack_real_mingw_fact_stdout_matches_unpacked() {
+        use crate::vm::VirtualMachine;
+        use std::cell::RefCell;
+        use std::path::Path;
+
+        thread_local! {
+            static FACT_OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        }
+
+        let pe_path = Path::new("sample/fact.exe");
+        if !pe_path.exists() {
+            return;
+        }
+
+        const GOLDEN: &[u8] = b"120\n";
+
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let bc = pack_function(&mut pe, None).unwrap();
+
+        FACT_OUT.with(|buf| buf.borrow_mut().clear());
+
+        fn putchar_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let ch = vm.get_register(0)? as u8;
+            FACT_OUT.with(|buf| buf.borrow_mut().push(ch));
+            Ok(())
+        }
+
+        fn printf_native(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let n = vm.get_register(2)?;
+            let s = format!("{n}\n");
+            for &ch in s.as_bytes() {
+                vm.set_register(0, ch as u64)?;
+                putchar_native(vm)?;
+            }
+            Ok(())
+        }
+
+        let mut vm = VirtualMachine::new(bc.clone());
+        register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
+        vm.run().expect("fact VM run");
+
+        let out = FACT_OUT.with(|buf| buf.borrow().clone());
+        assert_eq!(out.as_slice(), GOLDEN, "fact stdout mismatch: {:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn test_pack_with_explicit_rva() {
+        let pe_data = test_pe::create_pe64_with_callee();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        pack_function(&mut pe, Some(main_rva)).unwrap();
+        let bc = extract_bytecode_from_packed(&pe).unwrap();
+        assert!(!bc.is_empty());
+        assert!(bc.contains(&(OpCode::LoadImm as u8)));
+    }
+
+    #[test]
+    fn test_cfg_collects_multiple_functions() {
+        let pe_data = test_pe::create_pe64_with_callee();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let text_start = pe.rva_to_file_offset(text.virtual_address).unwrap();
+        let text_end = text_start + text.size_of_raw_data as usize;
+        let main_off = text_start + 0x20;
+        let entries = collect_cfg_entries(
+            &pe,
+            main_off,
+            main_off,
+            text_start,
+            text_end,
+            &pe.parse_imports().unwrap(),
+            false,
+        )
+        .unwrap();
+        assert!(entries.len() >= 2);
+    }
 
     #[test]
     fn test_pack_creates_valid_pe() {
@@ -703,21 +1096,21 @@ mod tests {
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
             stub.windows(save_rsi.len()).any(|w| w == save_rsi),
-            "native_call must save bytecode rsi at [rbp-0x68]"
+            "native_call must save bytecode rsi at [rbp-0x98]"
         );
         assert!(
             stub.windows(restore_rsi.len()).any(|w| w == restore_rsi),
-            "native_call must restore bytecode rsi from [rbp-0x68]"
+            "native_call must restore bytecode rsi from [rbp-0x98]"
         );
-        let clobber_r3 = [0x48u8, 0x89, 0x85, 0x68, 0xFF, 0xFF, 0xFF];
+        let rsi_on_push_depth = [0x48u8, 0x89, 0xB5, 0x18, 0xFF, 0xFF, 0xFF];
         assert!(
-            !stub.windows(clobber_r3.len()).any(|w| w == clobber_r3),
-            "native_call must not clobber VM r3 via mov [rbp-0x68], rax"
+            !stub.windows(rsi_on_push_depth.len()).any(|w| w == rsi_on_push_depth),
+            "bytecode rsi save must not use push-depth slot [rbp-0xE8]"
         );
     }
 
     #[test]
-    fn test_detect_main_prefers_high_candidate() {
+    fn test_detect_main_prefers_user_main_pattern() {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let text = pe.get_section(".text").unwrap();
@@ -729,7 +1122,10 @@ mod tests {
         }
         let crt = [0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x28, 0xE8, 0x05, 0x00, 0x00, 0x00, 0x90, 0xC3];
         pe.data[text_off + 0x380..text_off + 0x380 + crt.len()].copy_from_slice(&crt);
-        let mainfn = [0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x10, 0x00, 0x00, 0x00, 0xC3];
+        let mainfn = [
+            0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xC7, 0x45, 0xFC, 0x03, 0x00, 0x00,
+            0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x10, 0x00, 0x00, 0x00, 0xC3,
+        ];
         pe.data[text_off + 0x400..text_off + 0x400 + mainfn.len()].copy_from_slice(&mainfn);
         let rva = super::detect_main_rva(&pe).unwrap();
         assert_eq!(rva, text.virtual_address + 0x400);
@@ -853,7 +1249,7 @@ mod tests {
             pe.data.push(0);
         }
         pe.data[off..off + msg.len()].copy_from_slice(msg);
-        let found = super::find_printf_literal_in_pe(&pe);
+        let found = super::find_string_literal_in_pe(&pe);
         assert_eq!(found.as_deref(), Some(&b"Hello, World!\n"[..]));
     }
 
@@ -904,5 +1300,35 @@ mod tests {
         assert!(nc_target >= table_end);
         assert_eq!(stub[nc_target], 0x48);
         assert_eq!(stub[nc_target + 1], 0x8B);
+    }
+
+    #[test]
+    fn test_pack_puts_thunk_emits_iat_native_call() {
+        let pe_data = test_pe::create_pe64_with_puts_thunk_call();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let imports = pe.parse_imports().unwrap();
+        let puts = imports.entries().iter().find(|e| e.name == "puts").unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
+        let ids = native_call_ids_in_bytecode(&bc);
+        assert!(
+            ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)),
+            "expected IAT puts native_call with ptr flag, got {:?}",
+            ids
+        );
+        assert!(bc.len() < 300, "puts thunk pack should stay small, got {} bytes", bc.len());
+    }
+
+    #[test]
+    fn test_pack_does_not_lift_forward_crt_call() {
+        let pe_data = test_pe::create_pe64_with_forward_crt_call();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
+        assert!(
+            bc.len() < 400,
+            "forward CRT must not be lifted into bytecode, got {} bytes",
+            bc.len()
+        );
     }
 }

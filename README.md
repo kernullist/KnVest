@@ -26,7 +26,9 @@ This is a toy/educational project, not a production-grade protector. It does NOT
 ## Features
 
 - **Minimal VM**: 16 registers, call stack, data stack, opcodes (load, arithmetic, control flow, native helpers)
-- **Pack**: Lifts `main` plus pre-main callees (functions starting with `push rbp`) into VM bytecode; new PE entry is the interpreter stub (`0x55` = `push rbp`, not a JMP-to-OEP trampoline)
+- **Pack**: Lifts `main` and CFG-reachable callees into VM bytecode; new PE entry is the interpreter stub (`0x55` = `push rbp`, not a JMP-to-OEP trampoline)
+- **IAT native calls (L3)**: Parses the PE import directory; `call [rip+IAT]` to `puts`/`printf`/etc. emits `native_call` with win64 ABI (rcx/rdx/r8/r9 + shadow space) via the real IAT slot
+- **CFG function collection (L3)**: BFS over direct near calls from the entry function instead of the old “main-front + push rbp only” heuristic; prologue-less entries accepted when reachable
 - **IR Display**: Pretty-prints VM bytecode with addresses and operands
 - **x64 lifter**: Uses [iced-x86](https://github.com/icedland/iced) to decode the lifted code window
 - **Portable**: Written in Rust, runs on Linux/Windows for pack/IR; packed binaries run on Windows
@@ -49,7 +51,7 @@ Virtualize the detected `main` function (default: auto-detect) and write a new P
 knvest pack input.exe -o output.exe
 ```
 
-To specify a custom function RVA:
+To specify a custom function RVA (lifts that function and all CFG-reachable callees within `.text`):
 
 ```bash
 knvest pack input.exe -o output.exe --rva 0x1234
@@ -71,68 +73,59 @@ Address  | Opcode       | Operands
 00000000 | push         | r5
 00000002 | move         | r5, r4
 ...
-00000024 | native_call  | 0x2
+00000024 | native_call  | 0x100000030
 0000002d | load_imm     | r0, 0x0
 00000036 | exit         | r0
 ```
 
+`native_call` values `0x100000000 | iat_rva` invoke the imported function through the IAT with win64 calling convention. Legacy helpers remain: `1` = WriteFile string, `2` = integer print, `3` = putchar.
+
 ## Runtime Model
 
-1. **Parse PE** and locate `main` (or use `--rva`)
-2. **Lift** `main` and real pre-main callees (must start with `0x55`; CRT/`__main` are skipped) via iced-x86 → VM opcodes
-3. **Inject** a `.knvest` section containing:
-   - An x64 VM interpreter stub (opcode → handler VA table dispatch)
-   - A `VMBC` marker followed by VM bytecode
-4. **Redirect** the PE entry point to the stub (first byte `0x55`)
-5. **Execute**: The stub interprets bytecode. Native helpers handle I/O:
-   - `native_call 1` — WriteFile a string from VM registers (used when the lifter emits it from real x64, e.g. hello via `printf`)
-   - `native_call 2` — print integer in `r2` with newline (1/2/3-digit branches)
-   - `native_call 3` — putchar one byte from `r0`, no newline
+1. **Parse PE** — locate `main` (or use `--rva`), parse import directory / IAT
+2. **CFG collect** — BFS from entry over direct `call rel32` targets in `.text`
+3. **Lift** via iced-x86 → VM opcodes; IAT thunks (`call [rip+disp]`) → IAT `native_call`; CRT startup imports (`__main`, `_initterm`, …) skipped by name
+4. **Inject** `.knvest` section: x64 interpreter stub + `VMBC` + bytecode
+5. **Redirect** EP to stub (first byte `0x55`)
+6. **Execute**: stub interprets bytecode; I/O via IAT win64 `native_call` or legacy helpers
 
-Overwriting the original EP bytes with `0xCC` still works: the packed program does not depend on executing the original EP.
+Overwriting the original EP bytes with `0xCC` still works.
 
-**Cmp / branches**: The interpreter stores x64-like flags (ZF/SF/CF/OF). `jmp_if` condition codes match x64 Jcc semantics (JE, JNE, JL, JLE, JG, JGE).
+**Cmp / branches**: ZF/SF/CF/OF stored x64-style; `jmp_if` uses native Jcc semantics on restored flags.
 
 ## Sample Programs
 
-The `sample/` directory contains seven C programs exercised by the packer:
+Eight MinGW-style C samples in `sample/`:
 
-| Sample   | Behavior |
-|----------|----------|
-| `hello`  | `printf("Hello, World!\n")` — lifted like all other samples (no special path) |
-| `loop`   | Countdown loop |
-| `arith`  | Arithmetic |
-| `call`   | Internal calls |
-| `nested` | Nested loops, `putchar` via native_call 3 |
-| `fact`   | Recursive factorial |
-| `str`    | Walks embedded `knvest\0` string via LoadByte |
+| Sample        | Behavior |
+|---------------|----------|
+| `hello`       | `printf("Hello, World!\n")` — legacy native_call 1 or IAT printf when resolved |
+| `puts_hello`  | **`puts("IAT puts hello")` — documents IAT win64 native_call path** |
+| `loop`        | Countdown loop |
+| `arith`       | Arithmetic |
+| `call`        | Internal calls |
+| `nested`      | Nested loops, putchar |
+| `fact`        | Recursive factorial |
+| `str`         | LoadByte string walk |
 
-### Building Samples (Windows)
-
-**MinGW:**
+### Building Samples (Windows / MinGW)
 
 ```bash
 x86_64-w64-mingw32-gcc sample/hello.c -o sample/hello.exe
-x86_64-w64-mingw32-gcc sample/loop.c -o sample/loop.exe
-# ... same for arith.c, call.c, nested.c, fact.c, str.c
-```
-
-**MSVC (Developer Command Prompt):**
-
-```bat
-cl /Fe:hello.exe sample\hello.c
-cl /Fe:loop.exe sample\loop.c
+x86_64-w64-mingw32-gcc sample/puts_hello.c -o sample/puts_hello.exe
+x86_64-w64-mingw32-gcc -O0 sample/loop.c -o sample/loop.exe
+# ... arith, call, nested, fact, str
 ```
 
 ### Pack and Run (Windows)
 
 ```bash
-knvest pack sample/hello.exe -o sample/hello_packed.exe
-knvest ir sample/hello_packed.exe
-sample\hello_packed.exe
+knvest pack sample/puts_hello.exe -o sample/puts_hello_packed.exe
+knvest ir sample/puts_hello_packed.exe    # expect native_call 0x10000xxxx (puts IAT RVA)
+sample\puts_hello_packed.exe              # IAT puts hello
 ```
 
-Verify: EP starts with `0x55`, stdout matches original (CRLF/LF ok), exit code 0; patching original EP to `CC` still prints the same output.
+Regression samples (hello, loop, arith, call, nested, fact, str) must still pack/ir/run with the same stdout as before.
 
 ## Testing
 
@@ -140,7 +133,7 @@ Verify: EP starts with `0x55`, stdout matches original (CRLF/LF ok), exit code 0
 cargo test
 ```
 
-Tests cover VM semantics, IR disassembly, PE parsing/packing, stub invariants (handler table, LoadByte rip-rel, WriteFile slot), and integration pack→IR workflow. Unit tests run on Linux without a Windows runtime.
+Tests cover IAT parse/resolve, CFG collection, `--rva` packing, VM semantics, stub invariants, and integration pack→IR. Unit tests run on Linux without a Windows runtime.
 
 ## Project Structure
 
@@ -150,6 +143,8 @@ src/
 ├── ir/          - IR disassembly and display
 ├── pe/
 │   ├── parser.rs
+│   ├── imports.rs  - PE import directory / IAT resolution
+│   ├── cfg.rs      - CFG-based function collection
 │   ├── lifter.rs   - iced-x86 lifter → VM bytecode
 │   ├── vm_stub.rs  - x64 interpreter stub generator
 │   └── packer.rs
@@ -157,7 +152,7 @@ src/
 ├── cli/
 └── main.rs
 
-sample/          - hello, loop, arith, call, nested, fact, str
+sample/          - hello, puts_hello, loop, arith, call, nested, fact, str
 tests/
 ```
 

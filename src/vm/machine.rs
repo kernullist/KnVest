@@ -191,6 +191,15 @@ impl VirtualMachine {
                 let val2 = self.get_register(src2)?;
                 self.set_register(dst, val1.wrapping_mul(val2))?;
             },
+
+            OpCode::And => {
+                let dst = self.read_u8()?;
+                let src1 = self.read_u8()?;
+                let src2 = self.read_u8()?;
+                let val1 = self.get_register(src1)?;
+                let val2 = self.get_register(src2)?;
+                self.set_register(dst, val1 & val2)?;
+            },
             
             OpCode::Xor => {
                 let dst = self.read_u8()?;
@@ -206,6 +215,22 @@ impl VirtualMachine {
                 let src2 = self.read_u8()?;
                 let val1 = self.get_register(src1)?;
                 let val2 = self.get_register(src2)?;
+                let result = val1.wrapping_sub(val2);
+                let zf = val1 == val2;
+                let sf = (result as i64) < 0;
+                let cf = val1 < val2;
+                let of = ((val1 ^ val2) & (val1 ^ result)) >> 63 != 0;
+                self.flags = (if zf { 0x40 } else { 0 })
+                    | (if sf { 0x80 } else { 0 })
+                    | (if cf { 0x01 } else { 0 })
+                    | (if of { 0x800 } else { 0 });
+            },
+
+            OpCode::Cmp32 => {
+                let src1 = self.read_u8()?;
+                let src2 = self.read_u8()?;
+                let val1 = self.get_register(src1)? as u32 as u64;
+                let val2 = self.get_register(src2)? as u32 as u64;
                 let result = val1.wrapping_sub(val2);
                 let zf = val1 == val2;
                 let sf = (result as i64) < 0;

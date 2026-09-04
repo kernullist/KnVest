@@ -209,6 +209,47 @@ impl PEFile {
         Err(PEError::InvalidPE(format!("Cannot resolve RVA {:#x}", rva)))
     }
 
+    pub fn file_offset_to_rva(&self, offset: usize) -> PEResult<u32> {
+        for i in 0..self.num_sections {
+            let section_offset = self.sections_offset + (i as usize * 40);
+            if section_offset + 40 > self.data.len() {
+                continue;
+            }
+
+            let virtual_address = u32::from_le_bytes([
+                self.data[section_offset + 12],
+                self.data[section_offset + 13],
+                self.data[section_offset + 14],
+                self.data[section_offset + 15],
+            ]);
+
+            let pointer_to_raw_data = u32::from_le_bytes([
+                self.data[section_offset + 20],
+                self.data[section_offset + 21],
+                self.data[section_offset + 22],
+                self.data[section_offset + 23],
+            ]);
+
+            let size_of_raw_data = u32::from_le_bytes([
+                self.data[section_offset + 16],
+                self.data[section_offset + 17],
+                self.data[section_offset + 18],
+                self.data[section_offset + 19],
+            ]);
+
+            let raw_start = pointer_to_raw_data as usize;
+            let raw_end = raw_start + size_of_raw_data as usize;
+            if offset >= raw_start && offset < raw_end {
+                return Ok(virtual_address + (offset - raw_start) as u32);
+            }
+        }
+
+        Err(PEError::InvalidPE(format!(
+            "Cannot resolve file offset {:#x}",
+            offset
+        )))
+    }
+
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> PEResult<()> {
         fs::write(path, &self.data)?;
         Ok(())
