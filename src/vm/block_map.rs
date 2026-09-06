@@ -1,5 +1,5 @@
 use super::opcode::OpCode;
-use super::opcode_map::{CANONICAL_OPCODE_COUNT, CANONICAL_OPCODES, OpcodeMap};
+use super::opcode_map::{CANONICAL_OPCODE_COUNT, CANONICAL_OPCODES, KNV4_MAGIC, OpcodeMap};
 
 /// Fixed wire byte for L4e block-map refresh (never assigned to semantic opcodes).
 pub const META_WIRE_BYTE: u8 = 0xFD;
@@ -66,7 +66,13 @@ impl BlockMapPlan {
             .unwrap_or_else(|| Self::block_opcode_map(base.seed(), bb_id as usize))
     }
 
-    pub fn fill_handler_tables<F>(&mut self, mut handler_off: F, set_map_off: i32)
+    pub fn fill_handler_tables(&mut self, plan: &HandlerRedirectPlan) {
+        for entry in &mut self.entries {
+            entry.handler_table = plan.build_handler_table(&entry.wire);
+        }
+    }
+
+    pub fn fill_handler_tables_with<F>(&mut self, mut handler_off: F, set_map_off: i32)
     where
         F: FnMut(OpCode) -> i32,
     {
@@ -240,6 +246,93 @@ where
 
 pub const HANDLER_REDIRECT_TABLE_SIZE: usize = 256 * 4;
 
+/// Cached canonical handler offsets relative to `handler_table` (L4a layout).
+/// Built once from a finalized stub **before** any runtime redirect-table patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandlerRedirectPlan {
+    /// Per canonical opcode index (same order as [`CANONICAL_OPCODES`]).
+    pub by_op: [i32; CANONICAL_OPCODE_COUNT],
+    pub nop_default: i32,
+    pub set_block_map: i32,
+}
+
+impl HandlerRedirectPlan {
+    pub fn offset_for(&self, op: OpCode) -> i32 {
+        let idx = CANONICAL_OPCODES
+            .iter()
+            .position(|&o| o == op)
+            .expect("canonical opcode only");
+        self.by_op[idx]
+    }
+
+    pub fn build_handler_table(
+        &self,
+        wire: &[u8; CANONICAL_OPCODE_COUNT],
+    ) -> [u8; HANDLER_REDIRECT_TABLE_SIZE] {
+        build_handler_table_from_plan(wire, self)
+    }
+}
+
+/// First byte after handler bodies (PackMetadata / string pool); dispatch must stay below this.
+pub fn handler_region_end(stub: &[u8], table_base: usize) -> usize {
+    let handler_lo = table_base.saturating_add(HANDLER_REDIRECT_TABLE_SIZE);
+    for pos in handler_lo..stub.len().saturating_sub(KNV4_MAGIC.len()) {
+        if &stub[pos..pos + KNV4_MAGIC.len()] == KNV4_MAGIC {
+            return pos;
+        }
+    }
+    stub.len()
+}
+
+/// Capture L4a-class redirect dwords from a finalized stub (base wire layout, pre-patch).
+pub fn collect_handler_redirect_plan(
+    stub: &[u8],
+    opcode_map: &OpcodeMap,
+) -> HandlerRedirectPlan {
+    let table_base = crate::pe::threaded::handler_table_base(stub);
+    let mut by_op = [0i32; CANONICAL_OPCODE_COUNT];
+    for (idx, op) in CANONICAL_OPCODES.iter().enumerate() {
+        let wire = opcode_map.encode(*op) as usize;
+        let patch_at = table_base + wire * 4;
+        by_op[idx] = i32::from_le_bytes(
+            stub[patch_at..patch_at + 4]
+                .try_into()
+                .expect("handler slot"),
+        );
+    }
+    let nop_idx = CANONICAL_OPCODES
+        .iter()
+        .position(|&o| o == OpCode::Nop)
+        .unwrap();
+    let meta_patch = table_base + (META_WIRE_BYTE as usize) * 4;
+    HandlerRedirectPlan {
+        by_op,
+        nop_default: by_op[nop_idx],
+        set_block_map: i32::from_le_bytes(
+            stub[meta_patch..meta_patch + 4]
+                .try_into()
+                .expect("meta slot"),
+        ),
+    }
+}
+
+pub fn build_handler_table_from_plan(
+    wire: &[u8; CANONICAL_OPCODE_COUNT],
+    plan: &HandlerRedirectPlan,
+) -> [u8; HANDLER_REDIRECT_TABLE_SIZE] {
+    let mut table = [0u8; HANDLER_REDIRECT_TABLE_SIZE];
+    for slot in table.chunks_exact_mut(4) {
+        slot.copy_from_slice(&plan.nop_default.to_le_bytes());
+    }
+    for (idx, &w) in wire.iter().enumerate() {
+        let patch = (w as usize) * 4;
+        table[patch..patch + 4].copy_from_slice(&plan.by_op[idx].to_le_bytes());
+    }
+    let meta_patch = (META_WIRE_BYTE as usize) * 4;
+    table[meta_patch..meta_patch + 4].copy_from_slice(&plan.set_block_map.to_le_bytes());
+    table
+}
+
 /// Verify every non-zero slot resolves to a stub handler body (not metadata/bytecode).
 pub fn validate_handler_table_targets(
     stub: &[u8],
@@ -249,6 +342,7 @@ pub fn validate_handler_table_targets(
     let handler_lo = table_base
         .checked_add(HANDLER_REDIRECT_TABLE_SIZE)
         .ok_or_else(|| "handler_table base overflow".to_string())?;
+    let handler_hi = handler_region_end(stub, table_base);
     for (slot, chunk) in table.chunks_exact(4).enumerate() {
         let off = i32::from_le_bytes(chunk.try_into().map_err(|_| "slot len")?);
         if off == 0 {
@@ -260,10 +354,9 @@ pub fn validate_handler_table_targets(
                 "slot {slot:#04x} rel off {off:#x} -> {target:#x} precedes handler region ({handler_lo:#x})"
             ));
         }
-        if target as usize >= stub.len() {
+        if target as usize >= handler_hi {
             return Err(format!(
-                "slot {slot:#04x} rel off {off:#x} -> {target:#x} past stub end ({:#x})",
-                stub.len()
+                "slot {slot:#04x} rel off {off:#x} -> {target:#x} past handler region ({handler_hi:#x})"
             ));
         }
     }
@@ -321,11 +414,13 @@ mod tests {
     fn validate_handler_table_rejects_forward_offset_into_tail() {
         use super::validate_handler_table_targets;
 
-        let stub = vec![0u8; 0x2000];
+        let mut stub = vec![0u8; 0x2000];
         let table_base = 0x1000;
+        // Place PackMetadata marker so handler region ends before the tail.
+        stub[0x1800..0x1804].copy_from_slice(KNV4_MAGIC);
         let mut table = [0u8; HANDLER_REDIRECT_TABLE_SIZE];
-        // +0x1000 from table_base lands past stub (simulates jumping into appended bytecode).
-        table[0xB5 * 4..0xB5 * 4 + 4].copy_from_slice(&0x1000i32.to_le_bytes());
+        // Lands in metadata / appended-bytecode region, not in handler bodies.
+        table[0xB5 * 4..0xB5 * 4 + 4].copy_from_slice(&0x800i32.to_le_bytes());
         assert!(validate_handler_table_targets(&stub, table_base, &table).is_err());
     }
 
@@ -338,7 +433,7 @@ mod tests {
         plan.record_block(42, 0);
         plan.record_block(42, 1);
         let mut counter = 0i32;
-        plan.fill_handler_tables(|_| {
+        plan.fill_handler_tables_with(|_| {
             counter += 1;
             counter
         }, 0x1234);

@@ -3,10 +3,11 @@ use super::lifter::{
     lift_to_vm_bytecode_for_main, native_stack_sync_pairs_from_map, prebuild_stack_map,
 };
 use super::vm_stub::create_vm_interpreter_stub;
-use super::threaded::{self, embed_thread_targets, handler_offset_for_op};
+use super::threaded::{self, embed_thread_targets};
 use super::cfg::{collect_cfg_entries, disassemble_cfg_function, build_basic_blocks};
 use super::partial::{NativeSledBuilder, PartialVirtPlan, KNV5_MAGIC};
 use crate::vm::{BlockMapPlan, DispatchMode, OpcodeMap, PackMetadata, random_seed, set_active_map, clear_active_map, KNV6_MAGIC};
+use crate::vm::block_map::collect_handler_redirect_plan;
 use crate::vm::opcode_map::KNV4_MAGIC;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
@@ -104,11 +105,8 @@ fn build_section_bytecode(
         native_sleds,
         native_sync,
     );
-    let handler_off = |op: crate::vm::OpCode| {
-        threaded::handler_offset_for_op(&vm_stub, opcode_map, op)
-    };
-    let set_map_off = threaded::handler_offset_for_set_block_map(&vm_stub);
-    block_map_plan.fill_handler_tables(handler_off, set_map_off);
+    let handler_plan = collect_handler_redirect_plan(&vm_stub, opcode_map);
+    block_map_plan.fill_handler_tables(&handler_plan);
     // Patch KNV6 blob after handler offsets are known.
     patch_knv6_in_stub(&mut vm_stub, block_map_plan);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
@@ -117,8 +115,8 @@ fn build_section_bytecode(
             bytecode,
             opcode_map,
             block_map_plan,
-            &|op| threaded::handler_offset_for_op(&vm_stub, opcode_map, op),
-            set_map_off,
+            &|op| handler_plan.offset_for(op),
+            handler_plan.set_block_map,
         )
     } else {
         bytecode.to_vec()
@@ -829,15 +827,21 @@ pub fn extract_block_map_from_packed(pe: &PEFile) -> PEResult<BlockMapPlan> {
 }
 
 pub(crate) fn patch_knv6_in_stub(stub: &mut [u8], block_map_plan: &BlockMapPlan) {
+    let bytes = block_map_plan.to_embedded_bytes();
     for i in 0..stub.len().saturating_sub(KNV6_MAGIC.len()) {
         if &stub[i..i + KNV6_MAGIC.len()] == KNV6_MAGIC {
-            let bytes = block_map_plan.to_embedded_bytes();
-            if i + bytes.len() <= stub.len() {
-                stub[i..i + bytes.len()].copy_from_slice(&bytes);
+            if i + bytes.len() > stub.len() {
+                panic!(
+                    "KNV6 patch overflow: blob at {i:#x} needs {} bytes, stub has {}",
+                    bytes.len(),
+                    stub.len() - i
+                );
             }
+            stub[i..i + bytes.len()].copy_from_slice(&bytes);
             return;
         }
     }
+    panic!("KNV6 magic not found in stub — block-map metadata missing");
 }
 
 /// Install the first BB's precomputed redirect table into the writable stub slot (L4e).
@@ -2238,6 +2242,102 @@ mod tests {
             map1.encode(OpCode::LoadImm),
             "same semantic load_imm must encode to different wire bytes in different blocks"
         );
+    }
+
+    #[test]
+    fn test_l4e_knv6_load_imm_slot_matches_l4a_redirect_plan() {
+        use crate::pe::threaded::handler_table_base;
+        use crate::vm::block_map::handler_region_end;
+
+        let seed = 0xAAAA_AAAA_u64;
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_pe_seed(&mut pe, None, seed);
+        let section = pe.get_section(".knvest").unwrap();
+        let start = section.pointer_to_raw_data as usize;
+        let section_end = (start + section.size_of_raw_data as usize).min(pe.data.len());
+        let section_data = &pe.data[start..section_end];
+        let vmbc = section_data
+            .windows(4)
+            .position(|w| w == b"VMBC")
+            .expect("VMBC marker in .knvest stub");
+        let stub = &section_data[..vmbc + 4];
+
+        let knv6_pe = extract_block_map_from_packed(&pe).unwrap();
+        assert_eq!(knv6_pe.entries.len(), packed.block_map_plan.entries.len());
+        for (pe_entry, mem_entry) in knv6_pe.entries.iter().zip(packed.block_map_plan.entries.iter()) {
+            assert_eq!(
+                pe_entry.handler_table, mem_entry.handler_table,
+                "PE-embedded KNV6 bb_id={} must match pack-time plan",
+                mem_entry.bb_id
+            );
+        }
+
+        let table_base = handler_table_base(stub);
+        let handler_hi = handler_region_end(stub, table_base);
+        let l4a_load_imm_off = {
+            let (fresh_stub, _) = create_vm_interpreter_stub(
+                0,
+                0,
+                &packed.opcode_map,
+                crate::vm::DispatchMode::Table,
+                &[],
+                &BlockMapPlan::default(),
+                &[],
+                &[],
+            );
+            let base = handler_table_base(&fresh_stub);
+            let wire = packed.opcode_map.encode(OpCode::LoadImm) as usize;
+            i32::from_le_bytes(
+                fresh_stub[base + wire * 4..base + wire * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+
+        for entry in &knv6_pe.entries {
+            let load_imm_wire = knv6_pe
+                .map_for_bb_or_base(entry.bb_id, &packed.opcode_map)
+                .encode(OpCode::LoadImm) as usize;
+            let slot_off = i32::from_le_bytes(
+                entry.handler_table[load_imm_wire * 4..load_imm_wire * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(
+                slot_off, l4a_load_imm_off,
+                "BB{} load_imm wire {load_imm_wire:#x}: KNV6 dword must match L4a class offset {l4a_load_imm_off:#x}",
+                entry.bb_id
+            );
+            let live_off = i32::from_le_bytes(
+                stub[table_base + load_imm_wire * 4..table_base + load_imm_wire * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(
+                live_off, slot_off,
+                "live handler_table slot must match embedded KNV6 for BB{}",
+                entry.bb_id
+            );
+            let target = table_base as i64 + slot_off as i64;
+            assert!(
+                (target as usize) < handler_hi,
+                "BB{} load_imm target {target:#x} must stay below metadata ({handler_hi:#x})",
+                entry.bb_id
+            );
+            assert_eq!(
+                stub[target as usize],
+                0x0F,
+                "BB{} dispatch must land on h_load_imm (0x0F …)",
+                entry.bb_id
+            );
+            assert_eq!(
+                stub[target as usize + 1],
+                0xB6,
+                "BB{} dispatch must land on h_load_imm (… 0xB6 …)",
+                entry.bb_id
+            );
+        }
     }
 
     #[test]

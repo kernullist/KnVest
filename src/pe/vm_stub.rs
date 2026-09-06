@@ -1187,7 +1187,7 @@ impl StubEmitter {
 #[cfg(test)]
 mod tests {
     use super::create_vm_interpreter_stub;
-    use crate::vm::block_map::KNV6_ENTRY_SIZE;
+    use crate::vm::block_map::{KNV6_ENTRY_SIZE, KNV6_MAGIC};
 
     /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
@@ -1338,7 +1338,8 @@ mod tests {
     #[test]
     fn knv6_handler_table_slots_resolve_inside_stub() {
         use crate::vm::block_map::{
-            validate_handler_table_targets, BlockMapPlan, install_handler_table_in_stub,
+            collect_handler_redirect_plan, validate_handler_table_targets, BlockMapPlan,
+            install_handler_table_in_stub,
         };
 
         let seed = 0x4C34_4100u64;
@@ -1359,16 +1360,29 @@ mod tests {
             &[],
             &[],
         );
-        let set_map_off =
-            crate::pe::threaded::handler_offset_for_set_block_map(&stub);
-        plan.fill_handler_tables(
-            |op| crate::pe::threaded::handler_offset_for_op(&stub, &map, op),
-            set_map_off,
-        );
+        let handler_plan = collect_handler_redirect_plan(&stub, &map);
+        plan.fill_handler_tables(&handler_plan);
         crate::pe::packer::patch_knv6_in_stub(&mut stub, &plan);
         crate::pe::packer::patch_runtime_handler_table(&mut stub, &plan);
 
+        let parsed = BlockMapPlan::from_embedded(
+            &stub[stub
+                .windows(KNV6_MAGIC.len())
+                .position(|w| w == KNV6_MAGIC)
+                .expect("KNV6")..],
+        )
+        .expect("parse KNV6");
+        assert_eq!(parsed.entries.len(), plan.entries.len());
+        for (got, want) in parsed.entries.iter().zip(plan.entries.iter()) {
+            assert_eq!(
+                got.handler_table, want.handler_table,
+                "embedded KNV6 bb_id={} handler_table must match plan",
+                want.bb_id
+            );
+        }
+
         let table_base = handler_table_base(&stub);
+        let load_imm_prologue = [0x0Fu8, 0xB6, 0x0E];
         for entry in &plan.entries {
             validate_handler_table_targets(&stub, table_base, &entry.handler_table)
                 .unwrap_or_else(|e| panic!("KNV6 bb_id={} invalid: {e}", entry.bb_id));
@@ -1399,8 +1413,9 @@ mod tests {
             );
             let target = table_base as i64 + off as i64;
             assert!(
-                (target as usize) < stub.len(),
-                "bb_id={} load_imm dispatch target must stay inside stub",
+                stub.get(target as usize..target as usize + load_imm_prologue.len())
+                    == Some(load_imm_prologue.as_slice()),
+                "bb_id={} load_imm wire {load_imm_wire:#x} off {off:#x} must land on h_load_imm prologue",
                 entry.bb_id
             );
         }
