@@ -460,8 +460,9 @@ impl StubEmitter {
     }
 
     fn emit_copy_knv6_redirect_to_frame_and_point_active(&mut self) {
-        // push rsi — bytecode PC must survive redirect-table copy
-        self.emit(&[0x56]);
+        // Frame is exactly sub rsp,0x930 — push/pop rsi would spill below rsp and corrupt
+        // the saved PC on table-mode ret → set_block_map refresh (call/nested/fact).
+        self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
         // lea rsi, [r15+0x1C]
         self.emit(&[0x49, 0x8D, 0x77, 0x1C]);
         // lea rdi, [rbp+REDIRECT_FRAME_BUF_OFF]
@@ -471,7 +472,7 @@ impl StubEmitter {
         self.emit(&REDIRECT_FRAME_QWORDS.to_le_bytes());
         self.emit(&[0xFC]); // cld
         self.emit(&[0xF3, 0x48, 0xA5]); // rep movsq
-        self.emit(&[0x5E]); // pop rsi
+        self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov rsi, [rbp-0x98]
         // lea rax, [rbp+REDIRECT_FRAME_BUF_OFF]; mov [rbp-0x130], rax
         self.emit_lea_from_rbp(0, REDIRECT_FRAME_BUF_OFF);
         self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
@@ -892,25 +893,26 @@ impl StubEmitter {
         self.lea_rip_rel32(0x48, 1, "bytecode");
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x29, 0xCE]);
+        self.emit_mov_reg_reg(10, 6); // mov r10, rsi — return index (keep out of rax/rsi)
         self.emit(&[0x48, 0x8B, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
         self.emit_mov_reg_reg(11, 0); // mov r11, rax — preserve callee target offset
         match self.dispatch_mode {
             DispatchMode::Table => {
                 self.emit_movzx_word_from_rbp_to_eax(-0x120); // caller bb_id for ret refresh
                 self.emit(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
-                self.emit(&[0x48, 0x09, 0xF0]); // or rax, rsi — lo32 = return index
+                self.emit(&[0x4C, 0x09, 0xD0]); // or rax, r10 — lo32 = return index
             }
             DispatchMode::Threaded => {
-                self.emit_mov_reg_reg(0, 6); // mov rax, rsi — return index only (no L4e bb_id)
+                self.emit_mov_reg_reg(0, 10); // mov rax, r10 — return index only (no L4e bb_id)
             }
         }
         self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]); // mov [rbp+rdx*8-0x200], rax
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
-        self.lea_rip_rel32(0x48, 6, "bytecode");
+        self.lea_rip_rel32(0x48, 1, "bytecode"); // lea rcx, [bytecode]
         self.emit_mov_reg_reg(0, 11); // mov rax, r11
-        self.emit(&[0x48, 0x01, 0xF0]);
-        self.emit(&[0x48, 0x89, 0xC6]);
+        self.emit(&[0x48, 0x01, 0xC8]); // add rax, rcx — callee entry (bytecode + offset)
+        self.emit(&[0x48, 0x89, 0xC6]); // mov rsi, rax
         self.jmp_to_dispatch();
     }
 
@@ -926,6 +928,7 @@ impl StubEmitter {
         self.emit(&[0x44, 0x0F, 0xB7, 0xC0]); // movzx r8d, eax — caller bb_id
         self.emit(&[0x48, 0x89, 0xD8]); // mov rax, rbx
         self.emit(&[0x48, 0x25, 0xFF, 0xFF, 0xFF, 0xFF]); // and eax, 0xFFFFFFFF — return index
+        self.emit(&[0x48, 0x63, 0xC0]); // movsxd rax, eax — zero-extend lo32 index
         self.lea_rip_rel32(0x48, 6, "bytecode"); // lea rsi, [bytecode]
         self.emit(&[0x48, 0x01, 0xF0]); // add rax, rsi — return bytecode pointer
         self.emit(&[0x48, 0x89, 0xC6]); // mov rsi, rax
@@ -1535,7 +1538,7 @@ mod tests {
         let save_bb = [
             0x66u8, 0x0F, 0xB7, 0x85, 0xE0, 0xFE, 0xFF, 0xFF, // movzx eax, [rbp-0x120]
             0x48, 0xC1, 0xE0, 0x20, // shl rax, 32
-            0x48, 0x09, 0xF0, // or rax, rsi
+            0x4C, 0x09, 0xD0, // or rax, r10
             0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF, // mov [rbp+rdx*8-0x200], rax
         ];
         assert!(
@@ -1600,6 +1603,10 @@ mod tests {
             .expect("h_ret and eax,0xffffffff");
         let after = &stub[ret_pos..ret_pos.saturating_add(32).min(stub.len())];
         assert!(
+            after.windows(3).any(|w| w == [0x48, 0x63, 0xC0]),
+            "h_ret must movsxd rax,eax before rebuilding return rsi"
+        );
+        assert!(
             after.contains(&0xE9),
             "h_ret must jmp to h_set_block_map_resolve"
         );
@@ -1643,12 +1650,20 @@ mod tests {
             .expect("h_set_block_map");
         let body = &stub[pos..pos.saturating_add(160).min(stub.len())];
         assert!(
-            body.contains(&0x56) && body.contains(&0x5E),
-            "h_set_block_map must push/pop rsi around frame redirect copy"
+            body.windows(7).any(|w| w == [0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]),
+            "h_set_block_map must save bytecode rsi to [rbp-0x98] before rep movsq"
+        );
+        assert!(
+            body.windows(7).any(|w| w == [0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]),
+            "h_set_block_map must restore bytecode rsi from [rbp-0x98] after rep movsq"
+        );
+        assert!(
+            !body.contains(&0x56),
+            "h_set_block_map must not push rsi (frame is exactly 0x930 — push spills below rsp)"
         );
         assert!(
             body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
-            "h_set_block_map must lea rsi,[r15+0x1C] as rep movsq source after push"
+            "h_set_block_map must lea rsi,[r15+0x1C] as rep movsq source"
         );
         assert!(
             body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
