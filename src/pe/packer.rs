@@ -1817,16 +1817,7 @@ mod tests {
     fn test_handler_table_resolves_handlers() {
         let map = OpcodeMap::from_seed(0);
         let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
-        let dispatch_lea = [0x48u8, 0x8D, 0x1D];
-        let mut table_base = None;
-        for i in 0..stub.len().saturating_sub(7) {
-            if stub[i..i + 3] == dispatch_lea {
-                let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
-                table_base = Some((i + 7) as isize + disp as isize);
-                break;
-            }
-        }
-        let table_base = table_base.expect("dispatch lea rbx,[handler_table]") as usize;
+        let table_base = super::threaded::handler_table_base(&stub);
         let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
         let load_imm_off = i32::from_le_bytes([
             stub[table_base + load_imm_wire * 4],
@@ -2254,16 +2245,7 @@ mod tests {
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
         let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
-        let pat = [0x48u8, 0x8D, 0x1D];
-        let mut table_base = 0usize;
-        for i in 0..stub.len().saturating_sub(7) {
-            if stub[i..i + 3] == pat {
-                let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
-                table_base = (i as i64 + 7 + disp as i64) as usize;
-                break;
-            }
-        }
-        let table_base = table_base as usize;
+        let table_base = super::threaded::handler_table_base(&stub);
         let map = OpcodeMap::from_seed(0);
         let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
         let load_imm_off = i32::from_le_bytes(

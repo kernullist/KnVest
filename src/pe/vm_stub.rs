@@ -148,7 +148,9 @@ impl StubEmitter {
     }
 
     fn emit_init_active_redirect_ptr_to_handler_table(&mut self) {
-        self.emit_lea_handler_table_rbx();
+        // lea rax,[handler_table]; mov [rip+active_redirect_ptr], rax
+        // Must match the register used in h_set_block_map (lea rax,[r15+0x1C]).
+        self.lea_rip_rel32(0x48, 0, "handler_table");
         self.emit_mov_qword_to_rip_label(0, "active_redirect_ptr");
     }
 
@@ -1649,12 +1651,16 @@ mod tests {
         let table_base = resolve_lea_rip(&stub, dispatch);
         let prologue_init = stub
             .windows(10)
-            .position(|w| w[0..3] == [0x48, 0x8D, 0x1D] && w[7..10] == [0x48, 0x89, 0x05])
-            .expect("prologue must seed active_redirect_ptr from handler_table");
+            .position(|w| w[0..3] == [0x48, 0x8D, 0x05] && w[7..10] == [0x48, 0x89, 0x05])
+            .expect("prologue must lea rax,[handler_table] then mov [rip+active_redirect_ptr], rax");
         assert_eq!(
             resolve_lea_rip(&stub, prologue_init),
             table_base,
             "prologue must point active_redirect_ptr at handler_table before first META"
+        );
+        assert!(
+            !stub[prologue_init..prologue_init + 10].starts_with(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0, 0x48, 0x89, 0x05]),
+            "prologue must not lea rbx,[handler_table] then store rax into active_redirect_ptr"
         );
     }
 
@@ -2884,14 +2890,7 @@ invoke_once:
     }
 
     fn handler_table_base(stub: &[u8]) -> usize {
-        let dispatch_lea = [0x48u8, 0x8D, 0x1D];
-        for i in 0..stub.len().saturating_sub(7) {
-            if stub[i..i + 3] == dispatch_lea {
-                let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
-                return ((i + 7) as isize + disp as isize) as usize;
-            }
-        }
-        panic!("dispatch lea rbx,[handler_table] not found");
+        crate::pe::threaded::handler_table_base(stub)
     }
 
     fn add_handler_offset(stub: &[u8], map: &crate::vm::OpcodeMap) -> usize {
