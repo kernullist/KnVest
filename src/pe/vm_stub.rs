@@ -845,9 +845,16 @@ impl StubEmitter {
         self.emit(&[0x48, 0x29, 0xCE]);
         self.emit(&[0x48, 0x8B, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
         self.emit_mov_reg_reg(11, 0); // mov r11, rax — preserve callee target offset
-        self.emit_movzx_word_from_rbp_to_eax(-0x120); // current bb_id for ret-stack packing
-        self.emit(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
-        self.emit(&[0x48, 0x09, 0xF0]); // or rax, rsi — lo32 = return index
+        match self.dispatch_mode {
+            DispatchMode::Table => {
+                self.emit_movzx_word_from_rbp_to_eax(-0x120); // caller bb_id for ret refresh
+                self.emit(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
+                self.emit(&[0x48, 0x09, 0xF0]); // or rax, rsi — lo32 = return index
+            }
+            DispatchMode::Threaded => {
+                self.emit_mov_reg_reg(0, 6); // mov rax, rsi — return index only (no L4e bb_id)
+            }
+        }
         self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]); // mov [rbp+rdx*8-0x200], rax
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
@@ -1437,6 +1444,26 @@ mod tests {
         assert!(
             !body.windows(8).any(|w| w == [0x66, 0x44, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]),
             "h_set_block_map must not store bb_id at [rbp-0x20] (VM r12 slot)"
+        );
+    }
+
+    #[test]
+    fn h_call_skips_bb_id_frame_read_in_threaded_mode() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Threaded,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        assert!(
+            !stub
+                .windows(8)
+                .any(|w| w == [0x66, 0x0F, 0xB7, 0x85, 0xE0, 0xFE, 0xFF, 0xFF]),
+            "threaded h_call must not read current_bb_id from [rbp-0x120]"
         );
     }
 
