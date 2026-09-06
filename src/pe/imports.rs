@@ -44,11 +44,11 @@ pub fn iat_rva_from_native_call(func_id: u64) -> u32 {
 
 /// Collect every `native_call` func_id embedded in lifted VM bytecode.
 pub fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
-    use crate::vm::OpCode;
+    use crate::vm::{active_decode, OpCode};
     let mut ids = Vec::new();
     let mut i = 0usize;
     while i < bytecode.len() {
-        if bytecode[i] == OpCode::NativeCall as u8 && i + 9 <= bytecode.len() {
+        if active_decode(bytecode[i]) == Some(OpCode::NativeCall) && i + 9 <= bytecode.len() {
             ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
             i += 9;
         } else {

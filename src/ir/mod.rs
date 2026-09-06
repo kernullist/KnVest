@@ -1,3 +1,4 @@
+use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 use std::fmt;
 
@@ -34,7 +35,7 @@ impl fmt::Display for Operand {
 }
 
 impl Instruction {
-    pub fn disassemble(bytecode: &[u8]) -> Vec<Self> {
+    pub fn disassemble(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
         let mut consecutive_invalid = 0;
@@ -44,7 +45,7 @@ impl Instruction {
             let opcode_byte = bytecode[offset];
             offset += 1;
 
-            let opcode = match OpCode::from_u8(opcode_byte) {
+            let opcode = match opcode_map.decode(opcode_byte) {
                 Some(op) => op,
                 None => {
                     consecutive_invalid += 1;
@@ -213,28 +214,41 @@ impl Instruction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::OpcodeMap;
 
     #[test]
-    fn test_disassemble_load_imm() {
-        let mut bytecode = vec![OpCode::LoadImm as u8, 0];
+    fn test_disassemble_load_imm_with_map() {
+        let map = OpcodeMap::from_seed(99);
+        let mut bytecode = vec![map.encode(OpCode::LoadImm), 0];
         bytecode.extend_from_slice(&42u64.to_le_bytes());
         
-        let instructions = Instruction::disassemble(&bytecode);
+        let instructions = Instruction::disassemble(&bytecode, &map);
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].opcode, OpCode::LoadImm);
         assert_eq!(instructions[0].operands.len(), 2);
     }
 
     #[test]
-    fn test_pretty_print() {
-        let mut bytecode = vec![OpCode::LoadImm as u8, 0];
+    fn test_pretty_print_with_shuffled_map() {
+        let map = OpcodeMap::from_seed(7);
+        let mut bytecode = vec![map.encode(OpCode::LoadImm), 0];
         bytecode.extend_from_slice(&42u64.to_le_bytes());
-        bytecode.push(OpCode::Exit as u8);
+        bytecode.push(map.encode(OpCode::Exit));
         bytecode.push(0);
         
-        let instructions = Instruction::disassemble(&bytecode);
+        let instructions = Instruction::disassemble(&bytecode, &map);
         let output = Instruction::pretty_print(&instructions);
         assert!(output.contains("load_imm"));
         assert!(output.contains("exit"));
+    }
+
+    #[test]
+    fn test_raw_bytes_fail_without_map() {
+        let map_a = OpcodeMap::from_seed(1);
+        let map_b = OpcodeMap::from_seed(2);
+        let mut bytecode = vec![map_a.encode(OpCode::LoadImm), 0];
+        bytecode.extend_from_slice(&1u64.to_le_bytes());
+        let wrong = Instruction::disassemble(&bytecode, &map_b);
+        assert!(wrong.iter().any(|i| !i.operands.is_empty() && matches!(i.operands[0], Operand::Unknown(_))));
     }
 }

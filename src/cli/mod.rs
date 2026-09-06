@@ -27,6 +27,8 @@ pub enum Commands {
         
         #[arg(long, help = "Function RVA to protect (hex format, e.g., 0x1000)")]
         rva: Option<String>,
+        #[arg(long, help = "Opcode shuffle seed (u64); random per pack if omitted")]
+        seed: Option<String>,
     },
 }
 

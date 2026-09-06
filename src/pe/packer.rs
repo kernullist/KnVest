@@ -2,11 +2,19 @@ use super::parser::{PEFile, PEResult, PEError};
 use super::lifter::lift_to_vm_bytecode_for_main;
 use super::vm_stub::create_vm_interpreter_stub;
 use super::cfg::{collect_cfg_entries, disassemble_cfg_function};
+use crate::vm::{OpcodeMap, random_seed, set_active_map, clear_active_map};
+use crate::vm::opcode_map::KNV4_MAGIC;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
 const FILE_ALIGNMENT: u32 = 0x200;
 
-pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec<u8>> {
+pub struct PackResult {
+    pub bytecode: Vec<u8>,
+    pub opcode_map: OpcodeMap,
+    pub seed: u64,
+}
+
+pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u64>) -> PEResult<PackResult> {
     let explicit_rva = function_rva.is_some();
     let target_rva = if let Some(rva) = function_rva {
         rva
@@ -15,11 +23,18 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>) -> PEResult<Vec
     };
     let original_entry_rva = pe.entry_point_rva;
 
-    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva, explicit_rva)?;
+    let pack_seed = seed.unwrap_or_else(random_seed);
+    let opcode_map = OpcodeMap::from_seed(pack_seed);
+
+    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva, explicit_rva, &opcode_map)?;
     
-    add_vm_section(pe, &[], &bytecode)?;
+    add_vm_section(pe, &[], &bytecode, &opcode_map)?;
     
-    Ok(bytecode)
+    Ok(PackResult {
+        bytecode,
+        opcode_map,
+        seed: pack_seed,
+    })
 }
 
 fn has_stack_prologue(text_data: &[u8], offset: usize) -> bool {
@@ -140,6 +155,7 @@ fn translate_to_vm_bytecode(
     target_rva: u32,
     _original_entry: u32,
     explicit_rva: bool,
+    opcode_map: &OpcodeMap,
 ) -> PEResult<Vec<u8>> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
@@ -183,6 +199,7 @@ fn translate_to_vm_bytecode(
     }
 
     let string_literal = find_string_literal_in_pe(pe);
+    set_active_map(opcode_map);
     let bytecode = lift_to_vm_bytecode_for_main(
         &all_instrs,
         target_rva,
@@ -190,7 +207,9 @@ fn translate_to_vm_bytecode(
         pe,
         string_literal.as_deref(),
         &imports,
+        opcode_map,
     );
+    clear_active_map();
 
     Ok(bytecode)
 }
@@ -220,7 +239,7 @@ fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
     None
 }
 
-fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) -> PEResult<()> {
+fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8], opcode_map: &OpcodeMap) -> PEResult<()> {
     let _original_entry_rva = pe.entry_point_rva;
     
     let last_section = get_last_section(pe)?;
@@ -243,7 +262,7 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8]) ->
     };
     
     let image_base = 0x140000000u64;
-    let (vm_stub, _) = create_vm_interpreter_stub(image_base, new_virtual_address);
+    let (vm_stub, _) = create_vm_interpreter_stub(image_base, new_virtual_address, opcode_map);
     
     let mut section_data = Vec::new();
     section_data.extend_from_slice(&vm_stub);
@@ -385,6 +404,26 @@ fn create_section_header(
     header
 }
 
+pub fn extract_opcode_map_from_packed(pe: &PEFile) -> PEResult<OpcodeMap> {
+    let section = pe.get_section(".knvest")?;
+    let section_start = section.pointer_to_raw_data as usize;
+    let section_end = section_start + section.size_of_raw_data as usize;
+    if section_end > pe.data.len() {
+        return Err(PEError::InvalidPE("Section data out of bounds".to_string()));
+    }
+    let section_data = &pe.data[section_start..section_end];
+    for i in 0..section_data.len().saturating_sub(KNV4_MAGIC.len()) {
+        if &section_data[i..i + KNV4_MAGIC.len()] == KNV4_MAGIC {
+            if let Some(map) = OpcodeMap::from_embedded(&section_data[i..]) {
+                return Ok(map);
+            }
+        }
+    }
+    Err(PEError::InvalidPE(
+        "Packed image missing KNV4 opcode map (L4a); raw bytecode cannot be decoded".to_string(),
+    ))
+}
+
 pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
     let knvest_section = pe.get_section(".knvest");
     
@@ -433,7 +472,17 @@ mod tests {
         native_call_iat_id, native_call_iat_ptr_id, native_call_ids_in_bytecode,
     };
     use crate::pe::test_pe;
-    use crate::vm::OpCode;
+    use crate::vm::{OpCode, OpcodeMap};
+
+    const TEST_SEED: u64 = 0x4C344100;
+
+    fn pack_pe(pe: &mut PEFile, rva: Option<u32>) -> PackResult {
+        pack_function(pe, rva, Some(TEST_SEED)).unwrap()
+    }
+
+    fn pack_pe_seed(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
+        pack_function(pe, rva, Some(seed)).unwrap()
+    }
 
     #[test]
     fn test_pack_mingw_printf_stub_skips_clobber_chain() {
@@ -443,8 +492,10 @@ mod tests {
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let text = pe.get_section(".text").unwrap();
         let main_rva = text.virtual_address + 0x400;
-        let bc = pack_function(&mut pe, Some(main_rva)).unwrap();
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let packed = pack_pe(&mut pe, Some(main_rva));
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map));
         assert!(
             !ir.contains("move r15, r8"),
             "packed printf stub must not emit r15<-r8:\n{ir}"
@@ -481,13 +532,15 @@ mod tests {
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
         let text = pe.get_section(".text").unwrap();
         let main_rva = text.virtual_address + 0x4d4;
-        let bc = pack_function(&mut pe, Some(main_rva)).unwrap();
+        let packed = pack_pe(&mut pe, Some(main_rva));
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
         assert!(
             bc.len() < 247,
             "packed real arith bytecode should shrink from 247, got {}",
             bc.len()
         );
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map));
         let lines: Vec<&str> = ir.lines().collect();
         let nc2_idx = lines
             .iter()
@@ -518,8 +571,10 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let bc = pack_function(&mut pe, None).unwrap();
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let packed = pack_pe(&mut pe, None);
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map));
         assert!(
             ir.contains("native_call  | 0x1"),
             "hello must use nc1 WriteFile string path:\n{ir}"
@@ -549,13 +604,15 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let bc = pack_function(&mut pe, None).unwrap();
+        let packed = pack_pe(&mut pe, None);
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
         assert!(
             (280..=310).contains(&bc.len()),
             "fact auto-main pack expected ~295 bytes, got {}",
             bc.len()
         );
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map));
         assert!(
             ir.contains("call         | 0x") && ir.matches("native_call  | 0x2").count() == 1,
             "fact must recurse via vm call and printf once via nc2:\n{ir}"
@@ -576,8 +633,10 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let bc = pack_function(&mut pe, None).unwrap();
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc));
+        let packed = pack_pe(&mut pe, None);
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
+        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map));
         assert!(
             ir.contains("native_call  | 0x10000"),
             "nested must use IAT putchar:\n{ir}"
@@ -617,26 +676,26 @@ mod tests {
         );
         let product_cmp = bc
             .windows(3)
-            .position(|w| w == [OpCode::Cmp32 as u8, 12, 15])
+            .position(|w| w == [map.encode(OpCode::Cmp32), 12, 15])
             .expect("nested bytecode must contain cmp32 r12,r15");
         assert_eq!(
             bc.get(product_cmp + 3),
-            Some(&(OpCode::Jmp as u8)),
+            Some(&(map.encode(OpCode::Jmp))),
             "cmp32 r12,r15 must be followed by jmp to single-digit path"
         );
         let jle_after_product_nine = bc
             .windows(13)
             .position(|w| {
-                w[0] == OpCode::LoadImm as u8
+                w[0] == map.encode(OpCode::LoadImm)
                     && w[1] == 15
                     && u64::from_le_bytes(w[2..10].try_into().unwrap()) == 9
-                    && w[10] == OpCode::Cmp32 as u8
+                    && w[10] == map.encode(OpCode::Cmp32)
                     && w[11] == 12
                     && w[12] == 15
             })
             .and_then(|p| {
                 let after = p + 13;
-                (after < bc.len() && bc[after] == OpCode::JmpIf as u8).then_some(after)
+                (after < bc.len() && bc[after] == map.encode(OpCode::JmpIf)).then_some(after)
             });
         assert!(
             jle_after_product_nine.is_none(),
@@ -692,7 +751,9 @@ mod tests {
         const GOLDEN: &[u8] = b"1x1=1\r\n1x2=2\r\n1x3=3\r\n2x1=2\r\n2x2=4\r\n2x3=6\r\n3x1=3\r\n3x2=6\r\n3x3=9\r\n";
 
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let bc = pack_function(&mut pe, None).unwrap();
+        let packed = pack_pe(&mut pe, None);
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
 
         NESTED_OUT.with(|buf| buf.borrow_mut().clear());
 
@@ -710,7 +771,7 @@ mod tests {
         }
 
         let putchar_id = native_call_iat_id(0x8260);
-        let mut vm = VirtualMachine::new(bc.clone());
+        let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
         register_packed_putchar_natives(&mut vm, &bc, putchar_native);
         // Windows nested.exe may use a different IAT RVA than the Linux sample.
         assert!(
@@ -754,7 +815,9 @@ mod tests {
         const GOLDEN: &[u8] = b"5\n4\n3\n2\n1\n";
 
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let bc = pack_function(&mut pe, None).unwrap();
+        let packed = pack_pe(&mut pe, None);
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
 
         LOOP_OUT.with(|buf| buf.borrow_mut().clear());
 
@@ -774,7 +837,7 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = VirtualMachine::new(bc.clone());
+        let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
         register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
         vm.run().expect("loop VM run");
 
@@ -800,7 +863,9 @@ mod tests {
         const GOLDEN: &[u8] = b"120\n";
 
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let bc = pack_function(&mut pe, None).unwrap();
+        let packed = pack_pe(&mut pe, None);
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
 
         FACT_OUT.with(|buf| buf.borrow_mut().clear());
 
@@ -820,7 +885,7 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = VirtualMachine::new(bc.clone());
+        let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
         register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
         vm.run().expect("fact VM run");
 
@@ -834,10 +899,11 @@ mod tests {
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let text = pe.get_section(".text").unwrap();
         let main_rva = text.virtual_address + 0x20;
-        pack_function(&mut pe, Some(main_rva)).unwrap();
+        pack_pe(&mut pe, Some(main_rva));
+        let map = extract_opcode_map_from_packed(&pe).unwrap();
         let bc = extract_bytecode_from_packed(&pe).unwrap();
         assert!(!bc.is_empty());
-        assert!(bc.contains(&(OpCode::LoadImm as u8)));
+        assert!(bc.contains(&(map.encode(OpCode::LoadImm))));
     }
 
     #[test]
@@ -867,12 +933,9 @@ mod tests {
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let original_entry = pe.entry_point_rva;
         
-        let result = pack_function(&mut pe, None);
-        assert!(result.is_ok());
-        
-        let bytecode = result.unwrap();
-        assert!(!bytecode.is_empty());
-        assert!(bytecode.contains(&(OpCode::LoadImm as u8)));
+        let packed = pack_pe(&mut pe, None);
+        assert!(!packed.bytecode.is_empty());
+        assert!(packed.bytecode.contains(&(packed.opcode_map.encode(OpCode::LoadImm))));
     }
 
     #[test]
@@ -880,7 +943,7 @@ mod tests {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         
-        pack_function(&mut pe, None).unwrap();
+        pack_pe(&mut pe, None);
         
         let section = pe.get_section(".knvest");
         assert!(section.is_ok());
@@ -891,14 +954,15 @@ mod tests {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         
-        pack_function(&mut pe, None).unwrap();
+        pack_pe(&mut pe, None);
+        let map = extract_opcode_map_from_packed(&pe).unwrap();
         
         let bytecode = extract_bytecode_from_packed(&pe);
         assert!(bytecode.is_ok());
         
         let bc = bytecode.unwrap();
         assert!(!bc.is_empty());
-        assert!(bc.contains(&(OpCode::LoadImm as u8)));
+        assert!(bc.contains(&(map.encode(OpCode::LoadImm))));
     }
 
     #[test]
@@ -906,7 +970,8 @@ mod tests {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         
-        pack_function(&mut pe, None).unwrap();
+        pack_pe(&mut pe, None);
+        let map = extract_opcode_map_from_packed(&pe).unwrap();
         
         let bytecode = extract_bytecode_from_packed(&pe).unwrap();
         
@@ -915,7 +980,7 @@ mod tests {
 
         let mut i = 0;
         while i < bytecode.len() {
-            if let Some(op) = OpCode::from_u8(bytecode[i]) {
+            if let Some(op) = map.decode(bytecode[i]) {
                 match op {
                     OpCode::LoadImm => has_load_imm = true,
                     OpCode::Exit => has_exit = true,
@@ -935,7 +1000,7 @@ mod tests {
         let original_size = pe_data.len();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         
-        pack_function(&mut pe, None).unwrap();
+        pack_pe(&mut pe, None);
         
         let section = pe.get_section(".knvest").unwrap();
         let ptr = section.pointer_to_raw_data as usize;
@@ -953,7 +1018,7 @@ mod tests {
     
     #[test]
     fn test_stub_encoding_correctness() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         
         let mut i = 0;
         while i < stub.len() {
@@ -988,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_stub_does_not_clobber_writefile_slot() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
         let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1005,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_loadbyte_uses_rip_rel_bytecode_base() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
@@ -1041,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_prologue_uses_near_jb_ja_not_jl_jg() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let cmp_a = [0x83u8, 0xF8, 0x41];
         let mut found_jb = false;
         for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
@@ -1066,7 +1131,8 @@ mod tests {
 
     #[test]
     fn test_handler_table_resolves_handlers() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let map = OpcodeMap::from_seed(0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map);
         let dispatch_lea = [0x48u8, 0x8D, 0x1D];
         let mut table_base = None;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1077,11 +1143,12 @@ mod tests {
             }
         }
         let table_base = table_base.expect("dispatch lea rbx,[handler_table]") as usize;
+        let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
         let load_imm_off = i32::from_le_bytes([
-            stub[table_base + 4],
-            stub[table_base + 5],
-            stub[table_base + 6],
-            stub[table_base + 7],
+            stub[table_base + load_imm_wire * 4],
+            stub[table_base + load_imm_wire * 4 + 1],
+            stub[table_base + load_imm_wire * 4 + 2],
+            stub[table_base + load_imm_wire * 4 + 3],
         ]);
         assert!(load_imm_off > 0, "handler offsets must be positive (handlers after table)");
         let h_load_imm = (table_base as i64 + load_imm_off as i64) as usize;
@@ -1091,7 +1158,7 @@ mod tests {
 
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1133,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let ne_cond = [0x83u8, 0xF9, 0x02];
         let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
@@ -1165,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_h_cmp_preserves_zf_in_flag_mask() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
         assert!(
             stub.windows(mask.len()).any(|w| w == mask),
@@ -1175,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_taken_uses_add_rsi_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let taken_add = [0x48u8, 0x01, 0xDE];
         assert!(
             stub.windows(taken_add.len()).any(|w| w == taken_add),
@@ -1185,7 +1252,7 @@ mod tests {
 
     #[test]
     fn test_three_digit_printer_uses_rcx_buffer() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
         let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1209,7 +1276,7 @@ mod tests {
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let original_size = pe.data.len();
         
-        pack_function(&mut pe, None).unwrap();
+        pack_pe(&mut pe, None);
         
         let preserved_marker = &pe.data[marker_offset..marker_offset + 10];
         assert_eq!(
@@ -1255,7 +1322,7 @@ mod tests {
 
     #[test]
     fn test_module_next_advances_rcx_not_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let advance_rcx = [0x48u8, 0x8B, 0x09];
         let advance_rbx = [0x48u8, 0x8B, 0x1B];
         assert!(
@@ -1270,7 +1337,7 @@ mod tests {
 
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let pat = [0x48u8, 0x8D, 0x1D];
         let mut table_base = 0usize;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1281,8 +1348,12 @@ mod tests {
             }
         }
         let table_end = table_base + 1024;
+        let map = OpcodeMap::from_seed(0);
+        let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
         let load_imm_off = i32::from_le_bytes(
-            stub[table_base + 4..table_base + 8].try_into().unwrap(),
+            stub[table_base + load_imm_wire * 4..table_base + load_imm_wire * 4 + 4]
+                .try_into()
+                .unwrap(),
         );
         let load_imm_target = (table_base as i64 + load_imm_off as i64) as usize;
         assert!(load_imm_off > 0);
@@ -1290,8 +1361,9 @@ mod tests {
         assert_eq!(stub[load_imm_target], 0x0F);
         assert_eq!(stub[load_imm_target + 1], 0xB6);
 
+        let nc_wire = map.encode(OpCode::NativeCall) as usize;
         let nc_off = i32::from_le_bytes(
-            stub[table_base + 0x0E * 4..table_base + 0x0E * 4 + 4]
+            stub[table_base + nc_wire * 4..table_base + nc_wire * 4 + 4]
                 .try_into()
                 .unwrap(),
         );
@@ -1309,7 +1381,10 @@ mod tests {
         let imports = pe.parse_imports().unwrap();
         let puts = imports.entries().iter().find(|e| e.name == "puts").unwrap();
         let text = pe.get_section(".text").unwrap();
-        let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
+        let packed = pack_pe(&mut pe, Some(text.virtual_address + 0x20));
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
+        crate::vm::set_active_map(&map);
         let ids = native_call_ids_in_bytecode(&bc);
         assert!(
             ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)),
@@ -1320,11 +1395,45 @@ mod tests {
     }
 
     #[test]
+    fn test_l4a_seed_shuffle_changes_wire_bytes_same_ir() {
+        use crate::ir::Instruction;
+
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe_a = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_b = PEFile::from_bytes(pe_data).unwrap();
+        let packed_a = pack_pe_seed(&mut pe_a, None, 0xAAAA_AAAA);
+        let packed_b = pack_pe_seed(&mut pe_b, None, 0xBBBB_BBBB);
+        assert_ne!(packed_a.bytecode, packed_b.bytecode);
+        let ir_a = Instruction::pretty_print(
+            &Instruction::disassemble(&packed_a.bytecode, &packed_a.opcode_map),
+        );
+        let ir_b = Instruction::pretty_print(
+            &Instruction::disassemble(&packed_b.bytecode, &packed_b.opcode_map),
+        );
+        assert!(ir_a.contains("load_imm"));
+        assert!(ir_b.contains("load_imm"));
+        assert!(ir_a.contains("exit"));
+        assert!(ir_b.contains("exit"));
+    }
+
+    #[test]
+    fn test_l4a_embedded_map_roundtrip_in_section() {
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_pe_seed(&mut pe, None, 0x1234_5678_9ABC_DEF0);
+        let map = extract_opcode_map_from_packed(&pe).unwrap();
+        assert_eq!(map.seed(), 0x1234_5678_9ABC_DEF0);
+        assert_eq!(map.wire_table(), packed.opcode_map.wire_table());
+    }
+
+    #[test]
     fn test_pack_does_not_lift_forward_crt_call() {
         let pe_data = test_pe::create_pe64_with_forward_crt_call();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let text = pe.get_section(".text").unwrap();
-        let bc = pack_function(&mut pe, Some(text.virtual_address + 0x20)).unwrap();
+        let packed = pack_pe(&mut pe, Some(text.virtual_address + 0x20));
+        let bc = packed.bytecode;
+        let map = packed.opcode_map;
         assert!(
             bc.len() < 400,
             "forward CRT must not be lifted into bytecode, got {} bytes",

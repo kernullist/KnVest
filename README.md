@@ -57,6 +57,12 @@ To specify a custom function RVA (lifts that function and all CFG-reachable call
 knvest pack input.exe -o output.exe --rva 0x1234
 ```
 
+```bash
+knvest pack input.exe -o output.exe --seed 0xdeadbeef
+```
+
+Each pack (or explicit `--seed`) permutes the 18 implemented opcode wire bytes and shuffles handler placement in the stub. The seed and wire table are embedded in `.knvest` immediately before the `VMBC` marker as a `KNV4` header so `knvest ir` can decode shuffled bytecode. Packing without a reproducible seed picks a random value and records it in the image.
+
 ### View IR
 
 Pretty-print the VM bytecode from a packed executable:
@@ -85,9 +91,22 @@ Address  | Opcode       | Operands
 1. **Parse PE** — locate `main` (or use `--rva`), parse import directory / IAT
 2. **CFG collect** — BFS from entry over direct `call rel32` targets in `.text`
 3. **Lift** via iced-x86 → VM opcodes; IAT thunks (`call [rip+disp]`) → IAT `native_call`; CRT startup imports (`__main`, `_initterm`, …) skipped by name
-4. **Inject** `.knvest` section: x64 interpreter stub + `VMBC` + bytecode
+4. **Inject** `.knvest` section: x64 interpreter stub + `KNV4` opcode map + `VMBC` + bytecode
 5. **Redirect** EP to stub (first byte `0x55`)
-6. **Execute**: stub interprets bytecode; I/O via IAT win64 `native_call` or legacy helpers
+6. **Execute**: stub dispatches via a 256-entry handler table keyed by shuffled wire bytes; I/O via IAT win64 `native_call` or legacy helpers
+
+### L4a opcode map (`KNV4` header)
+
+Placed in `.knvest` after string blobs, 16-byte aligned, immediately before `VMBC`:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Magic `KNV4` |
+| 4 | 1 | Version `1` |
+| 5 | 8 | Pack seed (`u64` LE) |
+| 13 | 18 | Wire bytes for canonical opcodes (Nop, LoadImm, Move, …, Exit) |
+
+`knvest ir` scans `.knvest` for `KNV4`, rebuilds the decode table, and prints logical mnemonics. Raw bytecode without this header cannot be disassembled.
 
 Overwriting the original EP bytes with `0xCC` still works.
 
