@@ -111,6 +111,7 @@ fn build_section_bytecode(
     block_map_plan.fill_handler_tables(handler_off, set_map_off);
     // Patch KNV6 blob after handler offsets are known.
     patch_knv6_in_stub(&mut vm_stub, block_map_plan);
+    patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
         embed_thread_targets(
             bytecode,
@@ -827,7 +828,7 @@ pub fn extract_block_map_from_packed(pe: &PEFile) -> PEResult<BlockMapPlan> {
     ))
 }
 
-fn patch_knv6_in_stub(stub: &mut [u8], block_map_plan: &BlockMapPlan) {
+pub(crate) fn patch_knv6_in_stub(stub: &mut [u8], block_map_plan: &BlockMapPlan) {
     for i in 0..stub.len().saturating_sub(KNV6_MAGIC.len()) {
         if &stub[i..i + KNV6_MAGIC.len()] == KNV6_MAGIC {
             let bytes = block_map_plan.to_embedded_bytes();
@@ -836,6 +837,18 @@ fn patch_knv6_in_stub(stub: &mut [u8], block_map_plan: &BlockMapPlan) {
             }
             return;
         }
+    }
+}
+
+/// Install the first BB's precomputed redirect table into the writable stub slot (L4e).
+pub(crate) fn patch_runtime_handler_table(stub: &mut [u8], block_map_plan: &BlockMapPlan) {
+    let Some(first) = block_map_plan.entries.first() else {
+        return;
+    };
+    let base = super::threaded::handler_table_base(stub);
+    let end = base + first.handler_table.len();
+    if end <= stub.len() {
+        stub[base..end].copy_from_slice(&first.handler_table);
     }
 }
 
@@ -1659,8 +1672,9 @@ mod tests {
             stub[table_base + load_imm_wire * 4 + 2],
             stub[table_base + load_imm_wire * 4 + 3],
         ]);
-        assert!(load_imm_off > 0, "handler offsets must be positive (handlers after table)");
+        assert!(load_imm_off != 0, "handler offset must be non-zero");
         let h_load_imm = (table_base as i64 + load_imm_off as i64) as usize;
+        assert!(h_load_imm < stub.len(), "handler target must land inside stub");
         assert_eq!(stub[h_load_imm], 0x0F);
         assert_eq!(stub[h_load_imm + 1], 0xB6);
     }
@@ -2087,7 +2101,7 @@ mod tests {
                 break;
             }
         }
-        let table_end = table_base + 1024;
+        let table_base = table_base as usize;
         let map = OpcodeMap::from_seed(0);
         let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
         let load_imm_off = i32::from_le_bytes(
@@ -2096,8 +2110,11 @@ mod tests {
                 .unwrap(),
         );
         let load_imm_target = (table_base as i64 + load_imm_off as i64) as usize;
-        assert!(load_imm_off > 0);
-        assert!(load_imm_target >= table_end);
+        assert!(load_imm_off != 0);
+        assert!(
+            load_imm_target < table_base,
+            "handlers must precede writable handler_table (target {load_imm_target:#x}, table {table_base:#x})"
+        );
         assert_eq!(stub[load_imm_target], 0x0F);
         assert_eq!(stub[load_imm_target + 1], 0xB6);
 
@@ -2108,8 +2125,11 @@ mod tests {
                 .unwrap(),
         );
         let nc_target = (table_base as i64 + nc_off as i64) as usize;
-        assert!(nc_off > 0);
-        assert!(nc_target >= table_end);
+        assert!(nc_off != 0);
+        assert!(
+            nc_target < table_base,
+            "native_call handler must precede handler_table"
+        );
         assert_eq!(stub[nc_target], 0x48);
         assert_eq!(stub[nc_target + 1], 0x8B);
     }

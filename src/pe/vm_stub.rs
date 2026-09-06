@@ -1,5 +1,5 @@
 use crate::vm::dispatch::DispatchMode;
-use crate::vm::block_map::{BlockMapPlan, KNV6_HEADER_SIZE, META_WIRE_BYTE};
+use crate::vm::block_map::{BlockMapPlan, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE};
 use crate::vm::opcode_map::{CANONICAL_OPCODES, OpcodeMap, PackMetadata};
 use std::collections::HashMap;
 
@@ -35,7 +35,6 @@ pub fn create_vm_interpreter_stub(
     let mut e = StubEmitter::new(map, dispatch_mode, native_sync, block_map_plan);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
-    e.emit_handler_table_placeholder();
     e.emit_handlers();
     e.emit_strings_and_marker(knv5, block_map_plan, native_sleds);
     e.finalize()
@@ -367,8 +366,8 @@ impl StubEmitter {
     /// L4e: refresh opcode wire -> handler table from KNV6 entry for bb_id operand.
     fn emit_handler_set_block_map(&mut self) {
         self.label("h_set_block_map");
-        // movzx r8d, word [rsi]
-        self.emit(&[0x45, 0x0F, 0xB7, 0x06]);
+        // movzx r8d, word [rsi] — REX.R for r8 dest only (0x44); 0x45 wrongly sets REX.B → [r14]
+        self.emit(&[0x44, 0x0F, 0xB7, 0x06]);
         // add rsi, 2
         self.emit(&[0x48, 0x83, 0xC6, 0x02]);
         // lea r15, [rip + knv6_entries]
@@ -380,8 +379,15 @@ impl StubEmitter {
         // cmp word [r15], r8w
         self.emit(&[0x66, 0x45, 0x39, 0x07]);
         self.jcc_rel32_short(0x74, "h_set_block_map_found");
-        // add r15, KNV6_ENTRY_SIZE (1032)
-        self.emit(&[0x49, 0x81, 0xC7, 0x08, 0x04, 0x00, 0x00]);
+        // add r15, KNV6_ENTRY_SIZE
+        let stride = KNV6_ENTRY_SIZE as u32;
+        self.emit(&[
+            0x49, 0x81, 0xC7,
+            (stride & 0xFF) as u8,
+            ((stride >> 8) & 0xFF) as u8,
+            ((stride >> 16) & 0xFF) as u8,
+            ((stride >> 24) & 0xFF) as u8,
+        ]);
         // dec ecx; jnz search
         self.emit(&[0xFF, 0xC9]);
         self.jcc_rel32_short(0x75, "h_set_block_map_search");
@@ -398,6 +404,8 @@ impl StubEmitter {
         self.emit(&[0x4D, 0x8D, 0x67, 0x1C]);
         // lea rdi, [handler_table]
         self.lea_rip_rel32(0x48, 7, "handler_table");
+        // cld — rep movsq must run forward (DF=0)
+        self.emit(&[0xFC]);
         // mov rsi, r12; mov ecx, 128; rep movsq
         self.emit(&[0x49, 0x89, 0xE6]);
         self.emit(&[0xB9, 0x80, 0x00, 0x00, 0x00]);
@@ -1125,6 +1133,8 @@ impl StubEmitter {
         self.emit(&block_map_plan.to_embedded_bytes());
         self.labels.insert("knv6_count", knv6_pos + 9);
         self.labels.insert("knv6_entries", knv6_pos + KNV6_HEADER_SIZE);
+        // Writable handler redirect table (L4e runtime refresh target; lives in data tail not mid-code).
+        self.emit_handler_table_placeholder();
         self.label("exit_wire_cmp_slot");
         self.emit(&[0x00]);
         while self.pos() % 16 != 0 {
@@ -1178,6 +1188,7 @@ impl StubEmitter {
 #[cfg(test)]
 mod tests {
     use super::create_vm_interpreter_stub;
+    use crate::vm::block_map::KNV6_ENTRY_SIZE;
 
     /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
@@ -1214,6 +1225,30 @@ mod tests {
     }
 
     #[test]
+    fn set_block_map_movzx_reads_bb_id_from_rsi_not_r14() {
+        let (stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        const CORRECT: [u8; 4] = [0x44, 0x0F, 0xB7, 0x06];
+        const WRONG: [u8; 4] = [0x45, 0x0F, 0xB7, 0x06];
+        assert!(
+            stub.windows(CORRECT.len()).any(|w| w == CORRECT),
+            "h_set_block_map must emit movzx r8d,word [rsi] as 44 0f b7 06"
+        );
+        assert!(
+            !stub.windows(WRONG.len()).any(|w| w == WRONG),
+            "h_set_block_map must not emit 45 0f b7 06 (REX.B turns [rsi] into [r14])"
+        );
+    }
+
+    #[test]
     fn set_block_map_handler_preserves_bytecode_rsi() {
         let (stub, _) = create_vm_interpreter_stub(
             0,
@@ -1225,7 +1260,7 @@ mod tests {
             &[],
             &[],
         );
-        let sig = [0x45u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
         let pos = stub
             .windows(sig.len())
             .position(|w| w == sig)
@@ -1247,6 +1282,114 @@ mod tests {
             body.windows(4).any(|w| w == [0x4D, 0x8D, 0x67, 0x1C]),
             "h_set_block_map must lea r12,[r15+28] for rep movsq source"
         );
+    }
+
+    #[test]
+    fn knv6_search_stride_matches_entry_size() {
+        let (stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let stride = KNV6_ENTRY_SIZE as u32;
+        let expected = [
+            0x49,
+            0x81,
+            0xC7,
+            (stride & 0xFF) as u8,
+            ((stride >> 8) & 0xFF) as u8,
+            ((stride >> 16) & 0xFF) as u8,
+            ((stride >> 24) & 0xFF) as u8,
+        ];
+        assert!(
+            stub.windows(expected.len()).any(|w| w == expected),
+            "h_set_block_map must advance r15 by KNV6_ENTRY_SIZE ({KNV6_ENTRY_SIZE:#x}), not 0x408"
+        );
+    }
+
+    #[test]
+    fn handler_table_lives_in_data_tail_not_mid_code() {
+        let (stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let table_base = handler_table_base(&stub);
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+        let set_map = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        assert!(
+            table_base > set_map,
+            "writable handler_table must follow handler code (table at {table_base:#x}, h_set_block_map at {set_map:#x})"
+        );
+        let knv6 = stub
+            .windows(4)
+            .position(|w| w == b"KNV6")
+            .expect("KNV6");
+        assert!(
+            table_base > knv6,
+            "handler_table must sit in data tail after KNV6 metadata"
+        );
+    }
+
+    #[test]
+    fn knv6_handler_table_slots_resolve_inside_stub() {
+        use crate::vm::block_map::BlockMapPlan;
+
+        let seed = 0x4C34_4100u64;
+        let map = crate::vm::OpcodeMap::from_seed(seed);
+        let mut plan = BlockMapPlan {
+            decode_key: BlockMapPlan::global_decode_key(seed),
+            entries: Vec::new(),
+        };
+        plan.record_block(seed, 0);
+        plan.record_block(seed, 1);
+        let (mut stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            &[],
+            &plan,
+            &[],
+            &[],
+        );
+        let set_map_off =
+            crate::pe::threaded::handler_offset_for_set_block_map(&stub);
+        plan.fill_handler_tables(
+            |op| crate::pe::threaded::handler_offset_for_op(&stub, &map, op),
+            set_map_off,
+        );
+        crate::pe::packer::patch_knv6_in_stub(&mut stub, &plan);
+        crate::pe::packer::patch_runtime_handler_table(&mut stub, &plan);
+
+        let table_base = handler_table_base(&stub);
+        for entry in &plan.entries {
+            for chunk in entry.handler_table.chunks_exact(4) {
+                let off = i32::from_le_bytes(chunk.try_into().unwrap());
+                if off == 0 {
+                    continue;
+                }
+                let target = table_base as i64 + off as i64;
+                assert!(
+                    target >= 0 && (target as usize) < stub.len(),
+                    "KNV6 bb_id={} handler slot offset {off:#x} must resolve inside stub",
+                    entry.bb_id
+                );
+            }
+        }
     }
 
     #[test]

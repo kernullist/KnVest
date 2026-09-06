@@ -178,7 +178,7 @@ pub fn handler_offset_for_op(stub: &[u8], opcode_map: &OpcodeMap, op: OpCode) ->
 
 /// Handler offset for the L4e block-map refresh meta handler.
 pub fn handler_offset_for_set_block_map(stub: &[u8]) -> i32 {
-    let sig = [0x45u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
+    let sig = [0x44u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
     let table_base = handler_table_base(stub);
     let pos = stub
         .windows(sig.len())
