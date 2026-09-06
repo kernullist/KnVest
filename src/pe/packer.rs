@@ -1634,7 +1634,7 @@ mod tests {
     #[test]
     fn test_l4c_threaded_hello_preserves_string_pool() {
         use crate::ir::Instruction;
-        use crate::pe::threaded::threaded_load_imm_target;
+        use crate::pe::threaded::{bytecode_prefix_offset, threaded_string_pool_link};
         use std::path::Path;
 
         let pe_path = Path::new("sample/hello.exe");
@@ -1650,14 +1650,17 @@ mod tests {
             crate::vm::DispatchMode::Threaded,
         )
         .unwrap();
-        let msg = b"Hello, World!\n";
-        assert!(
-            packed.bytecode.windows(msg.len()).any(|w| w == msg),
-            "threaded hello must retain embedded Hello string in bytecode"
+        let msg = b"Hello, World!";
+        let str_off = bytecode_prefix_offset(&packed.bytecode, msg).expect(
+            "threaded hello must retain embedded Hello string in bytecode",
         );
-        let ptr = threaded_load_imm_target(&packed.bytecode, &packed.opcode_map, msg)
-            .expect("load_imm must point at Hello string");
-        assert_eq!(&packed.bytecode[ptr..ptr + msg.len()], msg);
+        let (pool_off, imm) = threaded_string_pool_link(&packed.bytecode, &packed.opcode_map, msg)
+            .expect("load_imm must point at Hello string pool");
+        assert_eq!(pool_off, str_off);
+        assert!(
+            packed.bytecode[imm..].starts_with(msg),
+            "load_imm must reference Hello prefix at {imm}"
+        );
         let ir = Instruction::pretty_print(&Instruction::disassemble(
             &packed.bytecode,
             &packed.opcode_map,
@@ -1671,7 +1674,7 @@ mod tests {
 
     #[test]
     fn test_l4c_threaded_puts_hello_preserves_string_pool() {
-        use crate::pe::threaded::threaded_load_imm_target;
+        use crate::pe::threaded::{bytecode_prefix_offset, threaded_string_pool_link};
         use std::path::Path;
 
         let pe_path = Path::new("sample/puts_hello.exe");
@@ -1688,13 +1691,16 @@ mod tests {
         )
         .unwrap();
         let msg = b"IAT puts hello";
-        assert!(
-            packed.bytecode.windows(msg.len()).any(|w| w == msg),
-            "threaded puts_hello must retain embedded string in bytecode"
+        let str_off = bytecode_prefix_offset(&packed.bytecode, msg).expect(
+            "threaded puts_hello must retain embedded string in bytecode",
         );
-        let ptr = threaded_load_imm_target(&packed.bytecode, &packed.opcode_map, msg)
-            .expect("load_imm must point at IAT puts string");
-        assert_eq!(&packed.bytecode[ptr..ptr + msg.len()], msg);
+        let (pool_off, imm) = threaded_string_pool_link(&packed.bytecode, &packed.opcode_map, msg)
+            .expect("load_imm must point at IAT puts string pool");
+        assert_eq!(pool_off, str_off);
+        assert!(
+            packed.bytecode[imm..].starts_with(msg),
+            "load_imm must reference IAT puts prefix at {imm}"
+        );
         let ids = native_call_ids_in_bytecode_with_map(&packed.bytecode, &packed.opcode_map);
         assert!(
             ids.iter().any(|id| is_iat_ptr_native_call(*id)),

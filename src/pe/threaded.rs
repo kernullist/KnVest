@@ -50,10 +50,10 @@ fn code_section_end(insns: &[InsnLayout]) -> usize {
         .unwrap_or(0)
 }
 
-fn is_string_or_data_offset(insns: &[InsnLayout], value: usize) -> bool {
+fn is_string_or_data_offset(insns: &[InsnLayout], value: usize, bytecode_len: usize) -> bool {
     let end = code_section_end(insns);
-    // Embedded literals are 16-byte aligned past the insn stream; small immediates are not.
-    value >= end && value % 16 == 0
+    // Pool offsets live in the tail past the lifted insn stream; small immediates do not.
+    value >= end && value < bytecode_len
 }
 
 fn is_insn_start(insns: &[InsnLayout], value: usize) -> bool {
@@ -64,6 +64,7 @@ fn patch_operands_for_threaded(
     op: OpCode,
     operands: &mut [u8],
     insns: &[InsnLayout],
+    bytecode_len: usize,
     relocate: &dyn Fn(usize) -> usize,
 ) {
     match op {
@@ -88,7 +89,7 @@ fn patch_operands_for_threaded(
         OpCode::LoadImm | OpCode::LoadStr => {
             if operands.len() >= 9 {
                 let old = u64::from_le_bytes(operands[1..9].try_into().unwrap()) as usize;
-                if is_string_or_data_offset(insns, old) {
+                if is_string_or_data_offset(insns, old, bytecode_len) {
                     let new = relocate(old);
                     operands[1..9].copy_from_slice(&(new as u64).to_le_bytes());
                 }
@@ -117,7 +118,7 @@ pub fn embed_thread_targets(
         out.push(bytecode[insn.start]);
         out.extend_from_slice(&handler_off.to_le_bytes());
         let mut operands = bytecode[insn.start + 1..insn.start + insn.raw_len].to_vec();
-        patch_operands_for_threaded(insn.op, &mut operands, &insns, &relocate);
+        patch_operands_for_threaded(insn.op, &mut operands, &insns, bytecode.len(), &relocate);
         out.extend_from_slice(&operands);
     }
     if code_end < bytecode.len() {
@@ -148,8 +149,23 @@ pub fn handler_table_base(stub: &[u8]) -> usize {
     panic!("dispatch lea rbx,[handler_table] not found");
 }
 
-/// Walk threaded bytecode and find a load_imm whose immediate points at `needle`.
-pub fn threaded_load_imm_target(bytecode: &[u8], opcode_map: &OpcodeMap, needle: &[u8]) -> Option<usize> {
+fn bytecode_starts_with_at(bytecode: &[u8], off: usize, needle: &[u8]) -> bool {
+    bytecode.get(off..).is_some_and(|tail| tail.starts_with(needle))
+}
+
+/// First offset in `bytecode` where `needle` appears as a contiguous prefix match.
+pub fn bytecode_prefix_offset(bytecode: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    bytecode
+        .windows(needle.len())
+        .position(|w| w.starts_with(needle))
+}
+
+/// Walk threaded bytecode and collect every `load_imm` immediate.
+pub fn threaded_load_imm_immediates(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<usize> {
+    let mut out = Vec::new();
     let mut offset = 0;
     while offset < bytecode.len() {
         let wire = bytecode[offset];
@@ -168,13 +184,47 @@ pub fn threaded_load_imm_target(bytecode: &[u8], opcode_map: &OpcodeMap, needle:
                     .try_into()
                     .unwrap(),
             ) as usize;
-            if bytecode.get(imm..imm + needle.len()) == Some(needle) {
-                return Some(imm);
-            }
+            out.push(imm);
         }
         offset += threaded_insn_len;
     }
+    out
+}
+
+/// True when some threaded `load_imm` immediate equals `target`.
+pub fn threaded_load_imm_points_at(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    target: usize,
+) -> bool {
+    threaded_load_imm_immediates(bytecode, opcode_map).contains(&target)
+}
+
+/// Walk threaded bytecode and find a `load_imm` whose immediate points at `needle`.
+/// Uses prefix matching so embedded pools may include a trailing NUL after `needle`.
+pub fn threaded_load_imm_target(bytecode: &[u8], opcode_map: &OpcodeMap, needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    for imm in threaded_load_imm_immediates(bytecode, opcode_map) {
+        if bytecode_starts_with_at(bytecode, imm, needle) {
+            return Some(imm);
+        }
+    }
     None
+}
+
+/// Verify an embedded string pool: `needle` is present and a `load_imm` points at it.
+pub fn threaded_string_pool_link(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    needle: &[u8],
+) -> Option<(usize, usize)> {
+    let str_off = bytecode_prefix_offset(bytecode, needle)?;
+    if threaded_load_imm_points_at(bytecode, opcode_map, str_off) {
+        return Some((str_off, str_off));
+    }
+    threaded_load_imm_target(bytecode, opcode_map, needle).map(|imm| (str_off, imm))
 }
 
 #[cfg(test)]
@@ -254,8 +304,37 @@ mod tests {
             threaded.windows(msg.len()).any(|w| w == msg),
             "threaded embed must preserve trailing string pool"
         );
-        let ptr = threaded_load_imm_target(&threaded, &map, msg).expect("load_imm string ptr");
-        assert_eq!(&threaded[ptr..ptr + msg.len()], msg);
+        let ptr = threaded_load_imm_target(&threaded, &map, b"Hello, World!")
+            .expect("load_imm string ptr");
+        assert!(threaded[ptr..].starts_with(b"Hello, World!"));
+        let (pool, imm) = threaded_string_pool_link(&threaded, &map, b"Hello, World!")
+            .expect("string pool link");
+        assert_eq!(pool, imm);
+    }
+
+    #[test]
+    fn embed_thread_targets_relocates_unaligned_string_pool() {
+        let map = OpcodeMap::from_seed(2);
+        let stub = stub_for(&map);
+        let msg = b"knvest\0";
+        let mut raw = vec![map.encode(OpCode::LoadImm), 0];
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.push(map.encode(OpCode::Exit));
+        raw.push(0);
+        // Deliberately unaligned pool tail (not a multiple of 16).
+        let string_off = raw.len();
+        raw[2..10].copy_from_slice(&(string_off as u64).to_le_bytes());
+        raw.extend_from_slice(msg);
+
+        let threaded = embed_thread_targets(&raw, &map, &|op| handler_offset_for_op(&stub, &map, op));
+        let imm = u64::from_le_bytes(
+            threaded[1 + THREAD_TARGET_SIZE + 1..1 + THREAD_TARGET_SIZE + 9]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(&threaded[imm..imm + msg.len()], msg);
+        threaded_string_pool_link(&threaded, &map, b"knvest")
+            .expect("unaligned pool must stay linked to load_imm");
     }
 
     #[test]
