@@ -461,16 +461,16 @@ impl StubEmitter {
 
     fn emit_handler_run_native(&mut self) {
         self.label("h_run_native");
-        self.emit_native_sled_invoke();
+        self.emit_native_sled_invoke("rn_frame_ready_run");
     }
 
     fn emit_handler_bail_native(&mut self) {
         self.label("h_bail_native");
-        self.emit_native_sled_invoke();
+        self.emit_native_sled_invoke("rn_frame_ready_bail");
     }
 
     /// L4d: read sled offset + orig rva, sync VM spills↔native rbp locals, run sled, resume VM.
-    fn emit_native_sled_invoke(&mut self) {
+    fn emit_native_sled_invoke(&mut self, frame_ready_label: &'static str) {
         let sync_pairs = self.native_sync.clone();
         self.emit(&[0x48, 0x8B, 0x06]); // mov rax, [rsi] sled offset
         self.emit(&[0x49, 0x89, 0xC3]); // mov r11, rax
@@ -483,7 +483,7 @@ impl StubEmitter {
         self.emit_mov_from_r13_slot(-0x110);
         self.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
         self.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
-        self.jcc_rel32(0x85, "rn_frame_ready"); // jne rn_frame_ready
+        self.jcc_rel32(0x85, frame_ready_label); // jne frame_ready_label
 
         self.lea_rip_rel32(0x48, 4, "native_stack_top");
         self.emit(&[0x48, 0x2D, 0x00, 0x01, 0x00, 0x00]); // sub rax, 0x100
@@ -491,7 +491,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax
         self.emit_mov_to_r13_slot(-0x110); // mov [r13-0x110], rcx
 
-        self.label("rn_frame_ready");
+        self.label(frame_ready_label);
         for &(rbp_disp, spill) in &sync_pairs {
             self.emit_mov_from_r13_spill(spill);
             self.emit_mov_to_rcx_disp(rbp_disp);
@@ -973,6 +973,86 @@ mod tests {
             &walk_region[init.len()..init.len() + advance.len()],
             advance,
             "module_loop must not advance rcx before comparing the current entry"
+        );
+    }
+
+    #[test]
+    fn run_native_and_bail_use_distinct_frame_ready_jcc_targets() {
+        let sync = vec![(-4i32, 10u8)];
+        let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &sync);
+
+        let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
+        let mut invoke_sites = Vec::new();
+        for (i, w) in stub.windows(invoke_prologue.len()).enumerate() {
+            if w == invoke_prologue {
+                invoke_sites.push(i);
+            }
+        }
+        assert_eq!(
+            invoke_sites.len(),
+            2,
+            "h_run_native and h_bail_native must each emit invoke prologue"
+        );
+        let run_site = invoke_sites[0];
+        let bail_site = invoke_sites[1];
+        assert!(run_site < bail_site);
+
+        let jne = [0x0Fu8, 0x85];
+        let jne_at = |base: usize, limit: usize| -> usize {
+            stub[base..limit]
+                .windows(jne.len())
+                .position(|w| w == jne)
+                .map(|p| base + p)
+                .expect("jne near frame-ready check")
+        };
+        let run_jne = jne_at(run_site, bail_site);
+        let bail_jne = jne_at(bail_site, stub.len());
+
+        let rel32_target = |stub: &[u8], jcc_pos: usize| -> usize {
+            let disp = i32::from_le_bytes(stub[jcc_pos + 2..jcc_pos + 6].try_into().unwrap());
+            jcc_pos + 6 + disp as usize
+        };
+        let run_target = rel32_target(&stub, run_jne);
+        let bail_target = rel32_target(&stub, bail_jne);
+
+        assert!(
+            run_target > run_jne && run_target < bail_site,
+            "run_native jne must target rn_frame_ready_run inside h_run_native (got {run_target:#x}, bail at {bail_site:#x})"
+        );
+        assert!(
+            bail_target > bail_jne,
+            "bail_native jne must target rn_frame_ready_bail inside h_bail_native"
+        );
+        assert_ne!(run_target, bail_target, "duplicate rn_frame_ready label bug");
+    }
+
+    #[test]
+    fn run_native_handler_win64_call_sequence() {
+        let sync = vec![(-4i32, 10u8)];
+        let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &sync);
+        let call_r10 = [0x41u8, 0xFF, 0xD2];
+        let call_at = stub
+            .windows(call_r10.len())
+            .position(|w| w == call_r10)
+            .expect("call r10");
+        let prefix = &stub[..call_at];
+        assert!(
+            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
+            "mov rbp, rcx before sled call"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "mov rsp, rcx before sled call"
+        );
+        assert!(
+            prefix.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x28]),
+            "Win64 0x28 shadow before sled call"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x4D, 0x01, 0xDA]),
+            "lea/add native_sleds offset into r10"
         );
     }
 

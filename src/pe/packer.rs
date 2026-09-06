@@ -1936,6 +1936,35 @@ mod tests {
         }
     }
 
+    /// In-repo evidence for Windows L4d debugging: first sled + handler contract.
+    #[test]
+    fn test_l4d_run_native_evidence_countdown_fixture() {
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        assert!(!sleds.is_empty(), "partial countdown must emit run_native sleds");
+        assert_eq!(
+            sleds[0],
+            vec![0x83, 0x6D, 0xFC, 0x01, 0xC3],
+            "first run_native sled bytes (sub dword [rbp-4],1; ret)"
+        );
+        let sync = native_stack_sync_pairs(
+            &super::super::cfg::disassemble_main_window(
+                &PEFile::from_bytes(test_pe::create_pe64_with_countdown_loop()).unwrap().data,
+                pe.rva_to_file_offset(main_rva).unwrap(),
+                pe.rva_to_file_offset(text.virtual_address).unwrap() + text.size_of_raw_data as usize,
+            ),
+        );
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
+        assert_run_native_stub_uses_native_rsp(&stub);
+        // Handler contract (Windows): r13=VM frame, r12=VM rsp, rcx=native frame,
+        // mov rbp/rsp=rcx, sub rsp 0x28, call r10 sled, restore rbp/rsp from r13/r12.
+    }
+
     fn collect_run_native_sleds(
         bytecode: &[u8],
         native_sleds: &[u8],
