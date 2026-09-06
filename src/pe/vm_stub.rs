@@ -427,8 +427,8 @@ impl StubEmitter {
             ((header >> 24) & 0xFF) as u8,
         ]);
         self.label("h_set_block_map_search");
-        // cmp word [r15], r8w — match entry.bb_id (REX.R+REX.B for r8 vs [r15])
-        self.emit(&[0x66, 0x4D, 0x39, 0x07]);
+        // cmp word [r15], r8w — 66 45 (no REX.W); 4D would be qword cmp and never match bb_id
+        self.emit(&[0x66, 0x45, 0x39, 0x07]);
         self.jcc_rel32_short(0x74, "h_set_block_map_found");
         let stride = KNV6_ENTRY_SIZE as u32;
         self.emit(&[
@@ -1625,8 +1625,12 @@ mod tests {
             "h_set_block_map must lea rax,[r15+0x1C] without touching bytecode rsi"
         );
         assert!(
-            body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
-            "h_set_block_map must linear-search cmp [r15],r8w for entry.bb_id match"
+            body.windows(4).any(|w| w == [0x66, 0x45, 0x39, 0x07]),
+            "h_set_block_map must cmp word [r15],r8w (66 45 39 07) for entry.bb_id search"
+        );
+        assert!(
+            !body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must not emit 66 4D 39 07 (REX.W qword cmp — search never matches)"
         );
         assert!(
             !body.windows(3).any(|w| w == [0x48, 0x69, 0xC0]),
@@ -1724,8 +1728,12 @@ mod tests {
             .expect("h_set_block_map");
         let body = &stub[set_map..set_map.saturating_add(160).min(stub.len())];
         assert!(
-            body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
-            "h_set_block_map must cmp word [r15],r8w to locate KNV6 entry header"
+            body.windows(4).any(|w| w == [0x66, 0x45, 0x39, 0x07]),
+            "h_set_block_map must cmp word [r15],r8w (66 45 39 07) to locate KNV6 entry header"
+        );
+        assert!(
+            !body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must not emit 66 4D 39 07 (qword cmp misses bb_id field)"
         );
         assert!(
             !body.windows(3).any(|w| w == [0x48, 0x69, 0xC0]),
