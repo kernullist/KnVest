@@ -846,9 +846,11 @@ pub(crate) fn patch_runtime_handler_table(stub: &mut [u8], block_map_plan: &Bloc
         return;
     };
     let base = super::threaded::handler_table_base(stub);
-    let end = base + first.handler_table.len();
-    if end <= stub.len() {
-        stub[base..end].copy_from_slice(&first.handler_table);
+    crate::vm::block_map::install_handler_table_in_stub(stub, base, &first.handler_table);
+    if let Err(err) =
+        crate::vm::block_map::validate_handler_table_targets(stub, base, &first.handler_table)
+    {
+        panic!("BB0 handler_table pre-install invalid: {err}");
     }
 }
 
@@ -2110,10 +2112,11 @@ mod tests {
                 .unwrap(),
         );
         let load_imm_target = (table_base as i64 + load_imm_off as i64) as usize;
-        assert!(load_imm_off != 0);
+        let table_end = table_base + 1024;
+        assert!(load_imm_off > 0, "handler offsets must be positive (handlers follow table)");
         assert!(
-            load_imm_target < table_base,
-            "handlers must precede writable handler_table (target {load_imm_target:#x}, table {table_base:#x})"
+            load_imm_target >= table_end,
+            "load_imm handler must follow redirect table"
         );
         assert_eq!(stub[load_imm_target], 0x0F);
         assert_eq!(stub[load_imm_target + 1], 0xB6);
@@ -2125,11 +2128,8 @@ mod tests {
                 .unwrap(),
         );
         let nc_target = (table_base as i64 + nc_off as i64) as usize;
-        assert!(nc_off != 0);
-        assert!(
-            nc_target < table_base,
-            "native_call handler must precede handler_table"
-        );
+        assert!(nc_off > 0);
+        assert!(nc_target >= table_end, "native_call handler must follow redirect table");
         assert_eq!(stub[nc_target], 0x48);
         assert_eq!(stub[nc_target + 1], 0x8B);
     }

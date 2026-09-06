@@ -35,6 +35,7 @@ pub fn create_vm_interpreter_stub(
     let mut e = StubEmitter::new(map, dispatch_mode, native_sync, block_map_plan);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
+    e.emit_handler_table_placeholder();
     e.emit_handlers();
     e.emit_strings_and_marker(knv5, block_map_plan, native_sleds);
     e.finalize()
@@ -1133,8 +1134,6 @@ impl StubEmitter {
         self.emit(&block_map_plan.to_embedded_bytes());
         self.labels.insert("knv6_count", knv6_pos + 9);
         self.labels.insert("knv6_entries", knv6_pos + KNV6_HEADER_SIZE);
-        // Writable handler redirect table (L4e runtime refresh target; lives in data tail not mid-code).
-        self.emit_handler_table_placeholder();
         self.label("exit_wire_cmp_slot");
         self.emit(&[0x00]);
         while self.pos() % 16 != 0 {
@@ -1313,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn handler_table_lives_in_data_tail_not_mid_code() {
+    fn handler_table_redirect_slots_precede_handler_bodies() {
         let (stub, _) = create_vm_interpreter_stub(
             0,
             0,
@@ -1331,22 +1330,16 @@ mod tests {
             .position(|w| w == sig)
             .expect("h_set_block_map");
         assert!(
-            table_base > set_map,
-            "writable handler_table must follow handler code (table at {table_base:#x}, h_set_block_map at {set_map:#x})"
-        );
-        let knv6 = stub
-            .windows(4)
-            .position(|w| w == b"KNV6")
-            .expect("KNV6");
-        assert!(
-            table_base > knv6,
-            "handler_table must sit in data tail after KNV6 metadata"
+            table_base < set_map,
+            "redirect table must precede handler bodies (table {table_base:#x}, h_set_block_map {set_map:#x})"
         );
     }
 
     #[test]
     fn knv6_handler_table_slots_resolve_inside_stub() {
-        use crate::vm::block_map::BlockMapPlan;
+        use crate::vm::block_map::{
+            validate_handler_table_targets, BlockMapPlan, install_handler_table_in_stub,
+        };
 
         let seed = 0x4C34_4100u64;
         let map = crate::vm::OpcodeMap::from_seed(seed);
@@ -1377,18 +1370,39 @@ mod tests {
 
         let table_base = handler_table_base(&stub);
         for entry in &plan.entries {
-            for chunk in entry.handler_table.chunks_exact(4) {
-                let off = i32::from_le_bytes(chunk.try_into().unwrap());
-                if off == 0 {
-                    continue;
-                }
-                let target = table_base as i64 + off as i64;
-                assert!(
-                    target >= 0 && (target as usize) < stub.len(),
-                    "KNV6 bb_id={} handler slot offset {off:#x} must resolve inside stub",
-                    entry.bb_id
-                );
-            }
+            validate_handler_table_targets(&stub, table_base, &entry.handler_table)
+                .unwrap_or_else(|e| panic!("KNV6 bb_id={} invalid: {e}", entry.bb_id));
+        }
+
+        // Simulate runtime h_set_block_map refresh for every BB entry.
+        for entry in &plan.entries {
+            install_handler_table_in_stub(&mut stub, table_base, &entry.handler_table);
+            validate_handler_table_targets(&stub, table_base, &entry.handler_table)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "after simulated set_block_map bb_id={} invalid: {e}",
+                        entry.bb_id
+                    )
+                });
+            let load_imm_wire = plan
+                .map_for_bb_or_base(entry.bb_id, &map)
+                .encode(crate::vm::OpCode::LoadImm) as usize;
+            let off = i32::from_le_bytes(
+                stub[table_base + load_imm_wire * 4..table_base + load_imm_wire * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert!(
+                off > 0,
+                "bb_id={} load_imm slot must point forward into stub handlers",
+                entry.bb_id
+            );
+            let target = table_base as i64 + off as i64;
+            assert!(
+                (target as usize) < stub.len(),
+                "bb_id={} load_imm dispatch target must stay inside stub",
+                entry.bb_id
+            );
         }
     }
 

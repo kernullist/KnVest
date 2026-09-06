@@ -238,6 +238,47 @@ where
     table
 }
 
+pub const HANDLER_REDIRECT_TABLE_SIZE: usize = 256 * 4;
+
+/// Verify every non-zero slot resolves to a stub handler body (not metadata/bytecode).
+pub fn validate_handler_table_targets(
+    stub: &[u8],
+    table_base: usize,
+    table: &[u8; HANDLER_REDIRECT_TABLE_SIZE],
+) -> Result<(), String> {
+    let handler_lo = table_base
+        .checked_add(HANDLER_REDIRECT_TABLE_SIZE)
+        .ok_or_else(|| "handler_table base overflow".to_string())?;
+    for (slot, chunk) in table.chunks_exact(4).enumerate() {
+        let off = i32::from_le_bytes(chunk.try_into().map_err(|_| "slot len")?);
+        if off == 0 {
+            continue;
+        }
+        let target = table_base as i64 + off as i64;
+        if target < handler_lo as i64 {
+            return Err(format!(
+                "slot {slot:#04x} rel off {off:#x} -> {target:#x} precedes handler region ({handler_lo:#x})"
+            ));
+        }
+        if target as usize >= stub.len() {
+            return Err(format!(
+                "slot {slot:#04x} rel off {off:#x} -> {target:#x} past stub end ({:#x})",
+                stub.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply one KNV6 entry's redirect table to the stub image (same as `h_set_block_map` copy).
+pub fn install_handler_table_in_stub(
+    stub: &mut [u8],
+    table_base: usize,
+    table: &[u8; HANDLER_REDIRECT_TABLE_SIZE],
+) {
+    stub[table_base..table_base + HANDLER_REDIRECT_TABLE_SIZE].copy_from_slice(table);
+}
+
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
@@ -274,6 +315,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn validate_handler_table_rejects_forward_offset_into_tail() {
+        use super::validate_handler_table_targets;
+
+        let stub = vec![0u8; 0x2000];
+        let table_base = 0x1000;
+        let mut table = [0u8; HANDLER_REDIRECT_TABLE_SIZE];
+        // +0x1000 from table_base lands past stub (simulates jumping into appended bytecode).
+        table[0xB5 * 4..0xB5 * 4 + 4].copy_from_slice(&0x1000i32.to_le_bytes());
+        assert!(validate_handler_table_targets(&stub, table_base, &table).is_err());
     }
 
     #[test]
