@@ -497,6 +497,24 @@ impl StubEmitter {
         }
     }
 
+    fn emit_mov_dword_to_rbp_disp(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x89, 0x45, disp as u8]); // mov dword [rbp+disp8], eax
+        } else {
+            self.emit(&[0x89, 0x85]); // mov dword [rbp+disp32], eax
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_dword_from_rbp_disp(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x8B, 0x45, disp as u8]); // mov eax, dword [rbp+disp8]
+        } else {
+            self.emit(&[0x8B, 0x85]); // mov eax, dword [rbp+disp32]
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
     fn emit_handler_run_native(&mut self) {
         self.label("h_run_native");
         self.emit_native_sled_invoke("rn_frame_ready_run");
@@ -530,15 +548,17 @@ impl StubEmitter {
         self.emit_mov_to_r13_slot(-0x110); // mov [r13-0x110], rcx
 
         self.label(frame_ready_label);
+        // Reload native frame: rcx may still hold a VM reg (e.g. loop counter) after jne skips alloc.
+        self.emit_mov_from_r13_slot(-0x110);
+        self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — native locals base before spill sync
         for &(rbp_disp, spill) in &sync_pairs {
             self.emit_mov_dword_from_r13_spill(spill);
-            self.emit_mov_dword_to_rcx_disp(rbp_disp);
+            self.emit_mov_dword_to_rbp_disp(rbp_disp);
         }
 
-        self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — sled uses native rbp locals
         // Dedicated call stack above locals within native_stack (Win64 shadow/ret must not
         // overlap [rbp±disp] slots like the loop counter at [rbp-4]).
-        self.emit(&[0x48, 0x8D, 0x61, 0x80]); // lea rsp, [rcx+0x80]
+        self.emit(&[0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]); // lea rsp, [rbp+0x80]
         self.emit(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
         self.lea_rip_rel32(0x4C, 2, "native_sleds");
         self.emit(&[0x4D, 0x01, 0xDA]); // add r10, r11
@@ -546,9 +566,8 @@ impl StubEmitter {
         self.emit(&[0x41, 0xFF, 0xD2]); // call r10
         self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
 
-        self.emit_mov_from_r13_slot(-0x110); // rcx = native frame (call clobbers rcx)
         for &(rbp_disp, spill) in &sync_pairs {
-            self.emit_mov_dword_from_rcx_disp(rbp_disp);
+            self.emit_mov_dword_from_rbp_disp(rbp_disp);
             self.emit_mov_dword_to_r13_spill(spill);
         }
 
@@ -1080,8 +1099,12 @@ mod tests {
             "mov rbp, rcx before sled call"
         );
         assert!(
-            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
-            "lea rsp, [rcx+0x80] — call stack above native locals (no [rbp-4] overlap)"
+            prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
+            "lea rsp, [rbp+0x80] — call stack above native locals"
+        );
+        assert!(
+            !prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "must not lea rsp,[rcx+0x80] (rcx may hold stale VM reg during sync)"
         );
         assert!(
             prefix.windows(4).any(|w| w == [0x48, 0x83, 0xE4, 0xF0]),
@@ -1129,8 +1152,12 @@ mod tests {
             "pre-sync must use dword load from VM spill"
         );
         assert!(
-            before_call.windows(2).any(|w| w == [0x89, 0x41]),
-            "pre-sync must use dword store to native [rcx+disp]"
+            before_call.windows(3).any(|w| w == [0x89, 0x45, 0xFC]),
+            "pre-sync must store to native [rbp-4] not [rcx-4]"
+        );
+        assert!(
+            !before_call.windows(3).any(|w| w == [0x89, 0x41, 0xFC]),
+            "pre-sync must not store via rcx (may hold VM counter)"
         );
         assert!(
             after_call.windows(3).any(|w| w == [0x41, 0x89, 0x45]),
@@ -1140,6 +1167,49 @@ mod tests {
         assert!(
             !after_call.windows(4).any(|w| w == [0x41, 0x89, 0x45, 0x80]),
             "run_native must not clobber VM r0 via spill slot 0"
+        );
+    }
+
+    #[test]
+    fn run_native_pre_sync_follows_native_frame_setup() {
+        let sync = vec![(-4i32, 10u8)];
+        let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
+        let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &sled, &sync);
+        let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
+        let run_site = stub
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .expect("h_run_native invoke prologue");
+        let bail_site = stub[run_site + 1..]
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .map(|p| run_site + 1 + p)
+            .expect("h_bail_native invoke prologue");
+        let run_body = &stub[run_site..bail_site];
+        let call_at = run_body
+            .windows(3)
+            .position(|w| w == [0x41, 0xFF, 0xD2])
+            .expect("call r10 in run_native");
+        let before_call = &run_body[..call_at];
+        let reload_native = [0x49u8, 0x8B, 0x8C, 0x25, 0xF0, 0xFE, 0xFF, 0xFF]; // mov rcx,[r13-0x110]
+        let mov_rbp_rcx = [0x48u8, 0x89, 0xCD];
+        let pre_sync_store = [0x89u8, 0x45, 0xFC];
+        let reload_at = before_call
+            .windows(reload_native.len())
+            .rposition(|w| w == reload_native)
+            .expect("reload native frame from [r13-0x110] at frame_ready");
+        let rbp_at = before_call
+            .windows(mov_rbp_rcx.len())
+            .position(|w| w == mov_rbp_rcx)
+            .expect("mov rbp, rcx before pre-sync");
+        let sync_at = before_call
+            .windows(pre_sync_store.len())
+            .position(|w| w == pre_sync_store)
+            .expect("pre-sync mov [rbp-4], eax");
+        assert!(
+            reload_at <= rbp_at && rbp_at < sync_at,
+            "native frame reload + mov rbp,rcx must precede spill sync stores"
         );
     }
 

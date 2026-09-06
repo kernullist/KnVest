@@ -418,20 +418,6 @@ fn frame_ptr_reg(reg: X64Reg) -> bool {
     )
 }
 
-fn arg_reg_touched(reg: X64Reg) -> bool {
-    matches!(
-        reg,
-        X64Reg::Rcx
-            | X64Reg::Ecx
-            | X64Reg::Rdx
-            | X64Reg::Edx
-            | X64Reg::R8
-            | X64Reg::R9
-            | X64Reg::Rax
-            | X64Reg::Eax
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1951,8 +1951,8 @@ mod tests {
         let sync = packed.native_sync.clone();
         let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
-        // Handler contract (Windows): r13=VM frame, r12=VM rsp, rcx=native locals,
-        // lea rsp,[rcx+0x80]; and rsp,-16; sub rsp 0x28; call r10 sled; dword spill sync; restore rbp/rsp.
+        // Handler contract (Windows): r13=VM frame, r12=VM rsp, reload [r13-0x110]→rcx/rbp,
+        // pre-sync via [rbp+disp]; lea rsp,[rbp+0x80]; and rsp,-16; sub rsp 0x28; call r10 sled.
     }
 
     fn collect_run_native_sleds(
@@ -1993,8 +1993,16 @@ mod tests {
             "run_native must set native rbp before sled call"
         );
         assert!(
-            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
-            "run_native must lea rsp,[rcx+0x80] (call stack above [rbp-4] locals)"
+            prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
+            "run_native must lea rsp,[rbp+0x80] (call stack above [rbp-4] locals)"
+        );
+        assert!(
+            !prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "run_native must not lea rsp,[rcx+0x80] (rcx may hold stale VM reg during sync)"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x89, 0x41, 0xFC]),
+            "pre-sync must not store via [rcx-4] (rcx may hold VM counter)"
         );
         assert!(
             prefix.windows(4).any(|w| w == [0x48, 0x83, 0xE4, 0xF0]),
