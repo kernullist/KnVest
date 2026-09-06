@@ -122,6 +122,9 @@ fn build_section_bytecode(
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     validate_live_handler_table_image(&vm_stub, block_map_plan);
     validate_meta_bb_ids_in_bytecode(bytecode, block_map_plan);
+    if dispatch_mode == DispatchMode::Table {
+        validate_call_redirect_wires_in_bytecode(&vm_stub, bytecode, block_map_plan, opcode_map);
+    }
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
         embed_thread_targets(
             bytecode,
@@ -165,6 +168,74 @@ fn validate_meta_bb_ids_in_bytecode(bytecode: &[u8], block_map_plan: &BlockMapPl
             "KNV6 entry index must match bb_id for direct lookup (META at {off:#x})"
         );
         off += 1 + META_OPERAND_LEN;
+    }
+}
+
+/// Every table-mode Call must use the active BB wire and that wire's KNV6 slot must land on h_call.
+fn validate_call_redirect_wires_in_bytecode(
+    stub: &[u8],
+    bytecode: &[u8],
+    block_map_plan: &BlockMapPlan,
+    opcode_map: &OpcodeMap,
+) {
+    use crate::ir::Instruction;
+    use crate::vm::block_map::{collect_handler_redirect_plan, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+    use crate::vm::opcode_map::CANONICAL_OPCODES;
+    use crate::vm::OpCode;
+
+    if block_map_plan.entries.is_empty() {
+        return;
+    }
+    let call_idx = CANONICAL_OPCODES
+        .iter()
+        .position(|&o| o == OpCode::Call)
+        .unwrap();
+    let insns = Instruction::disassemble_with_block_maps(
+        bytecode,
+        opcode_map,
+        Some(block_map_plan),
+        DispatchMode::Table,
+    );
+    let table_base = table_base_from_stub(stub);
+    let knv6 = stub
+        .windows(KNV6_MAGIC.len())
+        .position(|w| w == KNV6_MAGIC)
+        .expect("KNV6 blob missing for call-wire validation");
+    let h_call = collect_handler_redirect_plan(stub, opcode_map).offset_for(OpCode::Call);
+    let mut active_bb = 0usize;
+    for ins in &insns {
+        if ins.opcode == OpCode::SetBlockMap {
+            active_bb = match ins.operands.first() {
+                Some(crate::ir::Operand::Immediate(v)) => *v as usize,
+                _ => panic!("set_block_map missing bb_id during call-wire validation"),
+            };
+            continue;
+        }
+        if ins.opcode != OpCode::Call {
+            continue;
+        }
+        let w = bytecode[ins.offset];
+        let entry = &block_map_plan.entries[active_bb];
+        let expected = entry.wire[call_idx];
+        assert_eq!(
+            w, expected,
+            "Call at bc[{:#x}] under bb={active_bb}: wire {w:#x} != entry {expected:#x}",
+            ins.offset
+        );
+        let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + 0x1C;
+        let slot_off = i32::from_le_bytes(
+            stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let target = table_base as i64 + slot_off as i64;
+        let sig = &stub[target as usize..target as usize + 3];
+        assert_eq!(
+            sig,
+            [0x48, 0x8B, 0x06],
+            "bb={active_bb} Call wire {w:#x} at bc[{:#x}] must map to h_call (off {slot_off:#x}, want {h_call:#x})",
+            ins.offset
+        );
     }
 }
 
@@ -1060,7 +1131,8 @@ mod tests {
     };
     use crate::pe::test_pe;
     use crate::vm::block_map::{block_wire_for_bb, bytecode_contains_semantic, BlockMapPlan, META_WIRE_BYTE};
-    use crate::vm::{OpCode, OpcodeMap};
+    use crate::vm::opcode_map::CANONICAL_OPCODES;
+    use crate::vm::{DispatchMode, OpCode, OpcodeMap};
 
     const TEST_SEED: u64 = 0x4C344100;
 
@@ -2619,6 +2691,86 @@ mod tests {
             insns.iter().any(|i| i.opcode == OpCode::SetBlockMap),
             "IR disassembly must surface set_block_map refresh ops"
         );
+    }
+
+    #[test]
+    fn test_l4e_packed_call_wires_match_active_bb_knv6_slots() {
+        use crate::ir::Instruction;
+        use crate::pe::threaded::handler_table_base;
+        use crate::vm::block_map::{KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+
+        let call_idx = CANONICAL_OPCODES
+            .iter()
+            .position(|&o| o == OpCode::Call)
+            .unwrap();
+        for (name, path) in [
+            ("call", "sample/call.exe"),
+            ("nested", "sample/nested.exe"),
+            ("fact", "sample/fact.exe"),
+            ("hello", "sample/hello.exe"),
+        ] {
+            for seed in [None, Some(0xAAAA_AAAA_u64)] {
+                let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
+                let packed = pack_function(&mut pe, None, seed, false, DispatchMode::Table)
+                    .unwrap();
+                let insns = Instruction::disassemble_with_block_maps(
+                    &packed.bytecode,
+                    &packed.opcode_map,
+                    Some(&packed.block_map_plan),
+                    DispatchMode::Table,
+                );
+                let section = pe.get_section(".knvest").unwrap();
+                let start = section.pointer_to_raw_data as usize;
+                let sd = &pe.data[start..start + section.size_of_raw_data as usize];
+                let vmbc = sd.windows(4).position(|w| w == b"VMBC").unwrap();
+                let stub = &sd[..vmbc + 4];
+                let table_base = handler_table_base(stub);
+                let knv6 = sd[..vmbc]
+                    .windows(KNV6_MAGIC.len())
+                    .position(|w| w == KNV6_MAGIC)
+                    .expect("KNV6");
+                let h_call = crate::vm::block_map::collect_handler_redirect_plan(
+                    stub,
+                    &packed.opcode_map,
+                )
+                .offset_for(OpCode::Call);
+                let mut active_bb = 0usize;
+                for ins in &insns {
+                    if ins.opcode == OpCode::SetBlockMap {
+                        active_bb = match ins.operands.first() {
+                            Some(crate::ir::Operand::Immediate(v)) => *v as usize,
+                            _ => panic!("set_block_map missing bb_id"),
+                        };
+                        continue;
+                    }
+                    if ins.opcode != OpCode::Call {
+                        continue;
+                    }
+                    let w = packed.bytecode[ins.offset];
+                    let entry = &packed.block_map_plan.entries[active_bb];
+                    let expected = entry.wire[call_idx];
+                    assert_eq!(
+                        w, expected,
+                        "{name} seed={seed:?} Call at bc[{:#x}] under bb={active_bb}: wire {w:#x} != entry {expected:#x}",
+                        ins.offset
+                    );
+                    let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + 0x1C;
+                    let slot_off = i32::from_le_bytes(
+                        stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let target = table_base as i64 + slot_off as i64;
+                    let sig = &stub[target as usize..target as usize + 3];
+                    assert_eq!(
+                        sig,
+                        [0x48, 0x8B, 0x06],
+                        "{name} seed={seed:?} bb={active_bb} bc={:#x} wire={w:#x} slot_off={slot_off:#x} h_call={h_call:#x}",
+                        ins.offset
+                    );
+                }
+            }
+        }
     }
 
     #[test]

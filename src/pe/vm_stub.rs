@@ -1,7 +1,12 @@
 use crate::vm::dispatch::DispatchMode;
-use crate::vm::block_map::{BlockMapPlan, HandlerRedirectPlan, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE};
+use crate::vm::block_map::{
+    BlockMapPlan, HandlerRedirectPlan, HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_SIZE,
+    KNV6_HEADER_SIZE, META_WIRE_BYTE,
+};
 use crate::vm::opcode_map::{CANONICAL_HANDLER_LABELS, CANONICAL_OPCODES, OpcodeMap, PackMetadata};
 use std::collections::HashMap;
+const REDIRECT_FRAME_BUF_OFF: i32 = -0x930;
+const REDIRECT_FRAME_QWORDS: u32 = HANDLER_REDIRECT_TABLE_SIZE as u32 / 8;
 
 // L2 VM interpreter frame map (rbp-relative; disp32 = signed i32 little-endian)
 //   VM r0..r15     [rbp-0x80]..[rbp-0x08]   reg n → [rbp + n*8 - 0x80]
@@ -16,7 +21,8 @@ use std::collections::HashMap;
 //   call depth     [rbp-0xC8]  bytes 38 FF FF FF
 //   bytes written  [rbp-0xD0]  bytes 30 FF FF FF  (WriteFile out; do not clobber)
 //   current bb_id  [rbp-0x120] bytes E0 FE FF FF  (L4e table mode; restored on ret)
-//   active redirect [rbp-0x130] bytes D0 FE FF FF (L4e table: ptr to KNV6 redirect dwords)
+//   active redirect [rbp-0x130] bytes D0 FE FF FF (L4e table: ptr to frame-resident redirect dwords)
+//   redirect image [rbp-0x930] bytes D0 F6 FF FF  (1024 B copy of KNV6 entry redirect table)
 //   VM r12         [rbp-0x20]  bytes E0 FF FF FF  (do not alias with current_bb_id)
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
@@ -190,7 +196,7 @@ impl StubEmitter {
     fn emit_prologue_and_api_resolve(&mut self) {
         self.emit(&[0x55]);
         self.emit(&[0x48, 0x89, 0xE5]);
-        self.emit(&[0x48, 0x81, 0xEC, 0x20, 0x05, 0x00, 0x00]); // sub rsp, 0x520 (frame incl. nc_iat scratch)
+        self.emit(&[0x48, 0x81, 0xEC, 0x30, 0x09, 0x00, 0x00]); // sub rsp, 0x930 (frame + 1 KiB redirect copy)
         self.emit(&[0x48, 0x83, 0xE4, 0xF0]);
         // Zero L2 call depth [rbp-0xC8], push depth [rbp-0xE8], and L4e current bb_id [rbp-0x120]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
@@ -445,6 +451,32 @@ impl StubEmitter {
         self.jmp_rel32("h_set_block_map_fail");
     }
 
+    fn emit_lea_from_rbp(&mut self, dst: u8, disp: i32) {
+        debug_assert!(!(-128..=127).contains(&disp));
+        let rex = 0x48 | if dst >= 8 { 0x04 } else { 0 };
+        let modrm = 0x80u8 | ((dst & 7) << 3) | 5;
+        self.emit(&[rex, 0x8D, modrm]);
+        self.emit(&disp.to_le_bytes());
+    }
+
+    fn emit_copy_knv6_redirect_to_frame_and_point_active(&mut self) {
+        // push rsi — bytecode PC must survive redirect-table copy
+        self.emit(&[0x56]);
+        // lea rsi, [r15+0x1C]
+        self.emit(&[0x49, 0x8D, 0x77, 0x1C]);
+        // lea rdi, [rbp+REDIRECT_FRAME_BUF_OFF]
+        self.emit_lea_from_rbp(7, REDIRECT_FRAME_BUF_OFF);
+        // mov ecx, REDIRECT_FRAME_QWORDS
+        self.emit(&[0x48, 0xC7, 0xC1]);
+        self.emit(&REDIRECT_FRAME_QWORDS.to_le_bytes());
+        self.emit(&[0xFC]); // cld
+        self.emit(&[0xF3, 0x48, 0xA5]); // rep movsq
+        self.emit(&[0x5E]); // pop rsi
+        // lea rax, [rbp+REDIRECT_FRAME_BUF_OFF]; mov [rbp-0x130], rax
+        self.emit_lea_from_rbp(0, REDIRECT_FRAME_BUF_OFF);
+        self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
+    }
+
     fn emit_block_map_apply_and_dispatch(&mut self) {
         // mov [rbp-0x120], r8w — track active bb for table-mode ret restore
         self.emit_mov_word_to_rbp_from_r8(-0x120);
@@ -453,9 +485,7 @@ impl StubEmitter {
         // mov [rip+exit_wire_cmp_slot], al
         self.emit(&[0x88, 0x05, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
-        // Point dispatch at this KNV6 entry's embedded redirect table (frame slot, not rip).
-        self.emit(&[0x49, 0x8D, 0x47, 0x1C]); // lea rax, [r15+0x1C]
-        self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
+        self.emit_copy_knv6_redirect_to_frame_and_point_active();
         self.jmp_to_dispatch();
     }
 
@@ -1378,10 +1408,18 @@ mod tests {
             .windows(sig.len())
             .position(|w| w == sig)
             .expect("h_set_block_map");
-        let body = &stub[pos..pos.saturating_add(120).min(stub.len())];
+        let body = &stub[pos..pos.saturating_add(160).min(stub.len())];
         assert!(
-            body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, 0x1C]),
-            "h_set_block_map must lea rax,[r15+0x1C] for embedded KNV6 redirect table"
+            body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
+            "h_set_block_map must lea rsi,[r15+0x1C] for KNV6 redirect source"
+        );
+        assert!(
+            body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
+            "h_set_block_map must rep movsq KNV6 redirect into frame buffer"
+        );
+        assert!(
+            body.windows(7).any(|w| w == [0x48, 0x8D, 0xBD, 0xD0, 0xF6, 0xFF, 0xFF]),
+            "h_set_block_map must lea rdi,[rbp-0x930] redirect frame buffer"
         );
         assert!(
             body.windows(7).any(|w| w == [0x48, 0x89, 0x85, 0xD0, 0xFE, 0xFF, 0xFF]),
@@ -1390,10 +1428,6 @@ mod tests {
         assert!(
             !body.windows(3).any(|w| w == [0x48, 0x89, 0x05]),
             "h_set_block_map must not mov [rip+active_redirect_ptr], rax (Windows PE stale)"
-        );
-        assert!(
-            !body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
-            "h_set_block_map must not rep movsq into stub handler_table (Windows write hazard)"
         );
     }
 
@@ -1607,22 +1641,22 @@ mod tests {
             .windows(sig.len())
             .position(|w| w == sig)
             .expect("h_set_block_map");
-        let body = &stub[pos..pos.saturating_add(120).min(stub.len())];
+        let body = &stub[pos..pos.saturating_add(160).min(stub.len())];
         assert!(
-            !body.contains(&0x56),
-            "h_set_block_map must not push rsi (no in-stub handler-table copy)"
+            body.contains(&0x56) && body.contains(&0x5E),
+            "h_set_block_map must push/pop rsi around frame redirect copy"
         );
         assert!(
-            !body.contains(&0x5E),
-            "h_set_block_map must not pop rsi after redirect refresh"
+            body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
+            "h_set_block_map must lea rsi,[r15+0x1C] as rep movsq source after push"
         );
         assert!(
-            !body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
-            "h_set_block_map must not lea rsi,[r15+0x1C] (clobbers bytecode PC)"
+            body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
+            "h_set_block_map must rep movsq KNV6 redirect into [rbp-0x930] frame buffer"
         );
         assert!(
-            body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, 0x1C]),
-            "h_set_block_map must lea rax,[r15+0x1C] without touching bytecode rsi"
+            !body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, 0x1C]),
+            "h_set_block_map must not point [rbp-0x130] at raw KNV6 without frame copy"
         );
         assert!(
             body.windows(4).any(|w| w == [0x66, 0x45, 0x39, 0x07]),
@@ -2687,10 +2721,10 @@ invoke_once:
             !stub.windows(4).any(|w| w == [0x80, 0xFD, 0xFF, 0xFF]),
             "data stack must not use old [rbp-0x280] base (aliases ret at idx 16)"
         );
-        let prologue_alloc = [0x48u8, 0x81, 0xEC, 0x20, 0x05, 0x00, 0x00];
+        let prologue_alloc = [0x48u8, 0x81, 0xEC, 0x30, 0x09, 0x00, 0x00];
         assert!(
             stub.windows(prologue_alloc.len()).any(|w| w == prologue_alloc),
-            "prologue must allocate >= 0x520 bytes (ret/data/nc_iat scratch)"
+            "prologue must allocate >= 0x930 bytes (frame + 1 KiB redirect copy)"
         );
         let qword_cmp = [0x48u8, 0x8B, 0x44, 0xCD, 0x80, 0x48, 0x3B, 0x44, 0xFD, 0x80];
         assert!(
