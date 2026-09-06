@@ -377,8 +377,8 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB7, 0x0D, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "knv6_count"));
         self.label("h_set_block_map_search");
-        // cmp word [r15], r8w
-        self.emit(&[0x66, 0x45, 0x39, 0x07]);
+        // cmp word [r15], r8w — REX.R for r8 + REX.B for r15 (0x4D); 0x45 omits REX.R → compares ax
+        self.emit(&[0x66, 0x4D, 0x39, 0x07]);
         self.jcc_rel32_short(0x74, "h_set_block_map_found");
         // add r15, KNV6_ENTRY_SIZE
         let stride = KNV6_ENTRY_SIZE as u32;
@@ -407,8 +407,8 @@ impl StubEmitter {
         self.lea_rip_rel32(0x48, 7, "handler_table");
         // cld — rep movsq must run forward (DF=0)
         self.emit(&[0xFC]);
-        // mov rsi, r12; mov ecx, 128; rep movsq
-        self.emit(&[0x49, 0x89, 0xE6]);
+        // mov rsi, r12 — rep movsq source (REX.R for r12); 49 89 E6 wrongly encodes mov r14,rsp
+        self.emit_mov_reg_reg(6, 12);
         self.emit(&[0xB9, 0x80, 0x00, 0x00, 0x00]);
         self.emit(&[0xF3, 0x48, 0xA5]);
         // pop rsi
@@ -1224,6 +1224,41 @@ mod tests {
     }
 
     #[test]
+    fn set_block_map_rep_movsq_source_is_rsi_from_r12() {
+        let (stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        const CORRECT: [u8; 3] = [0x4C, 0x89, 0xE6]; // mov rsi, r12
+        const WRONG: [u8; 3] = [0x49, 0x89, 0xE6]; // mov r14, rsp (REX.B not REX.R)
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+        let pos = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        let body = &stub[pos..pos.saturating_add(120).min(stub.len())];
+        assert!(
+            body.windows(CORRECT.len()).any(|w| w == CORRECT),
+            "h_set_block_map must emit mov rsi,r12 as 4c 89 e6 before rep movsq"
+        );
+        assert!(
+            !body.windows(WRONG.len()).any(|w| w == WRONG),
+            "h_set_block_map must not emit 49 89 e6 (mov r14,rsp — copies bytecode over handler_table)"
+        );
+        assert!(
+            body.windows(4).any(|w| w == [0xF3, 0x48, 0xA5, 0x5E])
+                || body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
+            "rep movsq must follow mov rsi,r12"
+        );
+    }
+
+    #[test]
     fn set_block_map_movzx_reads_bb_id_from_rsi_not_r14() {
         let (stub, _) = create_vm_interpreter_stub(
             0,
@@ -1280,6 +1315,22 @@ mod tests {
         assert!(
             body.windows(4).any(|w| w == [0x4D, 0x8D, 0x67, 0x1C]),
             "h_set_block_map must lea r12,[r15+28] for rep movsq source"
+        );
+        assert!(
+            body.windows(3).any(|w| w == [0x4C, 0x89, 0xE6]),
+            "h_set_block_map must mov rsi,r12 (4c 89 e6) before rep movsq"
+        );
+        assert!(
+            !body.windows(3).any(|w| w == [0x49, 0x89, 0xE6]),
+            "h_set_block_map must not mov r14,rsp (49 89 e6)"
+        );
+        assert!(
+            body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must cmp [r15],r8w with REX.R (66 4d 39 07)"
+        );
+        assert!(
+            !body.windows(4).any(|w| w == [0x66, 0x45, 0x39, 0x07]),
+            "h_set_block_map must not cmp [r15],ax (66 45 39 07 — missing REX.R)"
         );
     }
 
