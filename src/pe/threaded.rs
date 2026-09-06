@@ -188,10 +188,10 @@ pub fn handler_offset_for_set_block_map(stub: &[u8]) -> i32 {
 }
 
 pub fn handler_table_base(stub: &[u8]) -> usize {
-    // L4e table: lea r10,[handler_table]; mov rbx,[active_redirect_ptr]; movsxd rax,[rbx+rax*4]
+    // L4e table: lea r10,[handler_table]; mov rbx,[rbp-0x128]; movsxd rax,[rbx+rax*4]
     for i in 0..stub.len().saturating_sub(18) {
         if stub[i..i + 3] == [0x4Cu8, 0x8D, 0x15]
-            && stub[i + 7..i + 10] == [0x48, 0x8B, 0x1D]
+            && stub[i + 7..i + 10] == [0x48, 0x8B, 0x9D]
             && stub[i + 14..i + 18] == [0x48, 0x63, 0x04, 0x83]
         {
             let disp = i32::from_le_bytes(stub[i + 3..i + 7].try_into().unwrap());

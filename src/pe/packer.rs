@@ -909,7 +909,7 @@ pub(crate) fn patch_knv6_in_stub(
     validate_knv6_embedded_handler_tables(stub, knv6_offset, block_map_plan);
 }
 
-/// Runtime `h_set_block_map` points `active_redirect_ptr` at `[r15+0x1C]` — verify PE blob is populated.
+/// Runtime `h_set_block_map` stores KNV6 redirect ptr in `[rbp-0x130]` — verify PE blob is populated.
 pub(crate) fn validate_knv6_embedded_handler_tables(
     stub: &[u8],
     knv6_offset: usize,

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 //   call depth     [rbp-0xC8]  bytes 38 FF FF FF
 //   bytes written  [rbp-0xD0]  bytes 30 FF FF FF  (WriteFile out; do not clobber)
 //   current bb_id  [rbp-0x120] bytes E0 FE FF FF  (L4e table mode; restored on ret)
+//   active redirect [rbp-0x130] bytes D0 FE FF FF (L4e table: ptr to KNV6 redirect dwords)
 //   VM r12         [rbp-0x20]  bytes E0 FF FF FF  (do not alias with current_bb_id)
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
@@ -148,10 +149,9 @@ impl StubEmitter {
     }
 
     fn emit_init_active_redirect_ptr_to_handler_table(&mut self) {
-        // lea rax,[handler_table]; mov [rip+active_redirect_ptr], rax
-        // Must match the register used in h_set_block_map (lea rax,[r15+0x1C]).
+        // lea rax,[handler_table]; mov [rbp-0x130], rax — frame slot (Windows-safe vs rip store).
         self.lea_rip_rel32(0x48, 0, "handler_table");
-        self.emit_mov_qword_to_rip_label(0, "active_redirect_ptr");
+        self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
     }
 
     /// Emit `mov dst, src` (Intel syntax, 64-bit reg-reg via opcode 89 /r).
@@ -333,7 +333,7 @@ impl StubEmitter {
         self.jcc_rel32(0x84, "h_exit");
         // Redirect dwords come from active KNV6 entry (or BB0 handler_table at prologue).
         self.emit_lea_handler_table_r10();
-        self.emit_mov_qword_from_rip_label(3, "active_redirect_ptr");
+        self.emit_mov_qword_from_rbp_to_reg(3, -0x130);
         self.emit(&[0x48, 0x63, 0x04, 0x83]); // movsxd rax, [rbx+rax*4]
         self.emit(&[0x4C, 0x01, 0xD0]); // add rax, r10
         self.emit(&[0xFF, 0xE0]);
@@ -438,9 +438,9 @@ impl StubEmitter {
         // mov [rip+exit_wire_cmp_slot], al
         self.emit(&[0x88, 0x05, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
-        // Point dispatch at this KNV6 entry's embedded redirect table (no runtime stub write).
+        // Point dispatch at this KNV6 entry's embedded redirect table (frame slot, not rip).
         self.emit(&[0x49, 0x8D, 0x47, 0x1C]); // lea rax, [r15+0x1C]
-        self.emit_mov_qword_to_rip_label(0, "active_redirect_ptr");
+        self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
         self.jmp_to_dispatch();
     }
 
@@ -1221,8 +1221,6 @@ impl StubEmitter {
         self.labels.insert("knv6_entries", knv6_pos + KNV6_HEADER_SIZE);
         self.label("exit_wire_cmp_slot");
         self.emit(&[0x00]);
-        self.label("active_redirect_ptr");
-        self.emit(&[0x00; 8]);
         while self.pos() % 16 != 0 {
             self.emit(&[0xCC]);
         }
@@ -1372,8 +1370,12 @@ mod tests {
             "h_set_block_map must lea rax,[r15+0x1C] for embedded KNV6 redirect table"
         );
         assert!(
-            body.windows(3).any(|w| w == [0x48, 0x89, 0x05]),
-            "h_set_block_map must store redirect pointer to [rip+active_redirect_ptr]"
+            body.windows(7).any(|w| w == [0x48, 0x89, 0x85, 0xD0, 0xFE, 0xFF, 0xFF]),
+            "h_set_block_map must mov [rbp-0x130], rax (D0 FE FF FF disp32)"
+        );
+        assert!(
+            !body.windows(3).any(|w| w == [0x48, 0x89, 0x05]),
+            "h_set_block_map must not mov [rip+active_redirect_ptr], rax (Windows PE stale)"
         );
         assert!(
             !body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
@@ -1639,10 +1641,10 @@ mod tests {
             .windows(18)
             .position(|w| {
                 w[0..3] == [0x4C, 0x8D, 0x15]
-                    && w[7..10] == [0x48, 0x8B, 0x1D]
+                    && w[7..10] == [0x48, 0x8B, 0x9D]
                     && w[14..18] == [0x48, 0x63, 0x04, 0x83]
             })
-            .expect("table dispatch lea r10 + mov rbx,[active_redirect_ptr] + movsxd");
+            .expect("table dispatch lea r10 + mov rbx,[rbp-0x130] + movsxd");
         assert_eq!(
             stub[dispatch + 18..dispatch + 22],
             [0x4C, 0x01, 0xD0, 0xFF],
@@ -1650,17 +1652,18 @@ mod tests {
         );
         let table_base = resolve_lea_rip(&stub, dispatch);
         let prologue_init = stub
-            .windows(10)
-            .position(|w| w[0..3] == [0x48, 0x8D, 0x05] && w[7..10] == [0x48, 0x89, 0x05])
-            .expect("prologue must lea rax,[handler_table] then mov [rip+active_redirect_ptr], rax");
+            .windows(11)
+            .position(|w| w[0..3] == [0x48, 0x8D, 0x05] && w[7..11] == [0x48, 0x89, 0x85, 0xD0])
+            .expect("prologue must lea rax,[handler_table] then mov [rbp-0x130], rax");
         assert_eq!(
             resolve_lea_rip(&stub, prologue_init),
             table_base,
-            "prologue must point active_redirect_ptr at handler_table before first META"
+            "prologue must point [rbp-0x130] at handler_table before first META"
         );
-        assert!(
-            !stub[prologue_init..prologue_init + 10].starts_with(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0, 0x48, 0x89, 0x05]),
-            "prologue must not lea rbx,[handler_table] then store rax into active_redirect_ptr"
+        assert_eq!(
+            &stub[prologue_init + 7..prologue_init + 11],
+            [0x48, 0x89, 0x85, 0xD0],
+            "prologue redirect slot must use disp32 D0 FE FF FF (-0x130)"
         );
     }
 
