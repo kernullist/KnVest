@@ -165,6 +165,8 @@ pub struct BasicBlock {
     pub tail_idx: usize,
     pub has_back_edge: bool,
     pub native_eligible: bool,
+    /// True when another BB branches backward to this block's entry (loop head).
+    pub is_loop_header: bool,
 }
 
 /// Split a linear instruction list into basic blocks from `entry` until the first `ret`.
@@ -226,6 +228,7 @@ pub fn build_basic_blocks(instrs: &[X64Instruction], entry: usize) -> Vec<BasicB
                 target <= start
             })
         });
+        let is_loop_header = false;
         let native_eligible = is_native_eligible(instrs, leader_idx, tail_idx);
         blocks.push(BasicBlock {
             id,
@@ -235,10 +238,42 @@ pub fn build_basic_blocks(instrs: &[X64Instruction], entry: usize) -> Vec<BasicB
             tail_idx,
             has_back_edge,
             native_eligible,
+            is_loop_header,
         });
     }
 
+    let incoming: Vec<bool> = blocks
+        .iter()
+        .map(|bb| incoming_back_edge_target(&blocks, instrs, bb.start))
+        .collect();
+    for (bb, inc) in blocks.iter_mut().zip(incoming) {
+        if inc {
+            bb.is_loop_header = true;
+            bb.has_back_edge = true;
+        }
+    }
+
     blocks
+}
+
+fn incoming_back_edge_target(
+    blocks: &[BasicBlock],
+    instrs: &[X64Instruction],
+    target_start: usize,
+) -> bool {
+    for bb in blocks {
+        for idx in bb.leader_idx..=bb.tail_idx {
+            if let Some(rel) = branch_target_offset(&instrs[idx]) {
+                let src = instrs[idx].offset;
+                let target =
+                    (src as i64 + instrs[idx].bytes.len() as i64 + rel as i64) as usize;
+                if target == target_start && target < src {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn idx_for_offset(instrs: &[X64Instruction], offset: usize) -> usize {

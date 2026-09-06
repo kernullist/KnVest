@@ -498,13 +498,15 @@ impl StubEmitter {
         }
 
         self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — sled uses native frame
+        self.emit(&[0x48, 0x89, 0xCC]); // mov rsp, rcx — call must not push onto VM stack
         self.lea_rip_rel32(0x4C, 2, "native_sleds");
         self.emit(&[0x4D, 0x01, 0xDA]); // add r10, r11
-        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow
+        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow (rsp%16==8 before call)
         self.emit(&[0x41, 0xFF, 0xD2]); // call r10
         self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
         self.emit(&[0x49, 0x89, 0xC6]); // mov r14, rax — preserve return value
 
+        self.emit_mov_from_r13_slot(-0x110); // rcx = native frame (call clobbers rcx)
         for &(rbp_disp, spill) in &sync_pairs {
             self.emit_mov_from_rcx_disp(rbp_disp);
             self.emit_mov_to_r13_spill(spill);

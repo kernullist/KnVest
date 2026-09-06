@@ -462,6 +462,7 @@ fn translate_to_vm_bytecode(
         file_offset,
         pe,
         partial_enabled,
+        &all_instrs,
     )?;
     let mut sled_builder = NativeSledBuilder::new();
 
@@ -1929,6 +1930,118 @@ mod tests {
             stub.windows(4).any(|w| w == [0x49, 0x8B, 0x8C, 0x25]),
             "run_native handler must load persistent native frame via [r13-0x110]"
         );
+        assert_run_native_stub_uses_native_rsp(&stub);
+        for sled in collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map) {
+            assert_run_native_sled_straight_line(&sled);
+        }
+    }
+
+    fn collect_run_native_sleds(
+        bytecode: &[u8],
+        native_sleds: &[u8],
+        map: &OpcodeMap,
+    ) -> Vec<Vec<u8>> {
+        let wire = map.encode(OpCode::RunNative);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bytecode.len() {
+            if bytecode[i] == wire && i + 17 <= bytecode.len() {
+                let off = u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()) as usize;
+                if off < native_sleds.len() {
+                    let tail = &native_sleds[off..];
+                    let end = tail
+                        .iter()
+                        .position(|&b| b == 0xC3)
+                        .map(|p| p + 1)
+                        .unwrap_or(tail.len());
+                    out.push(tail[..end].to_vec());
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn assert_run_native_stub_uses_native_rsp(stub: &[u8]) {
+        let call_r10 = [0x41u8, 0xFF, 0xD2];
+        let call_at = stub
+            .windows(call_r10.len())
+            .position(|w| w == call_r10)
+            .expect("run_native handler must call r10");
+        let prefix = &stub[..call_at];
+        assert!(
+            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
+            "run_native must set native rbp before sled call"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "run_native must switch rsp to native frame before sled call"
+        );
+    }
+
+    fn assert_run_native_sled_straight_line(sled: &[u8]) {
+        assert!(sled.ends_with(&[0xC3]), "sled must end with ret, got {sled:02x?}");
+        let body = &sled[..sled.len() - 1];
+        assert!(!body.contains(&0xE8), "sled must not contain call rel32: {sled:02x?}");
+        assert!(
+            !body.windows(2).any(|w| w == [0xFF, 0x25] || w == [0xFF, 0x15]),
+            "sled must not contain indirect call: {sled:02x?}"
+        );
+        assert!(
+            !body.contains(&0xEB) && !body.contains(&0xE9),
+            "sled must not branch: {sled:02x?}"
+        );
+        for i in 0..body.len().saturating_sub(1) {
+            if body[i] == 0x0F {
+                let b = body[i + 1];
+                assert!(
+                    !(0x80..=0x8F).contains(&b),
+                    "sled must not contain near jcc: {sled:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_l4d_minimal_call_then_native_dec_partial() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_call_then_native_dec();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        assert!(
+            packed.bytecode.contains(&run_wire),
+            "minimal call→native fixture must emit run_native"
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(
+            &packed.bytecode,
+            &packed.opcode_map,
+        ));
+        assert!(ir.contains("run_native"), "IR must show run_native:\n{ir}");
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        assert!(!sleds.is_empty(), "expected at least one native sled");
+        assert!(
+            sleds.iter().any(|s| s.starts_with(&[0x83, 0x6D])),
+            "expected decrement sled sub [rbp+disp], got {:?}",
+            sleds
+        );
+        let sync = native_stack_sync_pairs(
+            &super::super::cfg::disassemble_main_window(
+                &PEFile::from_bytes(test_pe::create_pe64_call_then_native_dec()).unwrap().data,
+                pe.rva_to_file_offset(main_rva).unwrap(),
+                pe.rva_to_file_offset(text.virtual_address).unwrap() + text.size_of_raw_data as usize,
+            ),
+        );
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
+        assert_run_native_stub_uses_native_rsp(&stub);
+        for sled in &sleds {
+            assert_run_native_sled_straight_line(sled);
+        }
     }
 
     #[test]
@@ -1947,19 +2060,19 @@ mod tests {
         let mut instrs = disassemble_main_window(&pe.data, main_off, text_end);
         let loop_idx = instrs
             .iter()
-            .position(|i| matches!(i.kind, X64InstrKind::Jmp { .. }))
+            .position(|i| matches!(i.kind, X64InstrKind::CmpMemImm { .. }))
             .unwrap_or(0);
         instrs.insert(
-            loop_idx,
+            loop_idx + 1,
             X64Instruction {
-                offset: instrs[loop_idx].offset,
+                offset: instrs[loop_idx].offset + instrs[loop_idx].bytes.len(),
                 bytes: vec![0x0F, 0x0B],
                 kind: X64InstrKind::Unknown,
             },
         );
         let blocks = build_basic_blocks(&instrs, main_off);
-        let plan = PartialVirtPlan::from_seed(0xBA11_0001, &blocks, main_off, &pe, true).unwrap();
-        let map = OpcodeMap::from_seed(0xBA11_0001);
+        let plan = PartialVirtPlan::from_seed(0x14D0_2026, &blocks, main_off, &pe, true, &instrs).unwrap();
+        let map = OpcodeMap::from_seed(0x14D0_2026);
         let mut sled = NativeSledBuilder::new();
         set_active_map(&map);
         let bc = lift_to_vm_bytecode_for_main(

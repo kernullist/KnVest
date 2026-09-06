@@ -736,13 +736,13 @@ pub fn create_pe64_with_countdown_loop() -> Vec<u8> {
     let loop_start = p;
     code[p..p + 4].copy_from_slice(&[0x83, 0x7D, 0xFC, 0x01]);
     p += 4;
-    code[p] = 0x7C;
-    p += 1;
+    code[p..p + 2].copy_from_slice(&[0x0F, 0x8C]);
+    p += 2;
     let jl_pos = p;
     p += 4;
     code[p..p + 4].copy_from_slice(&[0x83, 0x6D, 0xFC, 0x01]);
     p += 4;
-    code[p] = 0xEB;
+    code[p] = 0xE9;
     p += 1;
     let jmp_pos = p;
     p += 4;
@@ -761,6 +761,53 @@ pub fn create_pe64_with_countdown_loop() -> Vec<u8> {
     let jl_from = jl_pos + 4;
     let jl_rel = (exit_start as i32) - (jl_from as i32);
     code[jl_pos..jl_pos + 4].copy_from_slice(&jl_rel.to_le_bytes());
+
+    pe.splice(main_off..main_off + code.len(), code);
+    pe
+}
+
+/// Minimal L4d fixture: VM-lifted internal call, then native decrement BB in a loop.
+pub fn create_pe64_call_then_native_dec() -> Vec<u8> {
+    let mut pe = create_minimal_pe64();
+    let text_base = 0x400usize;
+    let main_off = text_base + 0x20;
+    let noop_callee_off = text_base + 0x90;
+
+    if pe.len() < noop_callee_off + 3 {
+        pe.resize(noop_callee_off + 3, 0);
+    }
+    pe[noop_callee_off..noop_callee_off + 3].copy_from_slice(&[0x31, 0xC0, 0xC3]);
+
+    let mut code = Vec::new();
+    code.push(0x55);
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]);
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    code.extend_from_slice(&[0xC7, 0x45, 0xFC, 0x03, 0x00, 0x00, 0x00]);
+    let loop_start = code.len();
+    code.extend_from_slice(&[0x83, 0x7D, 0xFC, 0x01]);
+    code.extend_from_slice(&[0x0F, 0x8C]);
+    let jl_pos = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    code.push(0xE8);
+    let call_end = main_off + code.len() + 4;
+    let call_rel = (noop_callee_off as i32) - (call_end as i32);
+    code.extend_from_slice(&call_rel.to_le_bytes());
+    code.extend_from_slice(&[0x83, 0x6D, 0xFC, 0x01]);
+    code.push(0xE9);
+    let jmp_pos = code.len();
+    code.extend_from_slice(&[0, 0, 0, 0]);
+    let exit_start = code.len();
+    code.extend_from_slice(&[0x31, 0xC0]);
+    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+    code.push(0x5D);
+    code.push(0xC3);
+
+    let jl_from = jl_pos + 4;
+    code[jl_pos..jl_pos + 4]
+        .copy_from_slice(&((exit_start as i32) - (jl_from as i32)).to_le_bytes());
+    let jmp_from = jmp_pos + 4;
+    code[jmp_pos..jmp_pos + 4]
+        .copy_from_slice(&((loop_start as i32) - (jmp_from as i32)).to_le_bytes());
 
     pe.splice(main_off..main_off + code.len(), code);
     pe

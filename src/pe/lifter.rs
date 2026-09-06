@@ -5,7 +5,7 @@ use super::imports::{
     ImportTable,
 };
 use super::parser::PEFile;
-use super::partial::{NativeSledBuilder, PartialVirtPlan};
+use super::partial::{bb_can_run_native, native_sled_instr_range, NativeSledBuilder, PartialVirtPlan};
 use super::cfg::{BasicBlock, build_basic_blocks};
 use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
@@ -1618,42 +1618,6 @@ fn bb_for_offset(blocks: &[BasicBlock], offset: usize) -> Option<&BasicBlock> {
         .find(|b| offset >= b.start && offset < b.end)
 }
 
-fn bb_can_run_native(instrs: &[X64Instruction], bb: &BasicBlock) -> bool {
-    for idx in bb.leader_idx..=bb.tail_idx {
-        match &instrs[idx].kind {
-            X64InstrKind::Call { .. } | X64InstrKind::CallIndRip { .. } => return false,
-            X64InstrKind::Jmp { .. }
-            | X64InstrKind::Je { .. }
-            | X64InstrKind::Jne { .. }
-            | X64InstrKind::Jl { .. }
-            | X64InstrKind::Jle { .. }
-            | X64InstrKind::Jg { .. }
-            | X64InstrKind::Jge { .. } => return false,
-            X64InstrKind::MovRegImm { reg, .. } if arg_reg_touched(*reg) => return false,
-            X64InstrKind::MovRegReg { dst, .. } if arg_reg_touched(*dst) => return false,
-            X64InstrKind::Lea { dst, .. }
-            | X64InstrKind::LeaRegReg { dst, .. }
-            | X64InstrKind::LeaRipRel { dst, .. } if arg_reg_touched(*dst) => return false,
-            _ => {}
-        }
-    }
-    true
-}
-
-fn arg_reg_touched(reg: X64Reg) -> bool {
-    matches!(
-        reg,
-        X64Reg::Rcx
-            | X64Reg::Ecx
-            | X64Reg::Rdx
-            | X64Reg::Edx
-            | X64Reg::R8
-            | X64Reg::R9
-            | X64Reg::Rax
-            | X64Reg::Eax
-    )
-}
-
 /// All rbp-local slots that need bidirectional sync across `run_native` transitions.
 pub fn native_stack_sync_pairs(instrs: &[X64Instruction]) -> Vec<(i32, u8)> {
     let mut pairs: Vec<(i32, u8)> = prebuild_stack_map(instrs).into_iter().collect();
@@ -2126,16 +2090,22 @@ fn lift_to_vm_bytecode_internal_with_main(
                             let sled_off = sled_builder.sled_offset(sled_idx);
                             let vm_pc = bytecode.len();
                             emit_run_native(&mut bytecode, sled_off, orig_rva as u64);
-                            for j in bb.leader_idx..=bb.tail_idx {
-                                label_map.insert(instrs[j].offset, vm_pc);
+                            if let Some((start_idx, end_idx)) = native_sled_instr_range(instrs, bb)
+                            {
+                                for j in start_idx..=end_idx {
+                                    label_map.insert(instrs[j].offset, vm_pc);
+                                }
                             }
                             emitted_native_bb.insert(bb.id);
                         }
                     }
-                    if instr.offset < bb.end {
-                        skip_until_offset = Some(bb.end);
+                    if let Some((_, end_idx)) = native_sled_instr_range(instrs, bb) {
+                        let prefix_end = instrs[end_idx].offset + instrs[end_idx].bytes.len();
+                        if instr.offset < prefix_end {
+                            skip_until_offset = Some(prefix_end);
+                            continue;
+                        }
                     }
-                    continue;
                 }
             }
         }
