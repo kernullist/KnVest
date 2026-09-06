@@ -1225,6 +1225,99 @@ invoke_sled:
         );
     }
 
+    /// Linux-only: two decrement transitions with lift spill slot (reg 10 → [rbp-0x30]) and stub-equivalent sync.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_native_double_decrement_with_lift_spill_linux() {
+        use std::io::Write;
+        use std::process::Command;
+
+        let src = r#"
+#include <stdio.h>
+#include <stdint.h>
+
+extern void sled_dec(void);
+extern void invoke_once(char *frame);
+
+int main(void) {
+    _Alignas(16) uint8_t arena[0x200];
+    for (int i = 0; i < 0x200; i++) arena[i] = 0;
+    char *frame = (char *)(arena + 0x100);
+    *(int32_t *)(frame - 0x30) = 3;
+    for (int pass = 0; pass < 2; pass++) {
+        int32_t before = *(int32_t *)(frame - 0x30);
+        *(int32_t *)(frame - 4) = before;
+        invoke_once(frame);
+        *(int32_t *)(frame - 0x30) = *(int32_t *)(frame - 4);
+        if (*(int32_t *)(frame - 0x30) != before - 1) {
+            fprintf(stderr, "pass %d: expected %d got %d\n", pass, before - 1,
+                    *(int32_t *)(frame - 0x30));
+            return 1;
+        }
+    }
+    if (*(int32_t *)(frame - 0x30) != 1) {
+        fprintf(stderr, "expected final spill 1 got %d\n", *(int32_t *)(frame - 0x30));
+        return 1;
+    }
+    return 0;
+}
+"#;
+        let asm_src = r#"
+.globl sled_dec
+.globl invoke_once
+sled_dec:
+    subl $1, -4(%rbp)
+    ret
+invoke_once:
+    mov %rsp, %r12
+    mov %rbp, %r13
+    mov %rdi, %rbp
+    lea 0x80(%rdi), %rsp
+    and $-16, %rsp
+    sub $0x28, %rsp
+    call sled_dec
+    add $0x28, %rsp
+    mov %r13, %rbp
+    mov %r12, %rsp
+    ret
+"#;
+        let dir = std::env::temp_dir().join("knvest_run_native_double_spill");
+        let _ = std::fs::create_dir_all(&dir);
+        let c_path = dir.join("double_spill.c");
+        let s_path = dir.join("double_spill.S");
+        let exe_path = dir.join("double_spill");
+        {
+            let mut f = std::fs::File::create(&c_path).expect("write harness.c");
+            f.write_all(src.as_bytes()).expect("write harness source");
+            let mut f = std::fs::File::create(&s_path).expect("write harness.S");
+            f.write_all(asm_src.as_bytes()).expect("write harness asm");
+        }
+        let gcc = Command::new("gcc")
+            .args([
+                "-O0",
+                "-fno-stack-protector",
+                "-fcf-protection=none",
+                "-no-pie",
+                c_path.to_str().unwrap(),
+                s_path.to_str().unwrap(),
+                "-o",
+                exe_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn gcc");
+        assert!(
+            gcc.status.success(),
+            "double spill harness build failed: {}",
+            String::from_utf8_lossy(&gcc.stderr)
+        );
+        let run = Command::new(&exe_path).output().expect("run harness");
+        assert!(
+            run.status.success(),
+            "double decrement spill harness failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
     #[test]
     fn iat_native_call_threshold_uses_full_mov_rcx_imm64() {
         let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
