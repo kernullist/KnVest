@@ -17,8 +17,9 @@ pub fn pack_executable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     seed: Option<u64>,
     partial: bool,
     dispatch_mode: DispatchMode,
+    mba: bool,
 ) -> anyhow::Result<OpcodeMap> {
-    pack::pack_executable(input, output, rva, seed, partial, dispatch_mode)
+    pack::pack_executable(input, output, rva, seed, partial, dispatch_mode, mba)
 }
 
 pub fn extract_opcode_map(pe: &PEFile) -> Result<OpcodeMap, pe::PEError> {
@@ -48,6 +49,10 @@ pub fn disassemble_with_block_maps(
 
 pub fn pretty_print(instructions: &[Instruction]) -> String {
     Instruction::pretty_print(instructions)
+}
+
+pub fn pretty_print_with_mba(instructions: &[Instruction], mba: bool) -> String {
+    Instruction::pretty_print_with_mba(instructions, mba)
 }
 
 pub fn extract_partial_plan(pe: &PEFile) -> Result<PartialVirtPlan, pe::PEError> {

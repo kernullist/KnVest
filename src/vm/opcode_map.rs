@@ -5,9 +5,12 @@ use std::cell::RefCell;
 pub const KNV4_MAGIC: &[u8; 4] = b"KNV4";
 pub const KNV4_VERSION_V1: u8 = 1;
 pub const KNV4_VERSION: u8 = 2;
+pub const KNV4_VERSION_V3: u8 = 3;
 pub const CANONICAL_OPCODE_COUNT: usize = 20;
 pub const KNV4_HEADER_SIZE_V1: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
+pub const KNV4_HEADER_SIZE_V3: usize = 4 + 1 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
+pub const KNV4_MBA_FLAG_ENABLED: u8 = 0x01;
 
 /// Handler polymorphism (L4b): number of native bodies per logical opcode.
 pub const ADD_HANDLER_VARIANT_COUNT: u8 = 3;
@@ -139,6 +142,7 @@ impl OpcodeMap {
         PackMetadata {
             opcode_map: self.clone(),
             dispatch_mode: DispatchMode::Table,
+            mba_enabled: false,
         }
             .to_embedded_bytes()
     }
@@ -148,11 +152,12 @@ impl OpcodeMap {
     }
 }
 
-/// L4a opcode map + L4c dispatch mode embedded in `.knvest`.
+/// L4a opcode map + L4c dispatch mode (+ optional L4f MBA flag) embedded in `.knvest`.
 #[derive(Clone, Debug)]
 pub struct PackMetadata {
     pub opcode_map: OpcodeMap,
     pub dispatch_mode: DispatchMode,
+    pub mba_enabled: bool,
 }
 
 impl PackMetadata {
@@ -160,6 +165,7 @@ impl PackMetadata {
         Self {
             opcode_map: OpcodeMap::from_seed(seed),
             dispatch_mode,
+            mba_enabled: false,
         }
     }
 
@@ -168,13 +174,24 @@ impl PackMetadata {
     }
 
     pub fn to_embedded_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(KNV4_HEADER_SIZE);
-        out.extend_from_slice(KNV4_MAGIC);
-        out.push(KNV4_VERSION);
-        out.push(self.dispatch_mode.as_wire());
-        out.extend_from_slice(&self.opcode_map.seed.to_le_bytes());
-        out.extend_from_slice(&self.opcode_map.wire);
-        out
+        if self.mba_enabled {
+            let mut out = Vec::with_capacity(KNV4_HEADER_SIZE_V3);
+            out.extend_from_slice(KNV4_MAGIC);
+            out.push(KNV4_VERSION_V3);
+            out.push(self.dispatch_mode.as_wire());
+            out.push(KNV4_MBA_FLAG_ENABLED);
+            out.extend_from_slice(&self.opcode_map.seed.to_le_bytes());
+            out.extend_from_slice(&self.opcode_map.wire);
+            out
+        } else {
+            let mut out = Vec::with_capacity(KNV4_HEADER_SIZE);
+            out.extend_from_slice(KNV4_MAGIC);
+            out.push(KNV4_VERSION);
+            out.push(self.dispatch_mode.as_wire());
+            out.extend_from_slice(&self.opcode_map.seed.to_le_bytes());
+            out.extend_from_slice(&self.opcode_map.wire);
+            out
+        }
     }
 
     pub fn from_embedded(data: &[u8]) -> Option<Self> {
@@ -195,6 +212,7 @@ impl PackMetadata {
                 Some(Self {
                     opcode_map: OpcodeMap::from_parts(seed, wire),
                     dispatch_mode: DispatchMode::Table,
+                    mba_enabled: false,
                 })
             }
             KNV4_VERSION => {
@@ -211,6 +229,25 @@ impl PackMetadata {
                 Some(Self {
                     opcode_map: OpcodeMap::from_parts(seed, wire),
                     dispatch_mode,
+                    mba_enabled: false,
+                })
+            }
+            KNV4_VERSION_V3 => {
+                if data.len() < KNV4_HEADER_SIZE_V3 {
+                    return None;
+                }
+                let dispatch_mode = DispatchMode::from_wire(data[5])?;
+                let mba_enabled = data[6] & KNV4_MBA_FLAG_ENABLED != 0;
+                let seed = u64::from_le_bytes(data[7..15].try_into().unwrap());
+                let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
+                wire.copy_from_slice(&data[15..15 + CANONICAL_OPCODE_COUNT]);
+                if !wire_is_valid(&wire) {
+                    return None;
+                }
+                Some(Self {
+                    opcode_map: OpcodeMap::from_parts(seed, wire),
+                    dispatch_mode,
+                    mba_enabled,
                 })
             }
             _ => None,
@@ -373,6 +410,21 @@ mod tests {
             let wire = map.encode(op);
             assert_eq!(map.decode(wire), Some(op));
         }
+    }
+
+    #[test]
+    fn pack_metadata_v3_mba_roundtrip() {
+        let meta = PackMetadata {
+            opcode_map: OpcodeMap::from_seed(0xCAFE),
+            dispatch_mode: DispatchMode::Table,
+            mba_enabled: true,
+        };
+        let bytes = meta.to_embedded_bytes();
+        assert_eq!(bytes[4], KNV4_VERSION_V3);
+        assert_eq!(bytes[6], KNV4_MBA_FLAG_ENABLED);
+        let parsed = PackMetadata::from_embedded(&bytes).unwrap();
+        assert!(parsed.mba_enabled);
+        assert_eq!(parsed.seed(), 0xCAFE);
     }
 
     #[test]

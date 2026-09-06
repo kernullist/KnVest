@@ -2,6 +2,7 @@ use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
+use crate::pe::mba::{MBA_TEMP_NEG, MBA_TEMP_ZERO};
 use std::fmt;
 
 pub struct Instruction {
@@ -233,11 +234,24 @@ impl Instruction {
     }
 
     pub fn pretty_print(instructions: &[Self]) -> String {
+        Self::pretty_print_with_mba(instructions, false)
+    }
+
+    pub fn pretty_print_with_mba(instructions: &[Self], annotate_mba: bool) -> String {
         let mut output = String::new();
         output.push_str("Address  | Opcode       | Operands\n");
         output.push_str("---------+--------------+---------\n");
 
-        for instr in instructions {
+        let mba_starts = if annotate_mba {
+            find_mba_substitution_starts(instructions)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        for (idx, instr) in instructions.iter().enumerate() {
+            if let Some(note) = mba_starts.get(&idx) {
+                output.push_str(&format!("         | ; MBA       | {note}\n"));
+            }
             output.push_str(&format!(
                 "{:08x} | {:<12} | ",
                 instr.offset,
@@ -256,6 +270,58 @@ impl Instruction {
 
         output
     }
+}
+
+fn reg_operand(op: &Operand) -> Option<u8> {
+    match op {
+        Operand::Register(r) => Some(*r),
+        _ => None,
+    }
+}
+
+fn reg_at(ops: &[Operand], idx: usize) -> Option<u8> {
+    ops.get(idx).and_then(reg_operand)
+}
+
+fn mba_note_for(a: u8, b: u8, dst: u8) -> String {
+    format!("add r{dst}, r{a}, r{b}  ==  r{a}-(0-r{b})")
+}
+
+/// Detect L4f MBA expansion: load_imm r14,0 ; sub r15,r14,b ; sub dst,a,r15
+fn find_mba_substitution_starts(instructions: &[Instruction]) -> std::collections::HashMap<usize, String> {
+    let mut out = std::collections::HashMap::new();
+    if instructions.len() < 3 {
+        return out;
+    }
+    for i in 0..instructions.len().saturating_sub(2) {
+        let z = &instructions[i];
+        let n = &instructions[i + 1];
+        let f = &instructions[i + 2];
+        if z.opcode != OpCode::LoadImm || n.opcode != OpCode::Sub || f.opcode != OpCode::Sub {
+            continue;
+        }
+        let Some(zero_dst) = reg_at(&z.operands, 0) else { continue };
+        if zero_dst != MBA_TEMP_ZERO {
+            continue;
+        }
+        if !matches!(z.operands.get(1), Some(Operand::Immediate(0))) {
+            continue;
+        }
+        let Some(neg_dst) = reg_at(&n.operands, 0) else { continue };
+        let Some(neg_s1) = reg_at(&n.operands, 1) else { continue };
+        let Some(b) = reg_at(&n.operands, 2) else { continue };
+        if neg_dst != MBA_TEMP_NEG || neg_s1 != MBA_TEMP_ZERO {
+            continue;
+        }
+        let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
+        let Some(a) = reg_at(&f.operands, 1) else { continue };
+        let Some(neg_src) = reg_at(&f.operands, 2) else { continue };
+        if neg_src != MBA_TEMP_NEG {
+            continue;
+        }
+        out.insert(i, mba_note_for(a, b, final_dst));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -297,5 +363,37 @@ mod tests {
         bytecode.extend_from_slice(&1u64.to_le_bytes());
         let wrong = Instruction::disassemble(&bytecode, &map_b, DispatchMode::Table);
         assert!(wrong.iter().any(|i| !i.operands.is_empty() && matches!(i.operands[0], Operand::Unknown(_))));
+    }
+
+    #[test]
+    fn test_mba_ir_annotation() {
+        let insns = vec![
+            Instruction {
+                offset: 0,
+                opcode: OpCode::LoadImm,
+                operands: vec![Operand::Register(MBA_TEMP_ZERO), Operand::Immediate(0)],
+            },
+            Instruction {
+                offset: 10,
+                opcode: OpCode::Sub,
+                operands: vec![
+                    Operand::Register(MBA_TEMP_NEG),
+                    Operand::Register(MBA_TEMP_ZERO),
+                    Operand::Register(3),
+                ],
+            },
+            Instruction {
+                offset: 14,
+                opcode: OpCode::Sub,
+                operands: vec![
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::Register(MBA_TEMP_NEG),
+                ],
+            },
+        ];
+        let out = Instruction::pretty_print_with_mba(&insns, true);
+        assert!(out.contains("; MBA"));
+        assert!(out.contains("add r1, r2, r3"));
     }
 }

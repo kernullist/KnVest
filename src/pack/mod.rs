@@ -10,18 +10,27 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
     seed: Option<u64>,
     partial: bool,
     dispatch_mode: DispatchMode,
+    mba_enabled: bool,
 ) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
 
-    let pack_result = packer::pack_function(&mut pe, function_rva, seed, partial, dispatch_mode)
+    let pack_result = packer::pack_function(
+        &mut pe,
+        function_rva,
+        seed,
+        partial,
+        dispatch_mode,
+        mba_enabled,
+    )
         .context("Failed to pack function")?;
 
     eprintln!(
-        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={})",
+        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={})",
         pack_result.bytecode.len(),
         pack_result.seed,
-        pack_result.dispatch_mode
+        pack_result.dispatch_mode,
+        mba_enabled
     );
 
     pe.write_to_file(&output_path)

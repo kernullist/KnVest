@@ -14,7 +14,7 @@ fn test_pack_and_ir_workflow() {
 
     let output_path = test_dir.join("test_output.exe");
     
-    let result = knvest::pack_executable(&input_path, &output_path, None, Some(0x1234), false, DispatchMode::Table);
+    let result = knvest::pack_executable(&input_path, &output_path, None, Some(0x1234), false, DispatchMode::Table, false);
     assert!(result.is_ok(), "Packing should succeed");
 
     assert!(output_path.exists(), "Packed file should exist");
@@ -59,11 +59,21 @@ fn test_l4a_different_seeds_different_opcode_streams() {
     let pe_b = knvest::PEFile::from_bytes(minimal_pe.clone()).unwrap();
     let mut pe_a = pe_a;
     let mut pe_b = pe_b;
-    let packed_a = knvest::pe::packer::pack_function(&mut pe_a, None, Some(1), false, DispatchMode::Table).unwrap();
-    let packed_b = knvest::pe::packer::pack_function(&mut pe_b, None, Some(2), false, DispatchMode::Table).unwrap();
+    let packed_a = knvest::pe::packer::pack_function(&mut pe_a, None, Some(1), false, DispatchMode::Table, false).unwrap();
+    let packed_b = knvest::pe::packer::pack_function(&mut pe_b, None, Some(2), false, DispatchMode::Table, false).unwrap();
     assert_ne!(packed_a.bytecode, packed_b.bytecode);
-    let ir_a = knvest::pretty_print(&knvest::disassemble(&packed_a.bytecode, &packed_a.opcode_map, packed_a.dispatch_mode));
-    let ir_b = knvest::pretty_print(&knvest::disassemble(&packed_b.bytecode, &packed_b.opcode_map, packed_b.dispatch_mode));
+    let ir_a = knvest::pretty_print(&knvest::disassemble_with_block_maps(
+        &packed_a.bytecode,
+        &packed_a.opcode_map,
+        Some(&packed_a.block_map_plan),
+        packed_a.dispatch_mode,
+    ));
+    let ir_b = knvest::pretty_print(&knvest::disassemble_with_block_maps(
+        &packed_b.bytecode,
+        &packed_b.opcode_map,
+        Some(&packed_b.block_map_plan),
+        packed_b.dispatch_mode,
+    ));
     assert!(ir_a.contains("load_imm"));
     assert!(ir_b.contains("load_imm"));
 }
@@ -85,6 +95,7 @@ fn test_l4c_threaded_pack_and_ir() {
         Some(0x5678),
         false,
         DispatchMode::Threaded,
+        false,
     );
     assert!(result.is_ok(), "Threaded packing should succeed");
 

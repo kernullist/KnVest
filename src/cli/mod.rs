@@ -41,6 +41,11 @@ pub enum Commands {
             help = "VM dispatch mode: table (handler table) or threaded (inline handler targets)"
         )]
         dispatch: String,
+        #[arg(
+            long,
+            help = "Enable L4f MBA algebraic substitution for integer add (default: off)"
+        )]
+        mba: bool,
     },
 }
 
