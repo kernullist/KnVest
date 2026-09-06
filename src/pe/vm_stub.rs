@@ -15,7 +15,8 @@ use std::collections::HashMap;
 //   GPA            [rbp-0xC0]  bytes 40 FF FF FF
 //   call depth     [rbp-0xC8]  bytes 38 FF FF FF
 //   bytes written  [rbp-0xD0]  bytes 30 FF FF FF  (WriteFile out; do not clobber)
-//   current bb_id  [rbp-0x120] bytes E0 FF FF FF  (L4e table mode; restored on ret)
+//   current bb_id  [rbp-0x120] bytes E0 FE FF FF  (L4e table mode; restored on ret)
+//   VM r12         [rbp-0x20]  bytes E0 FF FF FF  (do not alias with current_bb_id)
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
 //   ret addrs      [rbp + depth*8 - 0x200]       (lo32=bytecode index, hi32=caller bb_id)
@@ -182,7 +183,7 @@ impl StubEmitter {
         // Zero L2 call depth [rbp-0xC8], push depth [rbp-0xE8], and L4e current bb_id [rbp-0x120]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
-        self.emit(&[0x66, 0xC7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x00, 0x00]); // mov word [rbp-0x120], 0
+        self.emit_mov_word_imm_to_rbp(-0x120, 0); // mov word [rbp-0x120], 0
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x8B, 0x40, 0x18]);
         self.emit(&[0x4C, 0x8D, 0x58, 0x10]);
@@ -380,34 +381,41 @@ impl StubEmitter {
         self.emit(&[0x44, 0x0F, 0xB7, 0x06]);
         // add rsi, 2
         self.emit(&[0x48, 0x83, 0xC6, 0x02]);
-        // lea r15, [rip + knv6_entries]
-        self.lea_rip_rel32(0x4D, 7, "knv6_entries");
+        self.emit_block_map_resolve_r15();
+        self.label("h_set_block_map_found");
+        // Reject bogus KNV6 images: handler_table must start with dword >= 1024.
+        self.emit(&[0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]); // cmp dword [r15+0x1C], 1024
+        self.jcc_rel32_short(0x72, "h_set_block_map_fail");
+        self.emit_block_map_apply_and_dispatch();
+        self.label("h_set_block_map_fail");
+        self.jmp_rel32("module_fail");
+    }
+
+    /// r8 = bb_id (dense 0..count-1); rsi = bytecode PC. Sets r15 → KNV6 entry on success path.
+    fn emit_block_map_resolve_r15(&mut self) {
+        self.label("h_set_block_map_resolve");
         // movzx ecx, word [rip + knv6_count]
         self.emit(&[0x0F, 0xB7, 0x0D, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "knv6_count"));
-        self.label("h_set_block_map_search");
-        // cmp word [r15], r8w — REX.R for r8 + REX.B for r15 (0x4D); 0x45 omits REX.R → compares ax
-        self.emit(&[0x66, 0x4D, 0x39, 0x07]);
-        self.jcc_rel32_short(0x74, "h_set_block_map_found");
-        // add r15, KNV6_ENTRY_SIZE
+        // bb_id must be < entry count (entries are indexed by bb_id)
+        self.emit(&[0x44, 0x39, 0xC1]); // cmp ecx, r8d
+        self.jcc_rel32_short(0x76, "h_set_block_map_fail"); // jbe if count <= bb_id
+        self.lea_rip_rel32(0x4D, 7, "knv6_entries");
+        self.emit_mov_reg_reg(0, 8); // mov rax, r8
         let stride = KNV6_ENTRY_SIZE as u32;
         self.emit(&[
-            0x49, 0x81, 0xC7,
+            0x48, 0x69, 0xC0,
             (stride & 0xFF) as u8,
             ((stride >> 8) & 0xFF) as u8,
             ((stride >> 16) & 0xFF) as u8,
             ((stride >> 24) & 0xFF) as u8,
-        ]);
-        // dec ecx; jnz search
-        self.emit(&[0xFF, 0xC9]);
-        self.jcc_rel32_short(0x75, "h_set_block_map_search");
-        self.jmp_to_dispatch();
-        self.label("h_set_block_map_found");
-        // Reject spurious [r15] matches: handler_table image must start with dword >= 1024.
-        self.emit(&[0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]); // cmp dword [r15+0x1C], 1024
-        self.jcc_rel32_short(0x72, "h_set_block_map_search");
+        ]); // imul rax, KNV6_ENTRY_SIZE
+        self.emit(&[0x4C, 0x01, 0xC7]); // add r15, rax
+    }
+
+    fn emit_block_map_apply_and_dispatch(&mut self) {
         // mov [rbp-0x120], r8w — track active bb for table-mode ret restore
-        self.emit(&[0x66, 0x44, 0x89, 0x45, 0xE0]);
+        self.emit_mov_word_to_rbp_from_r8(-0x120);
         // mov al, [r15+6] exit_wire
         self.emit(&[0x41, 0x8A, 0x47, 0x06]);
         // mov [rip+exit_wire_cmp_slot], al
@@ -665,6 +673,28 @@ impl StubEmitter {
         }
     }
 
+    fn emit_mov_word_to_rbp_from_r8(&mut self, disp: i32) {
+        debug_assert!(!(-128..=127).contains(&disp));
+        // mov [rbp+disp32], r8w — REX.R for r8; disp32 required for slots like -0x120
+        self.emit(&[0x66, 0x44, 0x89, 0x85]);
+        self.emit(&disp.to_le_bytes());
+    }
+
+    fn emit_mov_word_imm_to_rbp(&mut self, disp: i32, imm: u16) {
+        debug_assert!(!(-128..=127).contains(&disp));
+        // mov word [rbp+disp32], imm16
+        self.emit(&[0x66, 0xC7, 0x85]);
+        self.emit(&disp.to_le_bytes());
+        self.emit(&imm.to_le_bytes());
+    }
+
+    fn emit_movzx_word_from_rbp_to_eax(&mut self, disp: i32) {
+        debug_assert!(!(-128..=127).contains(&disp));
+        // movzx eax, word [rbp+disp32]
+        self.emit(&[0x66, 0x0F, 0xB7, 0x85]);
+        self.emit(&disp.to_le_bytes());
+    }
+
     fn emit_mov_qword_from_rbp_to_reg(&mut self, reg: u8, disp: i32) {
         let rex = if reg >= 8 { 0x4C } else { 0x48 };
         let reg = reg & 7;
@@ -815,7 +845,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x29, 0xCE]);
         self.emit(&[0x48, 0x8B, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
         self.emit_mov_reg_reg(11, 0); // mov r11, rax — preserve callee target offset
-        self.emit(&[0x66, 0x0F, 0xB7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // movzx eax, word [rbp-0x120]
+        self.emit_movzx_word_from_rbp_to_eax(-0x120); // current bb_id for ret-stack packing
         self.emit(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
         self.emit(&[0x48, 0x09, 0xF0]); // or rax, rsi — lo32 = return index
         self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]); // mov [rbp+rdx*8-0x200], rax
@@ -843,7 +873,7 @@ impl StubEmitter {
         self.lea_rip_rel32(0x48, 6, "bytecode"); // lea rsi, [bytecode]
         self.emit(&[0x48, 0x01, 0xF0]); // add rax, rsi — return bytecode pointer
         self.emit(&[0x48, 0x89, 0xC6]); // mov rsi, rax
-        self.jmp_rel32("h_set_block_map_search");
+        self.jmp_rel32("h_set_block_map_resolve");
     }
 
     fn emit_handler_native_call(&mut self) {
@@ -1364,13 +1394,26 @@ mod tests {
 
     #[test]
     fn set_block_map_records_current_bb_id_in_frame() {
+        let mut plan = crate::vm::BlockMapPlan::default();
+        plan.record_block(0xDEAD_BEEF, 0);
+        let (_scratch, _, _, handler_plan) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0xDEAD_BEEF),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &plan,
+            &[],
+            &[],
+        );
+        plan.fill_handler_tables(&handler_plan);
         let (stub, _, _, _) = create_vm_interpreter_stub(
             0,
             0,
-            &crate::vm::OpcodeMap::from_seed(0),
+            &crate::vm::OpcodeMap::from_seed(0xDEAD_BEEF),
             crate::vm::DispatchMode::Table,
             &[],
-            &crate::vm::BlockMapPlan::default(),
+            &plan,
             &[],
             &[],
         );
@@ -1379,10 +1422,18 @@ mod tests {
             .windows(sig.len())
             .position(|w| w == sig)
             .expect("h_set_block_map");
-        let body = &stub[set_map..set_map.saturating_add(96).min(stub.len())];
         assert!(
-            body.windows(4).any(|w| w == [0x66, 0x44, 0x89, 0x45]),
-            "h_set_block_map must persist bb_id to [rbp-0x120] after match"
+            stub.windows(8).any(|w| w == [0x66, 0x44, 0x89, 0x85, 0xE0, 0xFE, 0xFF, 0xFF]),
+            "h_set_block_map must persist bb_id to [rbp-0x120] via disp32 (E0 FE FF FF, not E0 FF FF FF → [rbp-0x20])"
+        );
+        let body = &stub[set_map..set_map.saturating_add(160).min(stub.len())];
+        assert!(
+            !body.windows(5).any(|w| w == [0x66, 0x44, 0x89, 0x45, 0xE0]),
+            "h_set_block_map must not use disp8 0xE0 (aliases VM r12 at [rbp-0x20])"
+        );
+        assert!(
+            !body.windows(8).any(|w| w == [0x66, 0x44, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]),
+            "h_set_block_map must not store bb_id at [rbp-0x20] (VM r12 slot)"
         );
     }
 
@@ -1399,7 +1450,7 @@ mod tests {
             &[],
         );
         let save_bb = [
-            0x66u8, 0x0F, 0xB7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, // movzx eax, [rbp-0x120]
+            0x66u8, 0x0F, 0xB7, 0x85, 0xE0, 0xFE, 0xFF, 0xFF, // movzx eax, [rbp-0x120]
             0x48, 0xC1, 0xE0, 0x20, // shl rax, 32
             0x48, 0x09, 0xF0, // or rax, rsi
             0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF, // mov [rbp+rdx*8-0x200], rax
@@ -1430,19 +1481,19 @@ mod tests {
             stub.windows(ret_restore.len()).any(|w| w == ret_restore),
             "h_ret must reload caller bb_id from ret stack"
         );
-        let search = [0x66u8, 0x4D, 0x39, 0x07]; // cmp word [r15], r8w
+        assert!(
+            stub.contains(&0xE9),
+            "h_ret must jmp to h_set_block_map_resolve after rebuilding return rsi"
+        );
+        let ret_sig = [0x48u8, 0x25, 0xFF, 0xFF, 0xFF, 0xFF]; // and eax, 0xffffffff
         let ret_pos = stub
-            .windows(ret_restore.len())
-            .position(|w| w == ret_restore)
-            .expect("ret restore prologue");
-        let after = &stub[ret_pos..ret_pos.saturating_add(48).min(stub.len())];
+            .windows(ret_sig.len())
+            .position(|w| w == ret_sig)
+            .expect("h_ret and eax,0xffffffff");
+        let after = &stub[ret_pos..ret_pos.saturating_add(32).min(stub.len())];
         assert!(
             after.contains(&0xE9),
-            "h_ret must jmp to h_set_block_map_search after rebuilding return rsi"
-        );
-        assert!(
-            stub.windows(search.len()).any(|w| w == search),
-            "h_set_block_map search loop must remain available for h_ret refresh"
+            "h_ret must jmp to h_set_block_map_resolve"
         );
     }
 
@@ -1460,8 +1511,8 @@ mod tests {
         );
         assert!(
             stub.windows(9)
-                .any(|w| w == [0x66, 0xC7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x00, 0x00]),
-            "prologue must zero current bb_id at [rbp-0x120]"
+                .any(|w| w == [0x66, 0xC7, 0x85, 0xE0, 0xFE, 0xFF, 0xFF, 0x00, 0x00]),
+            "prologue must zero current bb_id at [rbp-0x120] (E0 FE FF FF, not E0 FF FF FF)"
         );
     }
 
@@ -1528,12 +1579,12 @@ mod tests {
             "h_set_block_map must use 64-bit mov rcx,128 not mov ecx,128"
         );
         assert!(
-            body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
-            "h_set_block_map must cmp [r15],r8w with REX.R (66 4d 39 07)"
+            body.windows(3).any(|w| w == [0x44, 0x39, 0xC1]),
+            "h_set_block_map must bounds-check bb_id against knv6_count (cmp ecx,r8d)"
         );
         assert!(
-            !body.windows(4).any(|w| w == [0x66, 0x45, 0x39, 0x07]),
-            "h_set_block_map must not cmp [r15],ax (66 45 39 07 — missing REX.R)"
+            !body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must not linear-search cmp [r15],r8w"
         );
     }
 
@@ -1593,10 +1644,38 @@ mod tests {
             .windows(sig.len())
             .position(|w| w == sig)
             .expect("h_set_block_map");
-        let body = &stub[set_map..set_map.saturating_add(96).min(stub.len())];
+        let body = &stub[set_map..set_map.saturating_add(160).min(stub.len())];
         assert!(
             body.windows(8).any(|w| w == [0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]),
             "h_set_block_map must cmp dword [r15+0x1C],1024 before rep movsq"
+        );
+    }
+
+    #[test]
+    fn knv6_resolve_uses_direct_bb_id_index() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+        let set_map = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        let body = &stub[set_map..set_map.saturating_add(160).min(stub.len())];
+        assert!(
+            body.windows(3).any(|w| w == [0x48, 0x69, 0xC0]),
+            "h_set_block_map must imul rax,KNV6_ENTRY_SIZE instead of linear search"
+        );
+        assert!(
+            !body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must not linear-search cmp [r15],r8w"
         );
     }
 
@@ -1614,9 +1693,9 @@ mod tests {
         );
         let stride = KNV6_ENTRY_SIZE as u32;
         let expected = [
-            0x49,
-            0x81,
-            0xC7,
+            0x48,
+            0x69,
+            0xC0,
             (stride & 0xFF) as u8,
             ((stride >> 8) & 0xFF) as u8,
             ((stride >> 16) & 0xFF) as u8,
@@ -1624,7 +1703,7 @@ mod tests {
         ];
         assert!(
             stub.windows(expected.len()).any(|w| w == expected),
-            "h_set_block_map must advance r15 by KNV6_ENTRY_SIZE ({KNV6_ENTRY_SIZE:#x}), not 0x408"
+            "h_set_block_map must imul rax,KNV6_ENTRY_SIZE ({KNV6_ENTRY_SIZE:#x}) for bb_id lookup"
         );
     }
 

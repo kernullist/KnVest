@@ -121,6 +121,7 @@ fn build_section_bytecode(
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     validate_live_handler_table_image(&vm_stub, block_map_plan);
+    validate_meta_bb_ids_in_bytecode(bytecode, block_map_plan);
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
         embed_thread_targets(
             bytecode,
@@ -136,6 +137,35 @@ fn build_section_bytecode(
         stub: vm_stub,
         bytecode: section_bytecode,
     })
+}
+
+/// Every L4e META refresh operand must index a KNV6 entry (bb_id is dense 0..N-1).
+fn validate_meta_bb_ids_in_bytecode(bytecode: &[u8], block_map_plan: &BlockMapPlan) {
+    use crate::vm::block_map::{META_OPERAND_LEN, META_WIRE_BYTE};
+
+    if block_map_plan.entries.is_empty() {
+        return;
+    }
+    let mut off = 0usize;
+    while off + 1 + META_OPERAND_LEN <= bytecode.len() {
+        if bytecode[off] != META_WIRE_BYTE {
+            off += 1;
+            continue;
+        }
+        let bb_id = u16::from_le_bytes([bytecode[off + 1], bytecode[off + 2]]) as usize;
+        if bb_id >= block_map_plan.entries.len() {
+            panic!(
+                "bytecode META at offset {off:#x} references bb_id={bb_id} but KNV6 has {} entries",
+                block_map_plan.entries.len()
+            );
+        }
+        assert_eq!(
+            block_map_plan.entries[bb_id].bb_id as usize,
+            bb_id,
+            "KNV6 entry index must match bb_id for direct lookup (META at {off:#x})"
+        );
+        off += 1 + META_OPERAND_LEN;
+    }
 }
 
 fn has_stack_prologue(text_data: &[u8], offset: usize) -> bool {
