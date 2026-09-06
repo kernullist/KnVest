@@ -536,9 +536,7 @@ impl StubEmitter {
         }
 
         self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — sled uses native rbp locals
-        // Dedicated call stack above locals within native_stack (avoid rsp=rbp shadow overlap).
-        self.emit(&[0x48, 0x8D, 0x61, 0x80]); // lea rsp, [rcx+0x80]
-        self.emit(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
+        self.emit(&[0x48, 0x89, 0xCC]); // mov rsp, rcx — call/ret on native_stack blob (not VM stack)
         self.lea_rip_rel32(0x4C, 2, "native_sleds");
         self.emit(&[0x4D, 0x01, 0xDA]); // add r10, r11
         self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow (rsp%16==8 before call)
@@ -1079,12 +1077,12 @@ mod tests {
             "mov rbp, rcx before sled call"
         );
         assert!(
-            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
-            "lea rsp, [rcx+0x80] — call stack above native locals"
+            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "mov rsp, rcx before sled call (native_stack call/ret band)"
         );
         assert!(
-            prefix.windows(4).any(|w| w == [0x48, 0x83, 0xE4, 0xF0]),
-            "and rsp, -16 before sled call"
+            !prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "must not lea rsp,[rcx+0x80] (Windows empty-stdout regression)"
         );
         assert!(
             prefix.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x28]),
@@ -1174,8 +1172,7 @@ invoke_sled:
     mov %rsp, %r12
     mov %rbp, %r13
     mov %rdi, %rbp
-    lea 0x80(%rbp), %rsp
-    and $-16, %rsp
+    mov %rdi, %rsp
     sub $0x28, %rsp
     call sled_dec
     add $0x28, %rsp

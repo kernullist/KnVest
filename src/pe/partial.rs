@@ -332,21 +332,17 @@ pub fn splitmix64(mut x: u64) -> u64 {
 }
 
 pub fn instr_safe_for_native_sled(kind: &X64InstrKind) -> bool {
-    !matches!(
-        kind,
-        X64InstrKind::Call { .. }
-            | X64InstrKind::CallIndRip { .. }
-            | X64InstrKind::Jmp { .. }
-            | X64InstrKind::Je { .. }
-            | X64InstrKind::Jne { .. }
-            | X64InstrKind::Jl { .. }
-            | X64InstrKind::Jle { .. }
-            | X64InstrKind::Jg { .. }
-            | X64InstrKind::Jge { .. }
-            | X64InstrKind::LeaRipRel { .. }
-            | X64InstrKind::Push { .. }
-            | X64InstrKind::Pop { .. }
-    )
+    match kind {
+        X64InstrKind::Nop => true,
+        X64InstrKind::SubMemImm { base, .. }
+        | X64InstrKind::AddMemImm { base, .. }
+        | X64InstrKind::CmpMemImm { base, .. }
+        | X64InstrKind::MovMemImm { base, .. }
+        | X64InstrKind::MovMemReg { base, .. } => matches!(*base, X64Reg::Rbp | X64Reg::Ebp),
+        X64InstrKind::MovRegMem { base, .. } if matches!(*base, X64Reg::Rbp | X64Reg::Ebp) => true,
+        X64InstrKind::MovRegImm { reg, .. } if !frame_ptr_reg(*reg) => true,
+        _ => false,
+    }
 }
 
 pub fn bb_can_run_native(instrs: &[X64Instruction], bb: &BasicBlock) -> bool {
@@ -367,10 +363,25 @@ pub fn native_sled_instr_range(
             break;
         }
         match kind {
-            X64InstrKind::MovRegImm { reg, .. } if arg_reg_touched(*reg) => return None,
-            X64InstrKind::MovRegReg { dst, .. } if arg_reg_touched(*dst) => return None,
+            X64InstrKind::MovRegImm { reg, .. } if arg_reg_touched(*reg) || frame_ptr_reg(*reg) => {
+                return None
+            }
+            X64InstrKind::MovRegReg { dst, src } if {
+                arg_reg_touched(*dst)
+                    || arg_reg_touched(*src)
+                    || frame_ptr_reg(*dst)
+                    || frame_ptr_reg(*src)
+            } =>
+            {
+                return None
+            }
+            X64InstrKind::SubRegImm { reg, .. } | X64InstrKind::AddRegImm { reg, .. }
+                if arg_reg_touched(*reg) || frame_ptr_reg(*reg) =>
+            {
+                return None
+            }
             X64InstrKind::Lea { dst, .. } | X64InstrKind::LeaRegReg { dst, .. }
-                if arg_reg_touched(*dst) =>
+                if arg_reg_touched(*dst) || frame_ptr_reg(*dst) =>
             {
                 return None
             }
@@ -378,6 +389,13 @@ pub fn native_sled_instr_range(
         }
     }
     last_safe.map(|end| (bb.leader_idx, end))
+}
+
+fn frame_ptr_reg(reg: X64Reg) -> bool {
+    matches!(
+        reg,
+        X64Reg::Rbp | X64Reg::Ebp | X64Reg::Rsp | X64Reg::Esp
+    )
 }
 
 fn arg_reg_touched(reg: X64Reg) -> bool {
@@ -422,6 +440,33 @@ mod tests {
         let parsed = PartialVirtPlan::from_embedded(&bytes).unwrap();
         assert_eq!(parsed.decode_key, plan.decode_key);
         assert_eq!(parsed.blocks.len(), plan.blocks.len());
+    }
+
+    #[test]
+    fn prologue_mov_rbp_rsp_bb_is_not_native_eligible() {
+        use crate::pe::lifter::{X64Instruction, X64InstrKind, X64Reg};
+        use crate::pe::cfg::BasicBlock;
+
+        let instrs = vec![X64Instruction {
+            offset: 0,
+            bytes: vec![0x48, 0x89, 0xE5],
+            kind: X64InstrKind::MovRegReg {
+                dst: X64Reg::Rbp,
+                src: X64Reg::Rsp,
+            },
+        }];
+        let bb = BasicBlock {
+            id: 0,
+            start: 0,
+            end: 3,
+            leader_idx: 0,
+            tail_idx: 0,
+            has_back_edge: false,
+            native_eligible: true,
+            is_loop_header: false,
+        };
+        assert!(!bb_can_run_native(&instrs, &bb));
+        assert!(native_sled_instr_range(&instrs, &bb).is_none());
     }
 
     #[test]

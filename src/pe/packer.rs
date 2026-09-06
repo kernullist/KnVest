@@ -1961,8 +1961,8 @@ mod tests {
         );
         let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
-        // Handler contract (Windows): r13=VM frame, r12=VM rsp, rcx=native locals base,
-        // lea rsp,[rcx+0x80] + shadow, call r10 sled, dword spill sync, restore rbp/rsp.
+        // Handler contract (Windows): r13=VM frame, r12=VM rsp, rcx=native locals,
+        // mov rbp/rsp=rcx, sub rsp 0x28, call r10 sled, dword spill sync, restore rbp/rsp.
     }
 
     fn collect_run_native_sleds(
@@ -2003,12 +2003,12 @@ mod tests {
             "run_native must set native rbp before sled call"
         );
         assert!(
-            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
-            "run_native must use lea rsp,[rcx+0x80] call stack above locals"
+            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "run_native must mov rsp,rcx before sled call (native_stack band)"
         );
         assert!(
-            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
-            "run_native must not mov rsp,rcx (shadow overlaps rbp locals)"
+            !prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "run_native must not lea rsp,[rcx+0x80]"
         );
     }
 
@@ -2126,6 +2126,109 @@ mod tests {
             "Unknown in VM BB must emit bail_native in partial mode"
         );
         assert!(!sled.sleds.is_empty(), "bail_native needs a native sled");
+    }
+
+    #[test]
+    fn test_l4d_prologue_frame_setup_bb_cannot_run_native() {
+        use super::super::lifter::{X64Instruction, X64InstrKind, X64Reg};
+        use super::super::cfg::BasicBlock;
+        use super::super::partial::bb_can_run_native;
+
+        let instrs = vec![
+            X64Instruction {
+                offset: 0x100,
+                bytes: vec![0x48, 0x89, 0xE5],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rbp,
+                    src: X64Reg::Rsp,
+                },
+            },
+            X64Instruction {
+                offset: 0x103,
+                bytes: vec![0x48, 0x83, 0xEC, 0x20],
+                kind: X64InstrKind::SubRegImm {
+                    reg: X64Reg::Rsp,
+                    imm: 0x20,
+                },
+            },
+            X64Instruction {
+                offset: 0x107,
+                bytes: vec![0xC7, 0x45, 0xFC, 0x03, 0x00, 0x00, 0x00],
+                kind: X64InstrKind::MovMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                    imm: 3,
+                },
+            },
+        ];
+        let bb = BasicBlock {
+            id: 0,
+            start: 0x100,
+            end: 0x10E,
+            leader_idx: 0,
+            tail_idx: 2,
+            has_back_edge: false,
+            native_eligible: true,
+            is_loop_header: false,
+        };
+        assert!(
+            !bb_can_run_native(&instrs, &bb),
+            "prologue mov rbp,rsp / sub rsp must not become run_native sled"
+        );
+    }
+
+    #[test]
+    fn test_l4d_native_sleds_must_not_touch_host_rbp_rsp() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        for sled in &sleds {
+            let body = &sled[..sled.len().saturating_sub(1)];
+            assert!(
+                !body.windows(3).any(|w| w == [0x48, 0x89, 0xE5]),
+                "sled must not contain mov rbp,rsp (clobbers VM/native frame): {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w == [0x48, 0x89, 0xE1]),
+                "sled must not contain mov rcx,rsp: {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w == [0x48, 0x89, 0xEC]),
+                "sled must not contain mov rsp,rbp: {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w == [0x48, 0x89, 0xCC]),
+                "sled must not contain mov rsp,rsp: {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w.starts_with(&[0x48, 0x83, 0xEC])
+                    || w.starts_with(&[0x48, 0x83, 0xC4])
+                    || w.starts_with(&[0x48, 0x81, 0xEC])
+                    || w.starts_with(&[0x48, 0x81, 0xC4])),
+                "sled must not adjust host rsp: {sled:02x?}"
+            );
+        }
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        let nc_wire = packed.opcode_map.encode(OpCode::NativeCall);
+        let first_rn = packed.bytecode.iter().position(|&b| b == run_wire);
+        let first_nc = packed.bytecode.iter().position(|&b| b == nc_wire);
+        if let (Some(rn), Some(nc)) = (first_rn, first_nc) {
+            assert!(
+                rn > nc,
+                "run_native must not precede first native_call (printf) in bytecode:\n{}",
+                Instruction::pretty_print(&Instruction::disassemble(
+                    &packed.bytecode,
+                    &packed.opcode_map
+                ))
+            );
+        }
     }
 
     #[test]
