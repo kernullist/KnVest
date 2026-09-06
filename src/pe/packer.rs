@@ -95,7 +95,8 @@ fn build_section_bytecode(
     native_sync: &[(i32, u8)],
 ) -> PEResult<SectionBytecode> {
     let knv5 = partial_plan.to_embedded_bytes();
-    let (mut vm_stub, _) = create_vm_interpreter_stub(
+    // Pass 1: finalize stub so we can capture L4a handler redirect plan.
+    let (scratch_stub, _, _) = create_vm_interpreter_stub(
         0,
         0,
         opcode_map,
@@ -105,10 +106,20 @@ fn build_section_bytecode(
         native_sleds,
         native_sync,
     );
-    let handler_plan = collect_handler_redirect_plan(&vm_stub, opcode_map);
+    let handler_plan = collect_handler_redirect_plan(&scratch_stub, opcode_map);
     block_map_plan.fill_handler_tables(&handler_plan);
-    // Patch KNV6 blob after handler offsets are known.
-    patch_knv6_in_stub(&mut vm_stub, block_map_plan);
+    // Pass 2: embed filled KNV6 at the labeled blob offset (not a magic scan).
+    let (mut vm_stub, _, knv6_offset) = create_vm_interpreter_stub(
+        0,
+        0,
+        opcode_map,
+        dispatch_mode,
+        &knv5,
+        block_map_plan,
+        native_sleds,
+        native_sync,
+    );
+    patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
         embed_thread_targets(
@@ -814,34 +825,83 @@ pub fn extract_block_map_from_packed(pe: &PEFile) -> PEResult<BlockMapPlan> {
         return Err(PEError::InvalidPE("Section data out of bounds".to_string()));
     }
     let section_data = &pe.data[section_start..section_end];
+    let mut best: Option<(usize, BlockMapPlan)> = None;
     for i in 0..section_data.len().saturating_sub(KNV6_MAGIC.len()) {
-        if &section_data[i..i + KNV6_MAGIC.len()] == KNV6_MAGIC {
-            if let Some(plan) = BlockMapPlan::from_embedded(&section_data[i..]) {
-                return Ok(plan);
-            }
+        if &section_data[i..i + KNV6_MAGIC.len()] != KNV6_MAGIC {
+            continue;
         }
+        let Some(plan) = BlockMapPlan::from_embedded(&section_data[i..]) else {
+            continue;
+        };
+        let populated = plan.entries.iter().any(|e| e.handler_table.iter().any(|&b| b != 0));
+        if !populated {
+            continue;
+        }
+        match &best {
+            None => best = Some((i, plan)),
+            Some((prev_i, _)) if i > *prev_i => best = Some((i, plan)),
+            _ => {}
+        }
+    }
+    if let Some((_, plan)) = best {
+        return Ok(plan);
     }
     Err(PEError::InvalidPE(
         "Packed image missing KNV6 block-map metadata (L4e)".to_string(),
     ))
 }
 
-pub(crate) fn patch_knv6_in_stub(stub: &mut [u8], block_map_plan: &BlockMapPlan) {
+pub(crate) fn patch_knv6_in_stub(
+    stub: &mut [u8],
+    knv6_offset: usize,
+    block_map_plan: &BlockMapPlan,
+) {
     let bytes = block_map_plan.to_embedded_bytes();
-    for i in 0..stub.len().saturating_sub(KNV6_MAGIC.len()) {
-        if &stub[i..i + KNV6_MAGIC.len()] == KNV6_MAGIC {
-            if i + bytes.len() > stub.len() {
-                panic!(
-                    "KNV6 patch overflow: blob at {i:#x} needs {} bytes, stub has {}",
-                    bytes.len(),
-                    stub.len() - i
-                );
-            }
-            stub[i..i + bytes.len()].copy_from_slice(&bytes);
-            return;
+    if knv6_offset + bytes.len() > stub.len() {
+        panic!(
+            "KNV6 patch overflow: blob at {knv6_offset:#x} needs {} bytes, stub has {}",
+            bytes.len(),
+            stub.len() - knv6_offset
+        );
+    }
+    if &stub[knv6_offset..knv6_offset + KNV6_MAGIC.len()] != KNV6_MAGIC {
+        panic!(
+            "KNV6 patch at labeled offset {knv6_offset:#x} missing magic (wrong knv6_block_maps label?)"
+        );
+    }
+    stub[knv6_offset..knv6_offset + bytes.len()].copy_from_slice(&bytes);
+    validate_knv6_embedded_handler_tables(stub, knv6_offset, block_map_plan);
+}
+
+/// Runtime `h_set_block_map` copies `[r15+0x1C]` from each KNV6 entry — verify PE blob is populated.
+pub(crate) fn validate_knv6_embedded_handler_tables(
+    stub: &[u8],
+    knv6_offset: usize,
+    block_map_plan: &BlockMapPlan,
+) {
+    use crate::vm::block_map::{HANDLER_REDIRECT_TABLE_SIZE, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+
+    let blob = block_map_plan.to_embedded_bytes();
+    if stub[knv6_offset..knv6_offset + blob.len()] != blob[..] {
+        panic!("KNV6 labeled patch did not stick at {knv6_offset:#x}");
+    }
+    for (idx, entry) in block_map_plan.entries.iter().enumerate() {
+        let entry_off = knv6_offset + KNV6_HEADER_SIZE + idx * KNV6_ENTRY_SIZE;
+        let table_off = entry_off + 0x1C;
+        let embedded = &stub[table_off..table_off + HANDLER_REDIRECT_TABLE_SIZE];
+        if embedded != entry.handler_table.as_slice() {
+            panic!(
+                "KNV6 entry {} handler_table mismatch at stub[{table_off:#x}]",
+                entry.bb_id
+            );
+        }
+        if embedded.iter().all(|&b| b == 0) {
+            panic!(
+                "KNV6 bb_id={} embedded handler_table is all zero — set_block_map would wipe live table",
+                entry.bb_id
+            );
         }
     }
-    panic!("KNV6 magic not found in stub — block-map metadata missing");
 }
 
 /// Install the first BB's precomputed redirect table into the writable stub slot (L4e).
@@ -1546,7 +1606,7 @@ mod tests {
     
     #[test]
     fn test_stub_encoding_correctness() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         
         let mut i = 0;
         while i < stub.len() {
@@ -1581,7 +1641,7 @@ mod tests {
 
     #[test]
     fn test_stub_does_not_clobber_writefile_slot() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
         let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1598,7 +1658,7 @@ mod tests {
 
     #[test]
     fn test_loadbyte_uses_rip_rel_bytecode_base() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
@@ -1634,7 +1694,7 @@ mod tests {
 
     #[test]
     fn test_prologue_uses_near_jb_ja_not_jl_jg() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let cmp_a = [0x83u8, 0xF8, 0x41];
         let mut found_jb = false;
         for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
@@ -1660,7 +1720,7 @@ mod tests {
     #[test]
     fn test_handler_table_resolves_handlers() {
         let map = OpcodeMap::from_seed(0);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let dispatch_lea = [0x48u8, 0x8D, 0x1D];
         let mut table_base = None;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1688,7 +1748,7 @@ mod tests {
     #[test]
     fn test_l4c_threaded_stub_uses_inline_handler_targets() {
         let map = OpcodeMap::from_seed(0xC0FF_EE01);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Threaded, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Threaded, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let inline_load = [0x48u8, 0x63, 0x46, 0x01]; // movsxd rax, dword [rsi+1]
         assert!(
             stub.windows(inline_load.len()).any(|w| w == inline_load),
@@ -1866,7 +1926,7 @@ mod tests {
 
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1960,7 +2020,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let ne_cond = [0x83u8, 0xF9, 0x02];
         let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
@@ -1992,7 +2052,7 @@ mod tests {
 
     #[test]
     fn test_h_cmp_preserves_zf_in_flag_mask() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
         assert!(
             stub.windows(mask.len()).any(|w| w == mask),
@@ -2002,7 +2062,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_taken_uses_add_rsi_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let taken_add = [0x48u8, 0x01, 0xDE];
         assert!(
             stub.windows(taken_add.len()).any(|w| w == taken_add),
@@ -2012,7 +2072,7 @@ mod tests {
 
     #[test]
     fn test_three_digit_printer_uses_rcx_buffer() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
         let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -2082,7 +2142,7 @@ mod tests {
 
     #[test]
     fn test_module_next_advances_rcx_not_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let advance_rcx = [0x48u8, 0x8B, 0x09];
         let advance_rbx = [0x48u8, 0x8B, 0x1B];
         assert!(
@@ -2097,7 +2157,7 @@ mod tests {
 
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let pat = [0x48u8, 0x8D, 0x1D];
         let mut table_base = 0usize;
         for i in 0..stub.len().saturating_sub(7) {
@@ -2197,8 +2257,8 @@ mod tests {
         let packed_a = pack_pe_seed(&mut pe_a, None, seed_a);
         let packed_b = pack_pe_seed(&mut pe_b, None, seed_b);
 
-        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
-        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub_a, _, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub_b, _, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         assert_ne!(stub_a, stub_b, "different Add variants must change stub bytes");
 
         let ir_a = ir_pretty(&packed_a);
@@ -2245,6 +2305,99 @@ mod tests {
     }
 
     #[test]
+    fn test_l4e_knv6_set_block_map_source_and_live_table_nonzero() {
+        use crate::pe::threaded::handler_table_base;
+        use crate::vm::block_map::{
+            install_handler_table_in_stub, HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_SIZE,
+            KNV6_HEADER_SIZE,
+        };
+
+        let seed = 0xAAAA_AAAA_u64;
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_pe_seed(&mut pe, None, seed);
+        let section = pe.get_section(".knvest").unwrap();
+        let start = section.pointer_to_raw_data as usize;
+        let section_end = (start + section.size_of_raw_data as usize).min(pe.data.len());
+        let section_data = &pe.data[start..section_end];
+        let vmbc = section_data
+            .windows(4)
+            .position(|w| w == b"VMBC")
+            .expect("VMBC marker in .knvest stub");
+        let stub = &section_data[..vmbc + 4];
+
+        let knv6_pe = extract_block_map_from_packed(&pe).unwrap();
+        let table_base = handler_table_base(stub);
+        let bb0 = &packed.block_map_plan.entries[0];
+        let load_imm_wire = knv6_pe
+            .map_for_bb_or_base(bb0.bb_id, &packed.opcode_map)
+            .encode(OpCode::LoadImm) as usize;
+
+        // Locate labeled KNV6 blob (must match h_set_block_map lea r15 target - header).
+        let knv6_offset = stub
+            .windows(KNV6_MAGIC.len())
+            .enumerate()
+            .filter(|(i, _)| {
+                let off = *i;
+                stub[off..off + KNV6_MAGIC.len()] == *KNV6_MAGIC
+                    && BlockMapPlan::from_embedded(&stub[off..]).is_some()
+                    && off + KNV6_HEADER_SIZE + KNV6_ENTRY_SIZE <= stub.len()
+            })
+            .map(|(i, _)| i)
+            .find(|&off| {
+                let entry0_table = off + KNV6_HEADER_SIZE + 0x1C;
+                let slot = i32::from_le_bytes(
+                    stub[entry0_table + load_imm_wire * 4..entry0_table + load_imm_wire * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                slot != 0
+            })
+            .expect("nonzero KNV6 BB0 handler_table at labeled blob");
+
+        let knv6_src_table = knv6_offset + KNV6_HEADER_SIZE + 0x1C;
+        let src_off = i32::from_le_bytes(
+            stub[knv6_src_table + load_imm_wire * 4..knv6_src_table + load_imm_wire * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(src_off, 0, "BB0 KNV6 load_imm slot must be nonzero before set_block_map");
+
+        // BB0 pre-install (patch_runtime) — live table before first META refresh.
+        let pre_off = i32::from_le_bytes(
+            stub[table_base + load_imm_wire * 4..table_base + load_imm_wire * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(pre_off, 0, "BB0 pre-install live load_imm slot must be nonzero");
+        assert_eq!(
+            pre_off, src_off,
+            "pre-install live slot must match KNV6 BB0 image"
+        );
+
+        // Simulate h_set_block_map rep movsq from [r15+0x1C] for BB0 entry.
+        let mut sim = stub.to_vec();
+        let mut embedded_table = [0u8; HANDLER_REDIRECT_TABLE_SIZE];
+        embedded_table.copy_from_slice(
+            &sim[knv6_src_table..knv6_src_table + HANDLER_REDIRECT_TABLE_SIZE],
+        );
+        install_handler_table_in_stub(&mut sim, table_base, &embedded_table);
+        let post_off = i32::from_le_bytes(
+            sim[table_base + load_imm_wire * 4..table_base + load_imm_wire * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(
+            post_off, 0,
+            "after simulated set_block_map load_imm slot must stay nonzero"
+        );
+        let target = table_base as i64 + post_off as i64;
+        assert_eq!(sim[target as usize], 0x0F);
+        assert_eq!(sim[target as usize + 1], 0xB6);
+        assert_eq!(sim[target as usize + 2], 0x0E);
+    }
+
+    #[test]
     fn test_l4e_knv6_load_imm_slot_matches_l4a_redirect_plan() {
         use crate::pe::threaded::handler_table_base;
         use crate::vm::block_map::handler_region_end;
@@ -2276,7 +2429,7 @@ mod tests {
         let table_base = handler_table_base(stub);
         let handler_hi = handler_region_end(stub, table_base);
         let l4a_load_imm_off = {
-            let (fresh_stub, _) = create_vm_interpreter_stub(
+            let (fresh_stub, _, _) = create_vm_interpreter_stub(
                 0,
                 0,
                 &packed.opcode_map,
@@ -2408,7 +2561,7 @@ mod tests {
             sync.iter().any(|(off, _)| *off == -4),
             "countdown loop counter [rbp-4] must sync across run_native"
         );
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
         assert!(
             stub.windows(7).any(|w| w == [0x48, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]),
             "run_native handler must persist VM frame at [rbp-0x118]"
@@ -2441,7 +2594,7 @@ mod tests {
             "first run_native sled bytes (sub dword [rbp-4],1; ret)"
         );
         let sync = packed.native_sync.clone();
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
         // Handler contract: prologue caches native_frame_ptr; invoke lea r14 + mov rbp,r14 before sync.
     }
@@ -2626,7 +2779,7 @@ mod tests {
             sleds
         );
         let sync = packed.native_sync.clone();
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
         for sled in &sleds {
             assert_run_native_sled_straight_line(sled);
@@ -2851,7 +3004,7 @@ mod tests {
     #[test]
     fn test_l4d_stub_has_native_sled_handlers() {
         let map = OpcodeMap::from_seed(0xDEAD_BEEF);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let call_r10 = [0x41u8, 0xFF, 0xD2];
         assert!(
             stub.windows(call_r10.len()).any(|w| w == call_r10),
