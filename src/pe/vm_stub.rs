@@ -18,14 +18,16 @@ use std::collections::HashMap;
 //   ret addrs      [rbp + depth*8 - 0x200]       (depth 3 → -0x1E8; must not use for scratch)
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
+//   native side    [rbp-0x110]                  (persistent native frame ptr for L4d run_native)
 pub fn create_vm_interpreter_stub(
     _image_base: u64,
     _section_rva: u32,
     map: &OpcodeMap,
     knv5: &[u8],
     native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
 ) -> (Vec<u8>, usize) {
-    let mut e = StubEmitter::new(map);
+    let mut e = StubEmitter::new(map, native_sync);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
@@ -42,10 +44,11 @@ struct StubEmitter {
     handler_table_start: Option<usize>,
     exit_cmp_patch_pos: Option<usize>,
     opcode_map: OpcodeMap,
+    native_sync: Vec<(i32, u8)>,
 }
 
 impl StubEmitter {
-    fn new(map: &OpcodeMap) -> Self {
+    fn new(map: &OpcodeMap, native_sync: &[(i32, u8)]) -> Self {
         Self {
             code: Vec::new(),
             labels: HashMap::new(),
@@ -54,6 +57,7 @@ impl StubEmitter {
             handler_table_start: None,
             exit_cmp_patch_pos: None,
             opcode_map: map.clone(),
+            native_sync: native_sync.to_vec(),
         }
     }
 
@@ -114,6 +118,8 @@ impl StubEmitter {
         // Zero L2 call depth [rbp-0xC8] and push depth [rbp-0xE8]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
+        // Zero L4d persistent native side frame pointer [rbp-0x110]
+        self.emit(&[0x48, 0xC7, 0x85, 0xF0, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x8B, 0x40, 0x18]);
         self.emit(&[0x4C, 0x8D, 0x58, 0x10]);
@@ -389,6 +395,70 @@ impl StubEmitter {
         self.jmp_to_dispatch();
     }
 
+    fn emit_mov_from_r13_spill(&mut self, spill_reg: u8) {
+        let disp = (spill_reg as i32) * 8 - 0x80;
+        self.emit_mov_from_r13(0, disp);
+    }
+
+    fn emit_mov_to_r13_spill(&mut self, spill_reg: u8) {
+        let disp = (spill_reg as i32) * 8 - 0x80;
+        self.emit_mov_to_r13(0, disp);
+    }
+
+    fn emit_mov_from_r13(&mut self, reg: u8, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x49, 0x8B, (reg << 3) | 0x45, disp as u8]);
+        } else {
+            self.emit(&[0x49, 0x8B, (reg << 3) | 0x84, 0x25]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_to_r13(&mut self, reg: u8, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x49, 0x89, (reg << 3) | 0x45, disp as u8]);
+        } else {
+            self.emit(&[0x49, 0x89, (reg << 3) | 0x84, 0x25]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_from_r13_slot(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x49, 0x8B, 0x4D, disp as u8]); // mov rcx, [r13+disp8]
+        } else {
+            self.emit(&[0x49, 0x8B, 0x8C, 0x25]); // mov rcx, [r13+disp32]
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_to_r13_slot(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x49, 0x89, 0x4D, disp as u8]); // mov [r13+disp8], rcx
+        } else {
+            self.emit(&[0x49, 0x89, 0x8C, 0x25]); // mov [r13+disp32], rcx
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_to_rcx_disp(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x48, 0x89, 0x41, disp as u8]);
+        } else {
+            self.emit(&[0x48, 0x89, 0x81]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_from_rcx_disp(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x48, 0x8B, 0x41, disp as u8]);
+        } else {
+            self.emit(&[0x48, 0x8B, 0x81]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
     fn emit_handler_run_native(&mut self) {
         self.label("h_run_native");
         self.emit_native_sled_invoke();
@@ -399,23 +469,50 @@ impl StubEmitter {
         self.emit_native_sled_invoke();
     }
 
-    /// L4d: read sled offset + orig rva, run sled on an isolated native stack, sync rax→r0.
+    /// L4d: read sled offset + orig rva, sync VM spills↔native rbp locals, run sled, resume VM.
     fn emit_native_sled_invoke(&mut self) {
+        let sync_pairs = self.native_sync.clone();
         self.emit(&[0x48, 0x8B, 0x06]); // mov rax, [rsi] sled offset
-        self.emit(&[0x48, 0x83, 0xC6, 0x08]); // add rsi, 8 (skip orig rva)
+        self.emit(&[0x49, 0x89, 0xC3]); // mov r11, rax
+        self.emit(&[0x48, 0x83, 0xC6, 0x10]); // add rsi, 16 (skip orig rva)
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
+        self.emit(&[0x49, 0x89, 0xE5]); // mov r13, rbp — VM frame
         self.emit(&[0x49, 0x89, 0xE4]); // mov r12, rsp
-        self.emit(&[0x49, 0x89, 0xED]); // mov r13, rbp — VM frame base (Win64 callee-saved)
-        self.lea_rip_rel32(0x48, 4, "native_stack_top"); // lea rsp, [native_stack_top]
-        self.emit(&[0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]); // sub rsp, 0x100
-        self.emit(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
-        self.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
-        self.lea_rip_rel32(0x4C, 2, "native_sleds"); // lea r10, [native_sleds]
-        self.emit(&[0x49, 0x01, 0xC2]); // add r10, rax
+
+        // rcx = persistent native side frame pointer [r13-0x110]
+        self.emit_mov_from_r13_slot(-0x110);
+        self.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+        self.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
+        self.jcc_rel32(0x85, "rn_frame_ready"); // jne rn_frame_ready
+
+        self.lea_rip_rel32(0x48, 4, "native_stack_top");
+        self.emit(&[0x48, 0x2D, 0x00, 0x01, 0x00, 0x00]); // sub rax, 0x100
+        self.emit(&[0x48, 0x83, 0xE0, 0xF0]); // and rax, -16
+        self.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+        self.emit_mov_to_r13_slot(-0x110); // mov [r13-0x110], rcx
+
+        self.label("rn_frame_ready");
+        for &(rbp_disp, spill) in &sync_pairs {
+            self.emit_mov_from_r13_spill(spill);
+            self.emit_mov_to_rcx_disp(rbp_disp);
+        }
+
+        self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — sled uses native frame
+        self.lea_rip_rel32(0x4C, 2, "native_sleds");
+        self.emit(&[0x4D, 0x01, 0xDA]); // add r10, r11
         self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow
         self.emit(&[0x41, 0xFF, 0xD2]); // call r10
         self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-        self.emit(&[0x49, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [r13-0x80], rax
+        self.emit(&[0x49, 0x89, 0xC6]); // mov r14, rax — preserve return value
+
+        for &(rbp_disp, spill) in &sync_pairs {
+            self.emit_mov_from_rcx_disp(rbp_disp);
+            self.emit_mov_to_r13_spill(spill);
+        }
+
+        self.emit(&[0x4C, 0x89, 0xF0]); // mov rax, r14
+        self.emit_mov_to_r13_spill(0); // sync return value into VM r0
+
         self.emit(&[0x49, 0x89, 0xED]); // mov rbp, r13
         self.emit(&[0x49, 0x89, 0xE4]); // mov rsp, r12
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov rsi, [rbp-0x98]
@@ -847,7 +944,7 @@ mod tests {
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
     #[test]
     fn peb_module_walk_single_advance_per_iteration() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let init = [0x49u8, 0x8B, 0x0B]; // mov rcx, [r11] — first module
         let done = [0x48u8, 0x8B, 0x59, 0x30]; // name_cmp_done: mov rbx, [rcx+0x30]
         let advance = [0x48u8, 0x8B, 0x09]; // mov rcx, [rcx]
@@ -879,7 +976,7 @@ mod tests {
 
     #[test]
     fn iat_native_call_threshold_uses_full_mov_rcx_imm64() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let pattern = [
             0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rcx, 0x100000000
             0x48, 0x39, 0xC8, // cmp rax, rcx
@@ -897,7 +994,7 @@ mod tests {
 
     #[test]
     fn vm_metadata_uses_l2_slots_with_correct_disp32() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let call_depth_init = [0x48u8, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         let push_depth_init = [0x48u8, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         assert!(
@@ -938,7 +1035,7 @@ mod tests {
 
     #[test]
     fn iat_native_call_maps_x64_rcx_from_vm_reg0() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         // nc_iat must load win64 rcx from VM r0 slot [rbp-0x80] (zero-extended via mov ecx)
         let rcx_from_r0 = [0x8Bu8, 0x8D, 0x80, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1052,7 +1149,7 @@ mod tests {
     /// Metadata (push/call depth, flags, rsi save) must not use VM r0..r15 frame slots.
     #[test]
     fn vm_stub_metadata_must_not_alias_vm_reg_slots() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let r13_slot = vm_reg_slot_disp32(13); // E8 FF FF FF = [rbp-0x18]
         assert!(
             !stub.windows(4).any(|w| w == r13_slot),
@@ -1289,7 +1386,7 @@ mod tests {
     /// Every SIB used for VM reg [rbp+idx*scale-0x80] in handlers must be scale*8 (CD/FD/D5).
     #[test]
     fn vm_reg_sib_must_be_scale8_in_handlers() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let forbidden_sib = [
             (0x8D, "rcx scale*4"),
             (0xBD, "rdi scale*4"),
@@ -1407,8 +1504,8 @@ mod tests {
         let seed_v1 = seed_for_add_variant(1);
         let map_v0 = crate::vm::OpcodeMap::from_seed(seed_v0);
         let map_v1 = crate::vm::OpcodeMap::from_seed(seed_v1);
-        let (stub_v0, _) = create_vm_interpreter_stub(0, 0, &map_v0, &[], &[]);
-        let (stub_v1, _) = create_vm_interpreter_stub(0, 0, &map_v1, &[], &[]);
+        let (stub_v0, _) = create_vm_interpreter_stub(0, 0, &map_v0, &[], &[], &[]);
+        let (stub_v1, _) = create_vm_interpreter_stub(0, 0, &map_v1, &[], &[], &[]);
 
         let h0 = add_handler_offset(&stub_v0, &map_v0);
         let h1 = add_handler_offset(&stub_v1, &map_v1);
@@ -1434,7 +1531,7 @@ mod tests {
         if ADD_HANDLER_VARIANT_COUNT >= 3 {
             let seed_v2 = seed_for_add_variant(2);
             let map_v2 = crate::vm::OpcodeMap::from_seed(seed_v2);
-            let (stub_v2, _) = create_vm_interpreter_stub(0, 0, &map_v2, &[], &[]);
+            let (stub_v2, _) = create_vm_interpreter_stub(0, 0, &map_v2, &[], &[], &[]);
             let h2 = add_handler_offset(&stub_v2, &map_v2);
             let body_v2 = &stub_v2[h2..h2 + 48];
             assert_ne!(body_v0, body_v2);
@@ -1452,8 +1549,8 @@ mod tests {
     fn add_handler_polymorphism_same_seed_is_stable() {
         let seed = seed_for_add_variant(1);
         let map = crate::vm::OpcodeMap::from_seed(seed);
-        let (a, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
-        let (b, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
+        let (a, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &[]);
+        let (b, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &[]);
         let ha = add_handler_offset(&a, &map);
         let hb = add_handler_offset(&b, &map);
         assert_eq!(&a[ha..ha + 48], &b[hb..hb + 48]);

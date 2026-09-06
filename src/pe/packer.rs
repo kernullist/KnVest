@@ -1,5 +1,5 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::lift_to_vm_bytecode_for_main;
+use super::lifter::{lift_to_vm_bytecode_for_main, native_stack_sync_pairs};
 use super::vm_stub::create_vm_interpreter_stub;
 use super::cfg::{collect_cfg_entries, disassemble_cfg_function, build_basic_blocks};
 use super::partial::{NativeSledBuilder, PartialVirtPlan, KNV5_MAGIC};
@@ -51,6 +51,7 @@ pub fn pack_function(
         &opcode_map,
         &translated.partial_plan,
         &translated.native_sleds,
+        &translated.native_sync,
     )?;
 
     Ok(PackResult {
@@ -399,6 +400,7 @@ struct TranslateResult {
     bytecode: Vec<u8>,
     partial_plan: PartialVirtPlan,
     native_sleds: Vec<u8>,
+    native_sync: Vec<(i32, u8)>,
 }
 
 fn translate_to_vm_bytecode(
@@ -478,10 +480,12 @@ fn translate_to_vm_bytecode(
     clear_active_map();
 
     let native_sleds = sled_builder.blob();
+    let native_sync = native_stack_sync_pairs(&all_instrs);
     Ok(TranslateResult {
         bytecode,
         partial_plan,
         native_sleds,
+        native_sync,
     })
 }
 
@@ -517,6 +521,7 @@ fn add_vm_section(
     opcode_map: &OpcodeMap,
     partial_plan: &PartialVirtPlan,
     native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
 ) -> PEResult<()> {
     let _original_entry_rva = pe.entry_point_rva;
     
@@ -547,6 +552,7 @@ fn add_vm_section(
         opcode_map,
         &knv5,
         native_sleds,
+        native_sync,
     );
     
     let mut section_data = Vec::new();
@@ -1350,7 +1356,7 @@ mod tests {
     
     #[test]
     fn test_stub_encoding_correctness() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         
         let mut i = 0;
         while i < stub.len() {
@@ -1385,7 +1391,7 @@ mod tests {
 
     #[test]
     fn test_stub_does_not_clobber_writefile_slot() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
         let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1402,7 +1408,7 @@ mod tests {
 
     #[test]
     fn test_loadbyte_uses_rip_rel_bytecode_base() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
@@ -1438,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_prologue_uses_near_jb_ja_not_jl_jg() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let cmp_a = [0x83u8, 0xF8, 0x41];
         let mut found_jb = false;
         for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
@@ -1464,7 +1470,7 @@ mod tests {
     #[test]
     fn test_handler_table_resolves_handlers() {
         let map = OpcodeMap::from_seed(0);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &[]);
         let dispatch_lea = [0x48u8, 0x8D, 0x1D];
         let mut table_base = None;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1490,7 +1496,7 @@ mod tests {
 
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1584,7 +1590,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let ne_cond = [0x83u8, 0xF9, 0x02];
         let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
@@ -1616,7 +1622,7 @@ mod tests {
 
     #[test]
     fn test_h_cmp_preserves_zf_in_flag_mask() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
         assert!(
             stub.windows(mask.len()).any(|w| w == mask),
@@ -1626,7 +1632,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_taken_uses_add_rsi_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let taken_add = [0x48u8, 0x01, 0xDE];
         assert!(
             stub.windows(taken_add.len()).any(|w| w == taken_add),
@@ -1636,7 +1642,7 @@ mod tests {
 
     #[test]
     fn test_three_digit_printer_uses_rcx_buffer() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
         let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1706,7 +1712,7 @@ mod tests {
 
     #[test]
     fn test_module_next_advances_rcx_not_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let advance_rcx = [0x48u8, 0x8B, 0x09];
         let advance_rbx = [0x48u8, 0x8B, 0x1B];
         assert!(
@@ -1721,7 +1727,7 @@ mod tests {
 
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let pat = [0x48u8, 0x8D, 0x1D];
         let mut table_base = 0usize;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1821,8 +1827,8 @@ mod tests {
         let packed_a = pack_pe_seed(&mut pe_a, None, seed_a);
         let packed_b = pack_pe_seed(&mut pe_b, None, seed_b);
 
-        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, &[], &[]);
-        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, &[], &[]);
+        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, &[], &[], &[]);
+        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, &[], &[], &[]);
         assert_ne!(stub_a, stub_b, "different Add variants must change stub bytes");
 
         let ir_a = Instruction::pretty_print(
@@ -1903,6 +1909,26 @@ mod tests {
         assert!(ir.contains("run_native"), "IR must show run_native:\n{ir}");
         let plan = extract_partial_plan_from_packed(&pe).unwrap();
         assert_eq!(plan.decode_key, packed.partial_plan.decode_key);
+
+        // Documented Windows verify seed: --partial --seed 0x14D02026
+        let fixture = test_pe::create_pe64_with_countdown_loop();
+        let fixture_pe = PEFile::from_bytes(fixture).unwrap();
+        let fixture_text = fixture_pe.get_section(".text").unwrap();
+        let fixture_main = fixture_pe.rva_to_file_offset(main_rva).unwrap();
+        let fixture_end = fixture_pe.rva_to_file_offset(fixture_text.virtual_address).unwrap()
+            + fixture_text.size_of_raw_data as usize;
+        let fixture_instrs =
+            super::super::cfg::disassemble_main_window(&fixture_pe.data, fixture_main, fixture_end);
+        let sync = native_stack_sync_pairs(&fixture_instrs);
+        assert!(
+            sync.iter().any(|(off, _)| *off == -4),
+            "countdown loop counter [rbp-4] must sync across run_native"
+        );
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
+        assert!(
+            stub.windows(4).any(|w| w == [0x49, 0x8B, 0x8C, 0x25]),
+            "run_native handler must load persistent native frame via [r13-0x110]"
+        );
     }
 
     #[test]
@@ -1959,7 +1985,7 @@ mod tests {
     #[test]
     fn test_l4d_stub_has_native_sled_handlers() {
         let map = OpcodeMap::from_seed(0xDEAD_BEEF);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &[]);
         let call_r10 = [0x41u8, 0xFF, 0xD2];
         assert!(
             stub.windows(call_r10.len()).any(|w| w == call_r10),

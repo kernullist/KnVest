@@ -1654,6 +1654,13 @@ fn arg_reg_touched(reg: X64Reg) -> bool {
     )
 }
 
+/// All rbp-local slots that need bidirectional sync across `run_native` transitions.
+pub fn native_stack_sync_pairs(instrs: &[X64Instruction]) -> Vec<(i32, u8)> {
+    let mut pairs: Vec<(i32, u8)> = prebuild_stack_map(instrs).into_iter().collect();
+    pairs.sort_unstable_by_key(|(off, _)| *off);
+    pairs
+}
+
 fn prebuild_stack_map(instrs: &[X64Instruction]) -> std::collections::HashMap<i32, u8> {
     let mut stack_map = std::collections::HashMap::new();
     let mut next_stack_reg = VM_STACK_SPILL_REG_FIRST;
@@ -1678,33 +1685,6 @@ fn prebuild_stack_map(instrs: &[X64Instruction]) -> std::collections::HashMap<i3
         }
     }
     stack_map
-}
-
-fn bb_rbp_sync_slots(
-    instrs: &[X64Instruction],
-    bb: &BasicBlock,
-    stack_map: &std::collections::HashMap<i32, u8>,
-) -> Vec<(i32, u8)> {
-    let mut slots = Vec::new();
-    for idx in bb.leader_idx..=bb.tail_idx {
-        let offset = match &instrs[idx].kind {
-            X64InstrKind::MovMemImm { base, offset, .. }
-            | X64InstrKind::MovMemReg { base, offset, .. }
-                if *base == X64Reg::Rbp || *base == X64Reg::Ebp =>
-            {
-                Some(*offset)
-            }
-            _ => None,
-        };
-        if let Some(off) = offset {
-            if let Some(&spill) = stack_map.get(&off) {
-                if !slots.iter().any(|(o, _)| *o == off) {
-                    slots.push((off, spill));
-                }
-            }
-        }
-    }
-    slots
 }
 
 fn lift_to_vm_bytecode_internal(
@@ -2114,7 +2094,7 @@ fn lift_to_vm_bytecode_internal_with_main(
 
     let main_blocks = build_basic_blocks(instrs, main_x64_offset);
     let use_partial = partial.map_or(false, |p| !p.full_virt);
-    let stack_map_pre = prebuild_stack_map(instrs);
+    let _stack_map_pre = prebuild_stack_map(instrs);
     let mut skip_until_offset: Option<usize> = None;
     let mut emitted_native_bb: HashSet<usize> = HashSet::new();
 
@@ -2140,9 +2120,8 @@ fn lift_to_vm_bytecode_internal_with_main(
             if let (Some(plan), Some(bb)) = (partial, bb_for_offset(&main_blocks, instr.offset)) {
                 if !plan.is_vm_bb(bb.id) && bb_can_run_native(instrs, bb) {
                     if !emitted_native_bb.contains(&bb.id) {
-                        let sync = bb_rbp_sync_slots(instrs, bb, &stack_map_pre);
                         if let Ok((sled_idx, orig_rva)) =
-                            sled_builder.add_range_sled(pe, instrs, bb, &sync)
+                            sled_builder.add_range_sled(pe, instrs, bb)
                         {
                             let sled_off = sled_builder.sled_offset(sled_idx);
                             let vm_pc = bytecode.len();
