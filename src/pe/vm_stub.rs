@@ -401,6 +401,9 @@ impl StubEmitter {
         self.jcc_rel32_short(0x75, "h_set_block_map_search");
         self.jmp_to_dispatch();
         self.label("h_set_block_map_found");
+        // Reject spurious [r15] matches: handler_table image must start with dword >= 1024.
+        self.emit(&[0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]); // cmp dword [r15+0x1C], 1024
+        self.jcc_rel32_short(0x72, "h_set_block_map_search");
         // mov al, [r15+6] exit_wire
         self.emit(&[0x41, 0x8A, 0x47, 0x06]);
         // mov [rip+exit_wire_cmp_slot], al
@@ -1452,6 +1455,30 @@ mod tests {
         assert_eq!(
             copy_target, dispatch_target,
             "rep movsq dest must use the same handler_table base as table dispatch"
+        );
+    }
+
+    #[test]
+    fn set_block_map_rejects_handler_table_image_below_1024() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+        let set_map = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        let body = &stub[set_map..set_map.saturating_add(96).min(stub.len())];
+        assert!(
+            body.windows(8).any(|w| w == [0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]),
+            "h_set_block_map must cmp dword [r15+0x1C],1024 before rep movsq"
         );
     }
 

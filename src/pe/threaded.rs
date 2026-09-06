@@ -188,10 +188,19 @@ pub fn handler_offset_for_set_block_map(stub: &[u8]) -> i32 {
 }
 
 pub fn handler_table_base(stub: &[u8]) -> usize {
+    let table_indexed = [0x48u8, 0x63, 0x04, 0x83]; // movsxd rax, [rbx+rax*4]
     let dispatch_lea = [0x48u8, 0x8D, 0x1D];
+    if let Some(idx) = stub.windows(table_indexed.len()).position(|w| w == table_indexed) {
+        for i in (idx.saturating_sub(32)..idx).rev() {
+            if stub[i..i + 3] == dispatch_lea {
+                let disp = i32::from_le_bytes(stub[i + 3..i + 7].try_into().unwrap());
+                return ((i + 7) as isize + disp as isize) as usize;
+            }
+        }
+    }
     for i in 0..stub.len().saturating_sub(7) {
         if stub[i..i + 3] == dispatch_lea {
-            let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
+            let disp = i32::from_le_bytes(stub[i + 3..i + 7].try_into().unwrap());
             return ((i + 7) as isize + disp as isize) as usize;
         }
     }

@@ -120,6 +120,7 @@ fn build_section_bytecode(
     );
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
+    validate_live_handler_table_image(&vm_stub, block_map_plan);
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
         embed_thread_targets(
             bytecode,
@@ -906,6 +907,56 @@ pub(crate) fn validate_knv6_embedded_handler_tables(
 
 fn table_base_from_stub(stub: &[u8]) -> usize {
     super::threaded::handler_table_base(stub)
+}
+
+/// Pack-time guard: live redirect table in the PE stub must be fully populated before Windows runs.
+fn validate_live_handler_table_image(stub: &[u8], block_map_plan: &BlockMapPlan) {
+    use crate::vm::block_map::{HANDLER_REDIRECT_TABLE_SIZE, META_WIRE_BYTE};
+
+    let table_base = table_base_from_stub(stub);
+    let mut zero = 0usize;
+    let mut small = 0usize;
+    for slot in 0..256 {
+        let off = i32::from_le_bytes(
+            stub[table_base + slot * 4..table_base + slot * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if off == 0 {
+            zero += 1;
+        }
+        if off < HANDLER_REDIRECT_TABLE_SIZE as i32 {
+            small += 1;
+        }
+    }
+    if zero != 0 || small != 0 {
+        panic!(
+            "live handler_table has {zero} zero slots and {small} sub-1024 slots before pack"
+        );
+    }
+    let meta_off = i32::from_le_bytes(
+        stub[table_base + (META_WIRE_BYTE as usize) * 4..table_base + (META_WIRE_BYTE as usize) * 4 + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let meta_target = table_base as i64 + meta_off as i64;
+    let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+    if stub.get(meta_target as usize..meta_target as usize + sig.len()) != Some(sig.as_slice()) {
+        panic!(
+            "meta slot 0xFD off {meta_off:#x} -> {meta_target:#x} does not land on h_set_block_map"
+        );
+    }
+    if let Some(first) = block_map_plan.entries.first() {
+        validate_handler_table_targets(stub, table_base, &first.handler_table).unwrap_or_else(
+            |e| panic!("BB{} pre-install handler_table invalid: {e}", first.bb_id),
+        );
+        if stub[table_base..table_base + HANDLER_REDIRECT_TABLE_SIZE] != first.handler_table {
+            panic!(
+                "live handler_table must match BB{} KNV6 image after patch_runtime",
+                first.bb_id
+            );
+        }
+    }
 }
 
 /// Install the first BB's precomputed redirect table into the writable stub slot (L4e).
@@ -2294,6 +2345,35 @@ mod tests {
             "forward CRT must not be lifted into bytecode, got {} bytes",
             bc.len()
         );
+    }
+
+    #[test]
+    fn test_l4e_packed_live_handler_table_all_slots_ge_1024() {
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let packed = pack_pe_seed(&mut pe, Some(text.virtual_address + 0x20), 0x14E0_2026);
+        let section = pe.get_section(".knvest").unwrap();
+        let start = section.pointer_to_raw_data as usize;
+        let section_data = &pe.data[start..start + section.size_of_raw_data as usize];
+        let vmbc = section_data
+            .windows(4)
+            .position(|w| w == b"VMBC")
+            .expect("VMBC");
+        let stub = &section_data[..vmbc + 4];
+        let table_base = super::threaded::handler_table_base(stub);
+        for slot in 0..256usize {
+            let off = i32::from_le_bytes(
+                stub[table_base + slot * 4..table_base + slot * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert!(
+                off >= 1024,
+                "packed live slot {slot:#04x} off={off:#x} must be >= 1024"
+            );
+        }
+        assert!(packed.block_map_plan.entries.len() >= 2);
     }
 
     #[test]
