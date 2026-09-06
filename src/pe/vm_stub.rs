@@ -408,26 +408,41 @@ impl StubEmitter {
         self.jmp_rel32("module_fail");
     }
 
-    /// r8 = bb_id (dense 0..count-1); rsi = bytecode PC. Sets r15 → KNV6 entry on success path.
+    /// r8 = bb_id operand; rsi = bytecode PC. Sets r15 → matching KNV6 entry header.
     fn emit_block_map_resolve_r15(&mut self) {
         self.label("h_set_block_map_resolve");
         // movzx ecx, word [rip + knv6_count]
         self.emit(&[0x0F, 0xB7, 0x0D, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "knv6_count"));
-        // bb_id must be < entry count (entries are indexed by bb_id)
-        self.emit(&[0x44, 0x39, 0xC1]); // cmp ecx, r8d
-        self.jcc_rel32_short(0x76, "h_set_block_map_fail"); // jbe if count <= bb_id
-        self.lea_rip_rel32(0x4D, 7, "knv6_entries");
-        self.emit_mov_reg_reg(0, 8); // mov rax, r8
+        // lea r15, [rip + knv6_block_maps]; add r15, KNV6_HEADER_SIZE
+        self.lea_rip_rel32(0x4D, 7, "knv6_block_maps");
+        let header = KNV6_HEADER_SIZE as u32;
+        self.emit(&[
+            0x49,
+            0x81,
+            0xC7,
+            (header & 0xFF) as u8,
+            ((header >> 8) & 0xFF) as u8,
+            ((header >> 16) & 0xFF) as u8,
+            ((header >> 24) & 0xFF) as u8,
+        ]);
+        self.label("h_set_block_map_search");
+        // cmp word [r15], r8w — match entry.bb_id (REX.R+REX.B for r8 vs [r15])
+        self.emit(&[0x66, 0x4D, 0x39, 0x07]);
+        self.jcc_rel32_short(0x74, "h_set_block_map_found");
         let stride = KNV6_ENTRY_SIZE as u32;
         self.emit(&[
-            0x48, 0x69, 0xC0,
+            0x49,
+            0x81,
+            0xC7,
             (stride & 0xFF) as u8,
             ((stride >> 8) & 0xFF) as u8,
             ((stride >> 16) & 0xFF) as u8,
             ((stride >> 24) & 0xFF) as u8,
-        ]); // imul rax, KNV6_ENTRY_SIZE
-        self.emit(&[0x4C, 0x01, 0xC7]); // add r15, rax
+        ]); // add r15, KNV6_ENTRY_SIZE
+        self.emit(&[0xFF, 0xC9]); // dec ecx
+        self.jcc_rel32_short(0x75, "h_set_block_map_search");
+        self.jmp_rel32("h_set_block_map_fail");
     }
 
     fn emit_block_map_apply_and_dispatch(&mut self) {
@@ -1218,7 +1233,6 @@ impl StubEmitter {
         let knv6_pos = self.pos();
         self.emit(&block_map_plan.to_embedded_bytes());
         self.labels.insert("knv6_count", knv6_pos + 9);
-        self.labels.insert("knv6_entries", knv6_pos + KNV6_HEADER_SIZE);
         self.label("exit_wire_cmp_slot");
         self.emit(&[0x00]);
         while self.pos() % 16 != 0 {
@@ -1276,7 +1290,7 @@ impl StubEmitter {
 #[cfg(test)]
 mod tests {
     use super::create_vm_interpreter_stub;
-    use crate::vm::block_map::{KNV6_ENTRY_SIZE, KNV6_MAGIC};
+    use crate::vm::block_map::{KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, KNV6_MAGIC};
 
     /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
@@ -1611,12 +1625,12 @@ mod tests {
             "h_set_block_map must lea rax,[r15+0x1C] without touching bytecode rsi"
         );
         assert!(
-            body.windows(3).any(|w| w == [0x44, 0x39, 0xC1]),
-            "h_set_block_map must bounds-check bb_id against knv6_count (cmp ecx,r8d)"
+            body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must linear-search cmp [r15],r8w for entry.bb_id match"
         );
         assert!(
-            !body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
-            "h_set_block_map must not linear-search cmp [r15],r8w"
+            !body.windows(3).any(|w| w == [0x48, 0x69, 0xC0]),
+            "h_set_block_map must not imul-index KNV6 (dense index lands mid-blob on PE)"
         );
     }
 
@@ -1692,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn knv6_resolve_uses_direct_bb_id_index() {
+    fn knv6_resolve_searches_entry_bb_id_field() {
         let (stub, _, _, _) = create_vm_interpreter_stub(
             0,
             0,
@@ -1710,18 +1724,18 @@ mod tests {
             .expect("h_set_block_map");
         let body = &stub[set_map..set_map.saturating_add(160).min(stub.len())];
         assert!(
-            body.windows(3).any(|w| w == [0x48, 0x69, 0xC0]),
-            "h_set_block_map must imul rax,KNV6_ENTRY_SIZE instead of linear search"
+            body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
+            "h_set_block_map must cmp word [r15],r8w to locate KNV6 entry header"
         );
         assert!(
-            !body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
-            "h_set_block_map must not linear-search cmp [r15],r8w"
+            !body.windows(3).any(|w| w == [0x48, 0x69, 0xC0]),
+            "h_set_block_map must not imul-index KNV6 entries by bb_id operand"
         );
     }
 
     #[test]
     fn knv6_search_stride_matches_entry_size() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(
+        let (stub, _, knv6_offset, _) = create_vm_interpreter_stub(
             0,
             0,
             &crate::vm::OpcodeMap::from_seed(0),
@@ -1733,9 +1747,9 @@ mod tests {
         );
         let stride = KNV6_ENTRY_SIZE as u32;
         let expected = [
-            0x48,
-            0x69,
-            0xC0,
+            0x49,
+            0x81,
+            0xC7,
             (stride & 0xFF) as u8,
             ((stride >> 8) & 0xFF) as u8,
             ((stride >> 16) & 0xFF) as u8,
@@ -1743,7 +1757,32 @@ mod tests {
         ];
         assert!(
             stub.windows(expected.len()).any(|w| w == expected),
-            "h_set_block_map must imul rax,KNV6_ENTRY_SIZE ({KNV6_ENTRY_SIZE:#x}) for bb_id lookup"
+            "h_set_block_map search loop must add r15,KNV6_ENTRY_SIZE ({KNV6_ENTRY_SIZE:#x})"
+        );
+        let header = KNV6_HEADER_SIZE as u32;
+        let header_add = [
+            0x49,
+            0x81,
+            0xC7,
+            (header & 0xFF) as u8,
+            ((header >> 8) & 0xFF) as u8,
+            ((header >> 16) & 0xFF) as u8,
+            ((header >> 24) & 0xFF) as u8,
+        ];
+        assert!(
+            stub.windows(header_add.len()).any(|w| w == header_add),
+            "h_set_block_map must add r15,KNV6_HEADER_SIZE ({KNV6_HEADER_SIZE:#x}) after knv6_block_maps lea"
+        );
+        let lea_sig = [0x4Du8, 0x8D, 0x3D];
+        let lea_pos = stub
+            .windows(lea_sig.len())
+            .position(|w| w == lea_sig)
+            .expect("lea r15,[rip+knv6_block_maps]");
+        let target = resolve_lea_rip(&stub, lea_pos);
+        assert_eq!(
+            target,
+            knv6_offset,
+            "KNV6 resolve must lea r15 to knv6_block_maps label ({knv6_offset:#x})"
         );
     }
 
