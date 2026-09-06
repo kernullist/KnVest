@@ -1931,6 +1931,7 @@ mod tests {
             "prologue must store native frame ptr in .knvest native_frame_ptr"
         );
         assert_run_native_stub_uses_native_rsp(&stub);
+        assert_run_native_pre_sync_order(&stub);
         for sled in collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map) {
             assert_run_native_sled_straight_line(&sled);
         }
@@ -1955,7 +1956,42 @@ mod tests {
         let sync = packed.native_sync.clone();
         let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
-        // Handler contract: prologue stores native_frame_ptr; invoke loads r14 from [rip+slot].
+        // Handler contract: prologue caches native_frame_ptr; invoke lea r14 + mov rbp,r14 before sync.
+    }
+
+    fn assert_run_native_pre_sync_order(stub: &[u8]) {
+        let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
+        let run_site = stub
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .expect("h_run_native invoke prologue");
+        let bail_site = stub[run_site + 1..]
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .map(|p| run_site + 1 + p)
+            .expect("h_bail_native invoke prologue");
+        let run_body = &stub[run_site..bail_site];
+        let call_at = run_body
+            .windows(3)
+            .position(|w| w == [0x41, 0xFF, 0xD2])
+            .expect("call r10");
+        let before_call = &run_body[..call_at];
+        let sync_at = before_call
+            .windows(3)
+            .position(|w| w == [0x89, 0x45, 0xFC])
+            .expect("pre-sync mov [rbp-4], eax");
+        let prefix = &before_call[..sync_at];
+        let rbp_at = prefix
+            .windows(3)
+            .rposition(|w| w == [0x4C, 0x89, 0xF5])
+            .expect("mov rbp,r14 before first pre-sync store");
+        let between = &prefix[rbp_at + 3..];
+        assert!(
+            between.is_empty()
+                || between.starts_with(&[0x41, 0x8B, 0x47])
+                || between.starts_with(&[0x41, 0x8B, 0x87]),
+            "only r15 spill load may appear between mov rbp,r14 and first pre-sync store"
+        );
     }
 
     fn collect_run_native_sleds(
@@ -1993,19 +2029,23 @@ mod tests {
         let prefix = &stub[..call_at];
         assert!(
             prefix.windows(3).any(|w| w == [0x4C, 0x89, 0xF5]),
-            "run_native must mov rbp,r14 before sled call (native frame from [rip+native_frame_ptr])"
+            "run_native must mov rbp,r14 before sled call (direct lea r14 from native_stack_top)"
         );
         assert!(
             !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
             "run_native must not mov rbp,rcx (rcx may hold VM counter)"
         );
         assert!(
-            prefix.windows(3).any(|w| w == [0x4C, 0x8B, 0x35]),
-            "run_native must mov r14,[rip+native_frame_ptr] before native rbp switch"
+            prefix.windows(3).any(|w| w == [0x4C, 0x8D, 0x35]),
+            "run_native must lea r14,[rip+native_stack_top] before native rbp switch"
         );
         assert!(
-            !prefix.windows(7).any(|w| w == [0x4C, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]),
-            "run_native must not load native frame via spill-adjacent [rbp-0x110]"
+            !prefix.windows(3).any(|w| w == [0x4C, 0x8B, 0x35]),
+            "run_native must not indirect-load native frame in handler"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x49, 0x89, 0xE5]),
+            "run_native must not use r13 as VM spill base"
         );
         assert!(
             prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
