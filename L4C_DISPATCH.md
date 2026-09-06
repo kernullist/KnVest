@@ -28,6 +28,13 @@ KnVest L4c adds a pack-time selectable VM dispatch mode alongside the existing h
 
 Handlers are unchanged; only the dispatch prologue and bytecode layout differ. Logical IR is identical when disassembled with the correct mode (rel32 slots are skipped).
 
+**Pack-time relocation:** `embed_thread_targets` inserts a 4-byte handler `rel32` after each opcode wire byte and **relocates** operands that encode bytecode positions:
+
+- `jmp` / `call` / `jmp_if` targets (instruction-start offsets)
+- `load_imm` / `load_str` embedded string offsets (16-byte-aligned positions at or past the code section)
+
+Without this fixup, threaded `hello` and other control-flow samples jump into rel32 slots and fault or exit early.
+
 ## Metadata
 
 - KNV4 header **version 2** adds a dispatch wire byte after the version field.
