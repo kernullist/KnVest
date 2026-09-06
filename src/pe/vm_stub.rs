@@ -15,9 +15,10 @@ use std::collections::HashMap;
 //   GPA            [rbp-0xC0]  bytes 40 FF FF FF
 //   call depth     [rbp-0xC8]  bytes 38 FF FF FF
 //   bytes written  [rbp-0xD0]  bytes 30 FF FF FF  (WriteFile out; do not clobber)
+//   current bb_id  [rbp-0x120] bytes E0 FF FF FF  (L4e table mode; restored on ret)
 //   push depth     [rbp-0xE8]  bytes 18 FF FF FF
 //   char buf       [rbp-0xF0]  bytes 10 FF FF FF  (nc2/nc3 digit buffer; do not clobber)
-//   ret addrs      [rbp + depth*8 - 0x200]       (depth 3 → -0x1E8; must not use for scratch)
+//   ret addrs      [rbp + depth*8 - 0x200]       (lo32=bytecode index, hi32=caller bb_id)
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
 //   VM frame save  [rbp-0x118]                  (run_native re-anchors VM base from here)
@@ -178,9 +179,10 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0xE5]);
         self.emit(&[0x48, 0x81, 0xEC, 0x20, 0x05, 0x00, 0x00]); // sub rsp, 0x520 (frame incl. nc_iat scratch)
         self.emit(&[0x48, 0x83, 0xE4, 0xF0]);
-        // Zero L2 call depth [rbp-0xC8] and push depth [rbp-0xE8]
+        // Zero L2 call depth [rbp-0xC8], push depth [rbp-0xE8], and L4e current bb_id [rbp-0x120]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
+        self.emit(&[0x66, 0xC7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x00, 0x00]); // mov word [rbp-0x120], 0
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x8B, 0x40, 0x18]);
         self.emit(&[0x4C, 0x8D, 0x58, 0x10]);
@@ -404,6 +406,8 @@ impl StubEmitter {
         // Reject spurious [r15] matches: handler_table image must start with dword >= 1024.
         self.emit(&[0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]); // cmp dword [r15+0x1C], 1024
         self.jcc_rel32_short(0x72, "h_set_block_map_search");
+        // mov [rbp-0x120], r8w — track active bb for table-mode ret restore
+        self.emit(&[0x66, 0x44, 0x89, 0x45, 0xE0]);
         // mov al, [r15+6] exit_wire
         self.emit(&[0x41, 0x8A, 0x47, 0x06]);
         // mov [rip+exit_wire_cmp_slot], al
@@ -810,10 +814,15 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x29, 0xCE]);
         self.emit(&[0x48, 0x8B, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x89, 0xB4, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]);
+        self.emit_mov_reg_reg(11, 0); // mov r11, rax — preserve callee target offset
+        self.emit(&[0x66, 0x0F, 0xB7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // movzx eax, word [rbp-0x120]
+        self.emit(&[0x48, 0xC1, 0xE0, 0x20]); // shl rax, 32
+        self.emit(&[0x48, 0x09, 0xF0]); // or rax, rsi — lo32 = return index
+        self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]); // mov [rbp+rdx*8-0x200], rax
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
         self.lea_rip_rel32(0x48, 6, "bytecode");
+        self.emit_mov_reg_reg(0, 11); // mov rax, r11
         self.emit(&[0x48, 0x01, 0xF0]);
         self.emit(&[0x48, 0x89, 0xC6]);
         self.jmp_to_dispatch();
@@ -821,14 +830,20 @@ impl StubEmitter {
 
     fn emit_handler_ret(&mut self) {
         self.label("h_ret");
-        self.emit(&[0x48, 0x8B, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0xFF, 0xC8]);
-        self.emit(&[0x48, 0x89, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x8B, 0x84, 0xC5, 0x00, 0xFE, 0xFF, 0xFF]);
-        self.lea_rip_rel32(0x48, 6, "bytecode");
-        self.emit(&[0x48, 0x01, 0xF0]);
-        self.emit(&[0x48, 0x89, 0xC6]);
-        self.jmp_to_dispatch();
+        self.emit(&[0x48, 0x8B, 0x85, 0x38, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0xC8] call depth
+        self.emit(&[0x48, 0xFF, 0xC8]); // dec rax
+        self.emit(&[0x48, 0x89, 0x85, 0x38, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xC8], rax
+        self.emit(&[0x48, 0x89, 0xC2]); // mov rdx, rax — ret frame index
+        self.emit(&[0x48, 0x8B, 0x84, 0xC5, 0x00, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp+rdx*8-0x200]
+        self.emit(&[0x48, 0x89, 0xC3]); // mov rbx, rax — packed ret words
+        self.emit(&[0x48, 0xC1, 0xE8, 0x20]); // shr rax, 32
+        self.emit(&[0x44, 0x0F, 0xB7, 0xC0]); // movzx r8d, eax — caller bb_id
+        self.emit(&[0x48, 0x89, 0xD8]); // mov rax, rbx
+        self.emit(&[0x48, 0x25, 0xFF, 0xFF, 0xFF, 0xFF]); // and eax, 0xFFFFFFFF — return index
+        self.lea_rip_rel32(0x48, 6, "bytecode"); // lea rsi, [bytecode]
+        self.emit(&[0x48, 0x01, 0xF0]); // add rax, rsi — return bytecode pointer
+        self.emit(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+        self.jmp_rel32("h_set_block_map_search");
     }
 
     fn emit_handler_native_call(&mut self) {
@@ -1344,6 +1359,109 @@ mod tests {
         assert!(
             !stub.windows(WRONG.len()).any(|w| w == WRONG),
             "h_set_block_map must not emit 45 0f b7 06 (REX.B turns [rsi] into [r14])"
+        );
+    }
+
+    #[test]
+    fn set_block_map_records_current_bb_id_in_frame() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+        let set_map = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        let body = &stub[set_map..set_map.saturating_add(96).min(stub.len())];
+        assert!(
+            body.windows(4).any(|w| w == [0x66, 0x44, 0x89, 0x45]),
+            "h_set_block_map must persist bb_id to [rbp-0x120] after match"
+        );
+    }
+
+    #[test]
+    fn h_call_saves_caller_bb_id_for_table_ret_restore() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let save_bb = [
+            0x66u8, 0x0F, 0xB7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, // movzx eax, [rbp-0x120]
+            0x48, 0xC1, 0xE0, 0x20, // shl rax, 32
+            0x48, 0x09, 0xF0, // or rax, rsi
+            0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF, // mov [rbp+rdx*8-0x200], rax
+        ];
+        assert!(
+            stub.windows(save_bb.len()).any(|w| w == save_bb),
+            "h_call must pack caller bb_id into hi32 of ret stack slot"
+        );
+    }
+
+    #[test]
+    fn h_ret_restores_block_map_via_knv6_search() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let ret_restore = [
+            0x48u8, 0xC1, 0xE8, 0x20, // shr rax, 32
+            0x44, 0x0F, 0xB7, 0xC0, // movzx r8d, eax
+        ];
+        assert!(
+            stub.windows(ret_restore.len()).any(|w| w == ret_restore),
+            "h_ret must reload caller bb_id from ret stack"
+        );
+        let search = [0x66u8, 0x4D, 0x39, 0x07]; // cmp word [r15], r8w
+        let ret_pos = stub
+            .windows(ret_restore.len())
+            .position(|w| w == ret_restore)
+            .expect("ret restore prologue");
+        let after = &stub[ret_pos..ret_pos.saturating_add(48).min(stub.len())];
+        assert!(
+            after.contains(&0xE9),
+            "h_ret must jmp to h_set_block_map_search after rebuilding return rsi"
+        );
+        assert!(
+            stub.windows(search.len()).any(|w| w == search),
+            "h_set_block_map search loop must remain available for h_ret refresh"
+        );
+    }
+
+    #[test]
+    fn prologue_inits_current_bb_id_slot() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        assert!(
+            stub.windows(9)
+                .any(|w| w == [0x66, 0xC7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x00, 0x00]),
+            "prologue must zero current bb_id at [rbp-0x120]"
         );
     }
 
