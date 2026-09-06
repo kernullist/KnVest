@@ -14,8 +14,9 @@ pub fn pack_executable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     output: Q,
     rva: Option<u32>,
     seed: Option<u64>,
+    partial: bool,
 ) -> anyhow::Result<OpcodeMap> {
-    pack::pack_executable(input, output, rva, seed)
+    pack::pack_executable(input, output, rva, seed, partial)
 }
 
 pub fn extract_opcode_map(pe: &PEFile) -> Result<OpcodeMap, pe::PEError> {

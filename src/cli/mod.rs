@@ -29,6 +29,11 @@ pub enum Commands {
         rva: Option<String>,
         #[arg(long, help = "Opcode shuffle seed (u64); random per pack if omitted")]
         seed: Option<String>,
+        #[arg(
+            long,
+            help = "Enable L4d partial BB virtualization (default: full VM lift like L4b)"
+        )]
+        partial: bool,
     },
 }
 

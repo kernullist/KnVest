@@ -399,23 +399,26 @@ impl StubEmitter {
         self.emit_native_sled_invoke();
     }
 
-    /// L4d: read sled offset + orig rva, sync VM regs, call native sled, resume dispatch.
+    /// L4d: read sled offset + orig rva, run sled on an isolated native stack, sync rax→r0.
     fn emit_native_sled_invoke(&mut self) {
         self.emit(&[0x48, 0x8B, 0x06]); // mov rax, [rsi] sled offset
         self.emit(&[0x48, 0x83, 0xC6, 0x08]); // add rsi, 8 (skip orig rva)
-        self.emit(&[0x48, 0x89, 0x85, 0x68, 0xFF, 0xFF, 0xFF]); // save rsi
+        self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
+        self.emit(&[0x49, 0x89, 0xE4]); // mov r12, rsp
+        self.emit(&[0x49, 0x89, 0xED]); // mov r13, rbp — VM frame base (Win64 callee-saved)
+        self.lea_rip_rel32(0x48, 4, "native_stack_top"); // lea rsp, [native_stack_top]
+        self.emit(&[0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]); // sub rsp, 0x100
+        self.emit(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
+        self.emit(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
         self.lea_rip_rel32(0x4C, 2, "native_sleds"); // lea r10, [native_sleds]
         self.emit(&[0x49, 0x01, 0xC2]); // add r10, rax
-        // sync VM r0..r3 into rcx, rdx, r8, r9 for native snippets
-        self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80]
-        self.emit(&[0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // mov edx, [rbp-0x78]
-        self.emit(&[0x44, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // mov r8d, [rbp-0x70]
-        self.emit(&[0x44, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // mov r9d, [rbp-0x68]
-        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // shadow space
+        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow
         self.emit(&[0x41, 0xFF, 0xD2]); // call r10
-        self.emit(&[0x48, 0x83, 0xC4, 0x28]);
-        self.emit(&[0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x80], rax
-        self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // restore rsi
+        self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+        self.emit(&[0x49, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [r13-0x80], rax
+        self.emit(&[0x49, 0x89, 0xED]); // mov rbp, r13
+        self.emit(&[0x49, 0x89, 0xE4]); // mov rsp, r12
+        self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov rsi, [rbp-0x98]
         self.jmp_to_dispatch();
     }
 
@@ -757,7 +760,7 @@ impl StubEmitter {
             .handler_table_start
             .expect("handler table placeholder missing");
         let handlers = self.opcode_map.handler_table_entries();
-        let default_off = self.handler_offset("h_bail_native", table_base);
+        let default_off = self.handler_offset("h_nop", table_base);
         for i in 0..256usize {
             let op = i as u8;
             let off = handlers
@@ -803,6 +806,11 @@ impl StubEmitter {
         while self.pos() % 16 != 0 {
             self.emit(&[0xCC]);
         }
+        self.label("native_stack");
+        for _ in 0..0x200 {
+            self.emit(&[0x00]);
+        }
+        self.label("native_stack_top");
         self.emit(b"VMBC");
         self.label("bytecode");
     }

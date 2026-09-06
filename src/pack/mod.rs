@@ -8,11 +8,12 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
     output_path: Q,
     function_rva: Option<u32>,
     seed: Option<u64>,
+    partial: bool,
 ) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
 
-    let pack_result = packer::pack_function(&mut pe, function_rva, seed)
+    let pack_result = packer::pack_function(&mut pe, function_rva, seed, partial)
         .context("Failed to pack function")?;
 
     eprintln!(

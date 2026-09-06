@@ -48,11 +48,13 @@ impl NativeSledBuilder {
         pe: &PEFile,
         instrs: &[X64Instruction],
         bb: &BasicBlock,
+        sync_slots: &[(i32, u8)],
     ) -> PEResult<(usize, u32)> {
         let mut copy = Vec::new();
         for idx in bb.leader_idx..=bb.tail_idx {
             copy.extend_from_slice(&instrs[idx].bytes);
         }
+        append_rbp_sync_tail(&mut copy, sync_slots);
         copy.push(0xC3);
         let source_rva = pe.file_offset_to_rva(instrs[bb.leader_idx].offset)?;
         let index = self.sleds.len();
@@ -98,6 +100,7 @@ impl PartialVirtPlan {
         blocks: &[BasicBlock],
         main_start: usize,
         pe: &PEFile,
+        partial_enabled: bool,
     ) -> PEResult<Self> {
         let decode_key = (splitmix64(seed ^ KEY_SALT) >> 32) as u32;
         let main_blocks: Vec<&BasicBlock> = blocks
@@ -105,11 +108,23 @@ impl PartialVirtPlan {
             .filter(|b| b.start >= main_start)
             .collect();
 
-        if main_blocks.is_empty() {
+        if main_blocks.is_empty() || !partial_enabled {
+            let mut infos = Vec::new();
+            for bb in &main_blocks {
+                let start_rva = pe.file_offset_to_rva(bb.start)?;
+                let end_rva = pe.file_offset_to_rva(bb.end.saturating_sub(1))?;
+                infos.push(PartialBlockInfo {
+                    id: bb.id,
+                    start_rva,
+                    end_rva,
+                    virtualized: true,
+                });
+            }
+            let vm_bb_ids: HashSet<usize> = main_blocks.iter().map(|b| b.id).collect();
             return Ok(Self {
                 decode_key,
-                blocks: Vec::new(),
-                vm_bb_ids: HashSet::new(),
+                blocks: infos,
+                vm_bb_ids,
                 full_virt: true,
             });
         }
@@ -287,6 +302,29 @@ pub fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// After native BB bytes, copy rbp locals into VM spill slots via r13 (interpreter frame).
+fn append_rbp_sync_tail(out: &mut Vec<u8>, sync_slots: &[(i32, u8)]) {
+    for &(rbp_disp, spill_reg) in sync_slots {
+        emit_mov_rax_from_rbp_disp(out, rbp_disp);
+        emit_mov_r13_vm_slot(out, spill_reg);
+    }
+}
+
+fn emit_mov_rax_from_rbp_disp(out: &mut Vec<u8>, disp: i32) {
+    if (-128..=127).contains(&disp) {
+        out.extend_from_slice(&[0x48, 0x8B, 0x45, disp as u8]);
+    } else {
+        out.extend_from_slice(&[0x48, 0x8B, 0x85]);
+        out.extend_from_slice(&disp.to_le_bytes());
+    }
+}
+
+fn emit_mov_r13_vm_slot(out: &mut Vec<u8>, spill_reg: u8) {
+    let disp = (spill_reg as i32) * 8 - 0x80;
+    out.extend_from_slice(&[0x49, 0x89, 0x85]);
+    out.extend_from_slice(&disp.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +343,7 @@ mod tests {
         let blocks = build_basic_blocks(&instrs, main_off);
         assert!(blocks.len() >= 2, "expected multiple BBs, got {}", blocks.len());
 
-        let plan = PartialVirtPlan::from_seed(0x14D_2026, &blocks, main_off, &pe).unwrap();
+        let plan = PartialVirtPlan::from_seed(0x14D_2026, &blocks, main_off, &pe, true).unwrap();
         assert!(!plan.full_virt);
         assert!(plan.blocks.iter().any(|b| b.virtualized));
         assert!(plan.blocks.iter().any(|b| !b.virtualized));
@@ -326,8 +364,8 @@ mod tests {
         let main_off = text_start + 0x20;
         let instrs = disassemble_main_window(&pe.data, main_off, text_end);
         let blocks = build_basic_blocks(&instrs, main_off);
-        let a = PartialVirtPlan::from_seed(1, &blocks, main_off, &pe).unwrap();
-        let b = PartialVirtPlan::from_seed(2, &blocks, main_off, &pe).unwrap();
+        let a = PartialVirtPlan::from_seed(1, &blocks, main_off, &pe, true).unwrap();
+        let b = PartialVirtPlan::from_seed(2, &blocks, main_off, &pe, true).unwrap();
         assert!(
             a.decode_key != b.decode_key
                 || a.vm_bb_ids != b.vm_bb_ids

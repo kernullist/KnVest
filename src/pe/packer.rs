@@ -17,7 +17,12 @@ pub struct PackResult {
     pub native_sleds: Vec<u8>,
 }
 
-pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u64>) -> PEResult<PackResult> {
+pub fn pack_function(
+    pe: &mut PEFile,
+    function_rva: Option<u32>,
+    seed: Option<u64>,
+    partial_enabled: bool,
+) -> PEResult<PackResult> {
     let explicit_rva = function_rva.is_some();
     let target_rva = if let Some(rva) = function_rva {
         rva
@@ -36,6 +41,7 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u6
         explicit_rva,
         &opcode_map,
         pack_seed,
+        partial_enabled,
     )?;
 
     add_vm_section(
@@ -402,6 +408,7 @@ fn translate_to_vm_bytecode(
     explicit_rva: bool,
     opcode_map: &OpcodeMap,
     pack_seed: u64,
+    partial_enabled: bool,
 ) -> PEResult<TranslateResult> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
@@ -447,7 +454,13 @@ fn translate_to_vm_bytecode(
     let string_literal = find_string_literal_in_pe(pe);
 
     let main_blocks = build_basic_blocks(&all_instrs, file_offset);
-    let partial_plan = PartialVirtPlan::from_seed(pack_seed, &main_blocks, file_offset, pe)?;
+    let partial_plan = PartialVirtPlan::from_seed(
+        pack_seed,
+        &main_blocks,
+        file_offset,
+        pe,
+        partial_enabled,
+    )?;
     let mut sled_builder = NativeSledBuilder::new();
 
     set_active_map(opcode_map);
@@ -769,11 +782,15 @@ mod tests {
     const TEST_SEED: u64 = 0x4C344100;
 
     fn pack_pe(pe: &mut PEFile, rva: Option<u32>) -> PackResult {
-        pack_function(pe, rva, Some(TEST_SEED)).unwrap()
+        pack_function(pe, rva, Some(TEST_SEED), false).unwrap()
     }
 
     fn pack_pe_seed(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
-        pack_function(pe, rva, Some(seed)).unwrap()
+        pack_function(pe, rva, Some(seed), false).unwrap()
+    }
+
+    fn pack_pe_partial(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
+        pack_function(pe, rva, Some(seed), true).unwrap()
     }
 
     /// MinGW gcc 16 educational samples: user `main` at `.text+offset` (see sample/README).
@@ -1844,6 +1861,22 @@ mod tests {
     }
 
     #[test]
+    fn test_default_pack_full_virt_no_run_native() {
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_pe(&mut pe, None);
+        assert!(
+            packed.partial_plan.full_virt,
+            "default pack must stay full VM (L4b-compatible)"
+        );
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        assert!(
+            !packed.bytecode.contains(&run_wire),
+            "default pack must not emit run_native"
+        );
+    }
+
+    #[test]
     fn test_l4d_partial_virt_emits_run_native_for_native_bb() {
         use crate::ir::Instruction;
         use crate::vm::OpCode;
@@ -1852,7 +1885,7 @@ mod tests {
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
         let text = pe.get_section(".text").unwrap();
         let main_rva = text.virtual_address + 0x20;
-        let packed = pack_pe_seed(&mut pe, Some(main_rva), 0x14D0_2026);
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), 0x14D0_2026);
         assert!(
             !packed.partial_plan.full_virt,
             "countdown loop fixture should use partial virt"
@@ -1899,7 +1932,7 @@ mod tests {
             },
         );
         let blocks = build_basic_blocks(&instrs, main_off);
-        let plan = PartialVirtPlan::from_seed(0xBA11_0001, &blocks, main_off, &pe).unwrap();
+        let plan = PartialVirtPlan::from_seed(0xBA11_0001, &blocks, main_off, &pe, true).unwrap();
         let map = OpcodeMap::from_seed(0xBA11_0001);
         let mut sled = NativeSledBuilder::new();
         set_active_map(&map);

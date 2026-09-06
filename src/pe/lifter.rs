@@ -1618,6 +1618,95 @@ fn bb_for_offset(blocks: &[BasicBlock], offset: usize) -> Option<&BasicBlock> {
         .find(|b| offset >= b.start && offset < b.end)
 }
 
+fn bb_can_run_native(instrs: &[X64Instruction], bb: &BasicBlock) -> bool {
+    for idx in bb.leader_idx..=bb.tail_idx {
+        match &instrs[idx].kind {
+            X64InstrKind::Call { .. } | X64InstrKind::CallIndRip { .. } => return false,
+            X64InstrKind::Jmp { .. }
+            | X64InstrKind::Je { .. }
+            | X64InstrKind::Jne { .. }
+            | X64InstrKind::Jl { .. }
+            | X64InstrKind::Jle { .. }
+            | X64InstrKind::Jg { .. }
+            | X64InstrKind::Jge { .. } => return false,
+            X64InstrKind::MovRegImm { reg, .. } if arg_reg_touched(*reg) => return false,
+            X64InstrKind::MovRegReg { dst, .. } if arg_reg_touched(*dst) => return false,
+            X64InstrKind::Lea { dst, .. }
+            | X64InstrKind::LeaRegReg { dst, .. }
+            | X64InstrKind::LeaRipRel { dst, .. } if arg_reg_touched(*dst) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn arg_reg_touched(reg: X64Reg) -> bool {
+    matches!(
+        reg,
+        X64Reg::Rcx
+            | X64Reg::Ecx
+            | X64Reg::Rdx
+            | X64Reg::Edx
+            | X64Reg::R8
+            | X64Reg::R9
+            | X64Reg::Rax
+            | X64Reg::Eax
+    )
+}
+
+fn prebuild_stack_map(instrs: &[X64Instruction]) -> std::collections::HashMap<i32, u8> {
+    let mut stack_map = std::collections::HashMap::new();
+    let mut next_stack_reg = VM_STACK_SPILL_REG_FIRST;
+    for instr in instrs {
+        let rbp_off = match &instr.kind {
+            X64InstrKind::MovMemImm { base, offset, .. }
+            | X64InstrKind::MovMemReg { base, offset, .. }
+            | X64InstrKind::MovRegMem { base, offset, .. }
+            | X64InstrKind::SubMemImm { base, offset, .. }
+            | X64InstrKind::AddMemImm { base, offset, .. }
+            | X64InstrKind::CmpMemImm { base, offset, .. }
+                if *base == X64Reg::Rbp || *base == X64Reg::Ebp =>
+            {
+                Some(*offset)
+            }
+            _ => None,
+        };
+        if let Some(off) = rbp_off {
+            stack_map.entry(off).or_insert_with(|| {
+                alloc_stack_spill_reg(&mut next_stack_reg)
+            });
+        }
+    }
+    stack_map
+}
+
+fn bb_rbp_sync_slots(
+    instrs: &[X64Instruction],
+    bb: &BasicBlock,
+    stack_map: &std::collections::HashMap<i32, u8>,
+) -> Vec<(i32, u8)> {
+    let mut slots = Vec::new();
+    for idx in bb.leader_idx..=bb.tail_idx {
+        let offset = match &instrs[idx].kind {
+            X64InstrKind::MovMemImm { base, offset, .. }
+            | X64InstrKind::MovMemReg { base, offset, .. }
+                if *base == X64Reg::Rbp || *base == X64Reg::Ebp =>
+            {
+                Some(*offset)
+            }
+            _ => None,
+        };
+        if let Some(off) = offset {
+            if let Some(&spill) = stack_map.get(&off) {
+                if !slots.iter().any(|(o, _)| *o == off) {
+                    slots.push((off, spill));
+                }
+            }
+        }
+    }
+    slots
+}
+
 fn lift_to_vm_bytecode_internal(
     instrs: &[X64Instruction],
     _base_rva: u32,
@@ -2025,6 +2114,7 @@ fn lift_to_vm_bytecode_internal_with_main(
 
     let main_blocks = build_basic_blocks(instrs, main_x64_offset);
     let use_partial = partial.map_or(false, |p| !p.full_virt);
+    let stack_map_pre = prebuild_stack_map(instrs);
     let mut skip_until_offset: Option<usize> = None;
     let mut emitted_native_bb: HashSet<usize> = HashSet::new();
 
@@ -2048,10 +2138,11 @@ fn lift_to_vm_bytecode_internal_with_main(
                 skip_until_offset = None;
             }
             if let (Some(plan), Some(bb)) = (partial, bb_for_offset(&main_blocks, instr.offset)) {
-                if !plan.is_vm_bb(bb.id) {
+                if !plan.is_vm_bb(bb.id) && bb_can_run_native(instrs, bb) {
                     if !emitted_native_bb.contains(&bb.id) {
+                        let sync = bb_rbp_sync_slots(instrs, bb, &stack_map_pre);
                         if let Ok((sled_idx, orig_rva)) =
-                            sled_builder.add_range_sled(pe, instrs, bb)
+                            sled_builder.add_range_sled(pe, instrs, bb, &sync)
                         {
                             let sled_off = sled_builder.sled_offset(sled_idx);
                             let vm_pc = bytecode.len();

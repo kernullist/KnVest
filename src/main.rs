@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         Commands::Ir { input } => {
             handle_ir_command(input)?;
         }
-        Commands::Pack { input, output, rva, seed } => {
+        Commands::Pack { input, output, rva, seed, partial } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
                 Some(u32::from_str_radix(rva_str, 16)?)
@@ -27,7 +27,7 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            handle_pack_command(input, output, rva_value, seed_value)?;
+            handle_pack_command(input, output, rva_value, seed_value, partial)?;
         }
     }
 
@@ -67,8 +67,9 @@ fn handle_pack_command(
     output: std::path::PathBuf,
     rva: Option<u32>,
     seed: Option<u64>,
+    partial: bool,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed)?;
+    pack::pack_executable(&input, &output, rva, seed, partial)?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }
