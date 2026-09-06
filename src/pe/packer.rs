@@ -909,7 +909,7 @@ pub(crate) fn patch_knv6_in_stub(
     validate_knv6_embedded_handler_tables(stub, knv6_offset, block_map_plan);
 }
 
-/// Runtime `h_set_block_map` copies `[r15+0x1C]` from each KNV6 entry — verify PE blob is populated.
+/// Runtime `h_set_block_map` points `active_redirect_ptr` at `[r15+0x1C]` — verify PE blob is populated.
 pub(crate) fn validate_knv6_embedded_handler_tables(
     stub: &[u8],
     knv6_offset: usize,
@@ -2636,6 +2636,57 @@ mod tests {
         assert!(
             insns.iter().any(|i| i.opcode == OpCode::SetBlockMap),
             "IR disassembly must surface set_block_map refresh ops"
+        );
+    }
+
+    #[test]
+    fn test_l4e_hello_bb2_call_wire_resolves_via_knv6_redirect_ptr() {
+        use crate::pe::threaded::handler_table_base;
+        use crate::vm::block_map::{KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+
+        let seed = 0xAAAA_AAAA_u64;
+        let pe_path = std::path::Path::new("sample/hello.exe");
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let packed = pack_function(&mut pe, None, Some(seed), false, DispatchMode::Table).unwrap();
+        let section = pe.get_section(".knvest").unwrap();
+        let start = section.pointer_to_raw_data as usize;
+        let section_data = &pe.data[start..start + section.size_of_raw_data as usize];
+        let vmbc = section_data
+            .windows(4)
+            .position(|w| w == b"VMBC")
+            .expect("VMBC marker");
+        let stub = &section_data[..vmbc + 4];
+        let table_base = handler_table_base(stub);
+        let knv6 = stub
+            .windows(crate::vm::block_map::KNV6_MAGIC.len())
+            .position(|w| w == crate::vm::block_map::KNV6_MAGIC)
+            .expect("KNV6 blob");
+        let bb2_entry = knv6 + KNV6_HEADER_SIZE + 2 * KNV6_ENTRY_SIZE;
+        let bb2_redirect = bb2_entry + 0x1C;
+        let call_wire = packed.block_map_plan.entries[2]
+            .wire[crate::vm::opcode_map::CANONICAL_OPCODES
+                .iter()
+                .position(|&o| o == OpCode::Call)
+                .unwrap()];
+        let call_off = i32::from_le_bytes(
+            stub[bb2_redirect + (call_wire as usize) * 4..bb2_redirect + (call_wire as usize) * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(
+            call_off, packed.block_map_plan.entries[0].handler_table[(call_wire as usize) * 4..][..4]
+                .try_into()
+                .map(i32::from_le_bytes)
+                .unwrap_or(0),
+            "BB2 call slot must differ from BB0 nop-default when wires match"
+        );
+        let target = table_base as i64 + call_off as i64;
+        assert_eq!(stub[target as usize], 0x48);
+        assert_eq!(stub[target as usize + 1], 0x8B);
+        assert_eq!(stub[target as usize + 2], 0x06);
+        assert!(
+            packed.bytecode.windows(3).any(|w| w == [META_WIRE_BYTE, 0x02, 0x00]),
+            "hello must emit set_block_map | 2 before cross-BB call"
         );
     }
 

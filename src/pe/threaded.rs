@@ -188,23 +188,38 @@ pub fn handler_offset_for_set_block_map(stub: &[u8]) -> i32 {
 }
 
 pub fn handler_table_base(stub: &[u8]) -> usize {
-    let table_indexed = [0x48u8, 0x63, 0x04, 0x83]; // movsxd rax, [rbx+rax*4]
-    let dispatch_lea = [0x48u8, 0x8D, 0x1D];
+    // L4e table: lea r10,[handler_table]; mov rbx,[active_redirect_ptr]; movsxd rax,[rbx+rax*4]
+    for i in 0..stub.len().saturating_sub(18) {
+        if stub[i..i + 3] == [0x4Cu8, 0x8D, 0x15]
+            && stub[i + 7..i + 10] == [0x48, 0x8B, 0x1D]
+            && stub[i + 14..i + 18] == [0x48, 0x63, 0x04, 0x83]
+        {
+            let disp = i32::from_le_bytes(stub[i + 3..i + 7].try_into().unwrap());
+            return ((i + 7) as isize + disp as isize) as usize;
+        }
+    }
+    // L4c threaded: movsxd rax,[rsi+1]; lea rbx,[handler_table]; add rax,rbx
+    for i in 0..stub.len().saturating_sub(16) {
+        if stub[i..i + 4] == [0x48, 0x63, 0x46, 0x01] {
+            for j in i + 4..i.saturating_add(24).min(stub.len().saturating_sub(7)) {
+                if stub[j..j + 3] == [0x48, 0x8D, 0x1D] {
+                    let disp = i32::from_le_bytes(stub[j + 3..j + 7].try_into().unwrap());
+                    return ((j + 7) as isize + disp as isize) as usize;
+                }
+            }
+        }
+    }
+    // Legacy table: lea rbx,[handler_table] immediately before movsxd rax,[rbx+rax*4]
+    let table_indexed = [0x48u8, 0x63, 0x04, 0x83];
     if let Some(idx) = stub.windows(table_indexed.len()).position(|w| w == table_indexed) {
         for i in (idx.saturating_sub(32)..idx).rev() {
-            if stub[i..i + 3] == dispatch_lea {
+            if stub[i..i + 3] == [0x48, 0x8D, 0x1D] {
                 let disp = i32::from_le_bytes(stub[i + 3..i + 7].try_into().unwrap());
                 return ((i + 7) as isize + disp as isize) as usize;
             }
         }
     }
-    for i in 0..stub.len().saturating_sub(7) {
-        if stub[i..i + 3] == dispatch_lea {
-            let disp = i32::from_le_bytes(stub[i + 3..i + 7].try_into().unwrap());
-            return ((i + 7) as isize + disp as isize) as usize;
-        }
-    }
-    panic!("dispatch lea rbx,[handler_table] not found");
+    panic!("dispatch lea handler_table not found");
 }
 
 fn bytecode_starts_with_at(bytecode: &[u8], off: usize, needle: &[u8]) -> bool {

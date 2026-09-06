@@ -390,7 +390,7 @@ pub fn validate_handler_table_targets(
     Ok(())
 }
 
-/// Apply one KNV6 entry's redirect table to the stub image (same as `h_set_block_map` copy).
+/// Apply one KNV6 entry's redirect table to the stub image (pack-time BB0 pre-install).
 pub fn install_handler_table_in_stub(
     stub: &mut [u8],
     table_base: usize,

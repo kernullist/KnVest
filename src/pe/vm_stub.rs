@@ -136,10 +136,20 @@ impl StubEmitter {
         self.lea_rip.push((self.pos() - 4, target));
     }
 
-    /// `lea rbx, [rip+handler_table]` — must match table/threaded dispatch exactly.
+    /// `lea rbx, [rip+handler_table]` — threaded dispatch and legacy table tests.
     fn emit_lea_handler_table_rbx(&mut self) {
         self.emit(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "handler_table"));
+    }
+
+    /// `lea r10, [rip+handler_table]` — table dispatch add base (redirect dwords live elsewhere).
+    fn emit_lea_handler_table_r10(&mut self) {
+        self.lea_rip_rel32(0x4C, 2, "handler_table");
+    }
+
+    fn emit_init_active_redirect_ptr_to_handler_table(&mut self) {
+        self.emit_lea_handler_table_rbx();
+        self.emit_mov_qword_to_rip_label(0, "active_redirect_ptr");
     }
 
     /// Emit `mov dst, src` (Intel syntax, 64-bit reg-reg via opcode 89 /r).
@@ -292,6 +302,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x85, 0x60, 0xFF, 0xFF, 0xFF]);
 
         self.emit_init_native_frame_ptr();
+        if self.dispatch_mode == DispatchMode::Table {
+            self.emit_init_active_redirect_ptr_to_handler_table();
+        }
         self.lea_rip_rel32(0x48, 6, "bytecode");
         self.emit(&[0x48, 0x89, 0xF6]);
         self.jmp_rel32("dispatch");
@@ -316,9 +329,11 @@ impl StubEmitter {
         self.exit_cmp_patch_pos = Some(self.pos() - 4);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
         self.jcc_rel32(0x84, "h_exit");
-        self.emit_lea_handler_table_rbx();
-        self.emit(&[0x48, 0x63, 0x04, 0x83]);
-        self.emit(&[0x48, 0x01, 0xD8]);
+        // Redirect dwords come from active KNV6 entry (or BB0 handler_table at prologue).
+        self.emit_lea_handler_table_r10();
+        self.emit_mov_qword_from_rip_label(3, "active_redirect_ptr");
+        self.emit(&[0x48, 0x63, 0x04, 0x83]); // movsxd rax, [rbx+rax*4]
+        self.emit(&[0x4C, 0x01, 0xD0]); // add rax, r10
         self.emit(&[0xFF, 0xE0]);
     }
 
@@ -421,22 +436,9 @@ impl StubEmitter {
         // mov [rip+exit_wire_cmp_slot], al
         self.emit(&[0x88, 0x05, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
-        // push rsi — bytecode PC must survive handler-table copy
-        self.emit(&[0x56]);
-        // lea r12, [r15+28] KNV6 handler-table source (rsi is rep movsq source after mov below)
-        self.emit(&[0x4D, 0x8D, 0x67, 0x1C]);
-        // lea rbx,[handler_table]; mov rdi,rbx — same base register path as dispatch
-        self.emit_lea_handler_table_rbx();
-        self.emit_mov_reg_reg(7, 3);
-        // cld — rep movsq must run forward (DF=0)
-        self.emit(&[0xFC]);
-        // mov rsi, r12 — rep movsq source (REX.R for r12); 49 89 E6 wrongly encodes mov r14,rsp
-        self.emit_mov_reg_reg(6, 12);
-        // mov rcx, 128 (1024-byte redirect table = 128 qwords)
-        self.emit(&[0x48, 0xC7, 0xC1, 0x80, 0x00, 0x00, 0x00]);
-        self.emit(&[0xF3, 0x48, 0xA5]);
-        // pop rsi
-        self.emit(&[0x5E]);
+        // Point dispatch at this KNV6 entry's embedded redirect table (no runtime stub write).
+        self.emit(&[0x49, 0x8D, 0x47, 0x1C]); // lea rax, [r15+0x1C]
+        self.emit_mov_qword_to_rip_label(0, "active_redirect_ptr");
         self.jmp_to_dispatch();
     }
 
@@ -1217,6 +1219,8 @@ impl StubEmitter {
         self.labels.insert("knv6_entries", knv6_pos + KNV6_HEADER_SIZE);
         self.label("exit_wire_cmp_slot");
         self.emit(&[0x00]);
+        self.label("active_redirect_ptr");
+        self.emit(&[0x00; 8]);
         while self.pos() % 16 != 0 {
             self.emit(&[0xCC]);
         }
@@ -1344,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn set_block_map_rep_movsq_source_is_rsi_from_r12() {
+    fn set_block_map_points_active_redirect_at_knv6_table() {
         let (stub, _, _, _) = create_vm_interpreter_stub(
             0,
             0,
@@ -1355,8 +1359,6 @@ mod tests {
             &[],
             &[],
         );
-        const CORRECT: [u8; 3] = [0x4C, 0x89, 0xE6]; // mov rsi, r12
-        const WRONG: [u8; 3] = [0x49, 0x89, 0xE6]; // mov r14, rsp (REX.B not REX.R)
         let sig = [0x44u8, 0x0F, 0xB7, 0x06];
         let pos = stub
             .windows(sig.len())
@@ -1364,17 +1366,16 @@ mod tests {
             .expect("h_set_block_map");
         let body = &stub[pos..pos.saturating_add(120).min(stub.len())];
         assert!(
-            body.windows(CORRECT.len()).any(|w| w == CORRECT),
-            "h_set_block_map must emit mov rsi,r12 as 4c 89 e6 before rep movsq"
+            body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, 0x1C]),
+            "h_set_block_map must lea rax,[r15+0x1C] for embedded KNV6 redirect table"
         );
         assert!(
-            !body.windows(WRONG.len()).any(|w| w == WRONG),
-            "h_set_block_map must not emit 49 89 e6 (mov r14,rsp — copies bytecode over handler_table)"
+            body.windows(3).any(|w| w == [0x48, 0x89, 0x05]),
+            "h_set_block_map must store redirect pointer to [rip+active_redirect_ptr]"
         );
         assert!(
-            body.windows(4).any(|w| w == [0xF3, 0x48, 0xA5, 0x5E])
-                || body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
-            "rep movsq must follow mov rsi,r12"
+            !body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
+            "h_set_block_map must not rep movsq into stub handler_table (Windows write hazard)"
         );
     }
 
@@ -1590,48 +1591,20 @@ mod tests {
             .expect("h_set_block_map");
         let body = &stub[pos..pos.saturating_add(120).min(stub.len())];
         assert!(
-            body.contains(&0x56),
-            "h_set_block_map must push rsi before handler-table copy"
+            !body.contains(&0x56),
+            "h_set_block_map must not push rsi (no in-stub handler-table copy)"
         );
         assert!(
-            body.contains(&0x5E),
-            "h_set_block_map must pop rsi after handler-table copy"
+            !body.contains(&0x5E),
+            "h_set_block_map must not pop rsi after redirect refresh"
         );
         assert!(
             !body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
-            "h_set_block_map must not lea rsi,[r15+28] (clobbers bytecode PC)"
+            "h_set_block_map must not lea rsi,[r15+0x1C] (clobbers bytecode PC)"
         );
         assert!(
-            body.windows(4).any(|w| w == [0x4D, 0x8D, 0x67, 0x1C]),
-            "h_set_block_map must lea r12,[r15+28] for rep movsq source"
-        );
-        assert!(
-            body.windows(3).any(|w| w == [0x48, 0x8D, 0x1D]),
-            "h_set_block_map must lea rbx,[handler_table] (same as dispatch) before copy"
-        );
-        assert!(
-            !body.windows(3).any(|w| w == [0x48, 0x8D, 0x3D]),
-            "h_set_block_map must not lea rdi,[handler_table] via separate modrm path"
-        );
-        assert!(
-            body.windows(3).any(|w| w == [0x48, 0x89, 0xDF]),
-            "h_set_block_map must mov rdi,rbx (48 89 df) for rep movsq dest"
-        );
-        assert!(
-            body.windows(3).any(|w| w == [0x4C, 0x89, 0xE6]),
-            "h_set_block_map must mov rsi,r12 (4c 89 e6) before rep movsq"
-        );
-        assert!(
-            !body.windows(3).any(|w| w == [0x49, 0x89, 0xE6]),
-            "h_set_block_map must not mov r14,rsp (49 89 e6)"
-        );
-        assert!(
-            body.windows(7).any(|w| w == [0x48, 0xC7, 0xC1, 0x80, 0x00, 0x00, 0x00]),
-            "h_set_block_map must mov rcx,128 before rep movsq"
-        );
-        assert!(
-            !body.windows(5).any(|w| w == [0xB9, 0x80, 0x00, 0x00, 0x00]),
-            "h_set_block_map must use 64-bit mov rcx,128 not mov ecx,128"
+            body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, 0x1C]),
+            "h_set_block_map must lea rax,[r15+0x1C] without touching bytecode rsi"
         );
         assert!(
             body.windows(3).any(|w| w == [0x44, 0x39, 0xC1]),
@@ -1649,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn set_block_map_rep_movsq_dest_matches_dispatch_handler_table_lea() {
+    fn table_dispatch_uses_active_redirect_ptr_and_r10_add_base() {
         let (stub, _, _, _) = create_vm_interpreter_stub(
             0,
             0,
@@ -1660,25 +1633,28 @@ mod tests {
             &[],
             &[],
         );
-        let dispatch_lea = stub
-            .windows(3)
-            .position(|w| w == [0x48, 0x8D, 0x1D])
-            .expect("dispatch lea rbx,[handler_table]");
-        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
-        let set_map = stub
-            .windows(sig.len())
-            .position(|w| w == sig)
-            .expect("h_set_block_map");
-        let body = &stub[set_map..set_map.saturating_add(120).min(stub.len())];
-        let copy_lea = body
-            .windows(3)
-            .position(|w| w == [0x48, 0x8D, 0x1D])
-            .expect("h_set_block_map lea rbx,[handler_table]");
-        let copy_target = resolve_lea_rip(&stub, set_map + copy_lea);
-        let dispatch_target = resolve_lea_rip(&stub, dispatch_lea);
+        let dispatch = stub
+            .windows(18)
+            .position(|w| {
+                w[0..3] == [0x4C, 0x8D, 0x15]
+                    && w[7..10] == [0x48, 0x8B, 0x1D]
+                    && w[14..18] == [0x48, 0x63, 0x04, 0x83]
+            })
+            .expect("table dispatch lea r10 + mov rbx,[active_redirect_ptr] + movsxd");
         assert_eq!(
-            copy_target, dispatch_target,
-            "rep movsq dest must use the same handler_table base as table dispatch"
+            stub[dispatch + 18..dispatch + 22],
+            [0x4C, 0x01, 0xD0, 0xFF],
+            "table dispatch must add handler_table base via r10 then jmp rax"
+        );
+        let table_base = resolve_lea_rip(&stub, dispatch);
+        let prologue_init = stub
+            .windows(10)
+            .position(|w| w[0..3] == [0x48, 0x8D, 0x1D] && w[7..10] == [0x48, 0x89, 0x05])
+            .expect("prologue must seed active_redirect_ptr from handler_table");
+        assert_eq!(
+            resolve_lea_rip(&stub, prologue_init),
+            table_base,
+            "prologue must point active_redirect_ptr at handler_table before first META"
         );
     }
 
