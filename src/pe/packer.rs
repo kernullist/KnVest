@@ -64,6 +64,51 @@ fn has_near_call_in_window(text_data: &[u8], offset: usize, window: usize) -> bo
     text_data[start..end].contains(&0xE8)
 }
 
+/// Collect targets of `call rel32` (0xE8) within `scan_len` bytes of a function entry.
+fn near_rel32_call_targets(text_data: &[u8], offset: usize, scan_len: usize) -> Vec<usize> {
+    let end = (offset + scan_len).min(text_data.len());
+    if offset >= end {
+        return Vec::new();
+    }
+    let w = &text_data[offset..end];
+    let mut targets = Vec::new();
+    for i in 0..w.len().saturating_sub(5) {
+        if w[i] != 0xE8 {
+            continue;
+        }
+        let rel = i32::from_le_bytes([w[i + 1], w[i + 2], w[i + 3], w[i + 4]]);
+        let call_from = offset + i;
+        let target = call_from as i64 + 5 + rel as i64;
+        if target >= 0 {
+            targets.push(target as usize);
+        }
+    }
+    targets
+}
+
+/// True when the function body looks like it performs stdio (printf/puts) I/O.
+fn has_stdio_io_pattern(text_data: &[u8], offset: usize) -> bool {
+    let end = (offset + 0x120).min(text_data.len());
+    if offset >= end {
+        return false;
+    }
+    let w = &text_data[offset..end];
+    for i in 0..w.len().saturating_sub(12) {
+        if w[i] == 0x48 && w.get(i + 1) == Some(&0x8D) {
+            let tail = &w[i..w.len().min(i + 20)];
+            if tail.contains(&0xE8) || tail.windows(2).any(|x| x == [0xFF, 0x15]) {
+                return true;
+            }
+        }
+    }
+    for i in 0..w.len().saturating_sub(6) {
+        if w[i] == 0xB9 && w.get(i + 5) == Some(&0xE8) {
+            return true;
+        }
+    }
+    w.windows(2).any(|x| x == [0xFF, 0x15])
+}
+
 fn score_user_main(text_data: &[u8], offset: usize) -> i32 {
     let end = (offset + 0x50).min(text_data.len());
     if offset >= end {
@@ -130,12 +175,90 @@ fn score_crt_ctor_penalty(text_data: &[u8], offset: usize) -> i32 {
     penalty
 }
 
+/// MinGW CRT `__main` shim: near-call to another prologue candidate, no stdio in-body.
+fn score_crt_main_shim_penalty(
+    text_data: &[u8],
+    offset: usize,
+    candidate_offsets: &[usize],
+) -> i32 {
+    if has_stdio_io_pattern(text_data, offset) {
+        return 0;
+    }
+    let targets = near_rel32_call_targets(text_data, offset, 0x80);
+    let calls_candidate = targets.iter().any(|t| candidate_offsets.contains(t));
+    if !calls_candidate {
+        return 0;
+    }
+    let mut penalty = 70;
+    let in_text_calls = targets
+        .iter()
+        .filter(|t| candidate_offsets.contains(t))
+        .count();
+    if in_text_calls == 1 {
+        penalty += 15;
+    }
+    penalty
+}
+
+/// In-text helper (e.g. `factorial`) called from user `main` but without stdio itself.
+fn score_in_text_callee_penalty(
+    text_data: &[u8],
+    offset: usize,
+    candidate_offsets: &[usize],
+) -> i32 {
+    if has_stdio_io_pattern(text_data, offset) {
+        return 0;
+    }
+    let called_from_main_like = candidate_offsets.iter().any(|caller_off| {
+        *caller_off != offset
+            && has_stdio_io_pattern(text_data, *caller_off)
+            && near_rel32_call_targets(text_data, *caller_off, 0x160).contains(&offset)
+    });
+    if called_from_main_like {
+        return 50;
+    }
+    let called_from_any = candidate_offsets.iter().any(|caller_off| {
+        *caller_off != offset
+            && near_rel32_call_targets(text_data, *caller_off, 0x160).contains(&offset)
+    });
+    if called_from_any {
+        return 30;
+    }
+    0
+}
+
+fn boost_called_by_crt_shim(
+    text_data: &[u8],
+    offset: usize,
+    candidate_offsets: &[usize],
+) -> i32 {
+    let boosted = candidate_offsets.iter().any(|shim_off| {
+        *shim_off != offset
+            && score_crt_main_shim_penalty(text_data, *shim_off, candidate_offsets) >= 70
+            && near_rel32_call_targets(text_data, *shim_off, 0x80).contains(&offset)
+    });
+    if boosted {
+        25
+    } else {
+        0
+    }
+}
+
+fn final_main_score(text_data: &[u8], offset: usize, candidate_offsets: &[usize]) -> i32 {
+    let base = net_main_score(text_data, offset);
+    let shim = score_crt_main_shim_penalty(text_data, offset, candidate_offsets);
+    let callee = score_in_text_callee_penalty(text_data, offset, candidate_offsets);
+    let stdio = if has_stdio_io_pattern(text_data, offset) { 18 } else { 0 };
+    let shim_target = boost_called_by_crt_shim(text_data, offset, candidate_offsets);
+    base - shim - callee + stdio + shim_target
+}
+
 fn net_main_score(text_data: &[u8], offset: usize) -> i32 {
     score_user_main(text_data, offset) - score_crt_ctor_penalty(text_data, offset)
 }
 
-fn looks_like_user_main(text_data: &[u8], offset: usize) -> bool {
-    net_main_score(text_data, offset) > 0
+fn looks_like_user_main(text_data: &[u8], offset: usize, candidate_offsets: &[usize]) -> bool {
+    final_main_score(text_data, offset, candidate_offsets) > 0
 }
 
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
@@ -164,9 +287,11 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
         }
     }
 
+    let candidate_offsets: Vec<usize> = candidates.iter().map(|(_, off)| *off).collect();
+
     let user_main_candidates: Vec<_> = candidates
         .iter()
-        .filter(|(_, off)| looks_like_user_main(text_data, *off))
+        .filter(|(_, off)| looks_like_user_main(text_data, *off, &candidate_offsets))
         .copied()
         .collect();
     let pick_from = if user_main_candidates.is_empty() {
@@ -178,10 +303,13 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     if let Some(&(rva, offset)) = pick_from
         .iter()
         .max_by(|a, b| {
-            net_main_score(text_data, a.1)
-                .cmp(&net_main_score(text_data, b.1))
-                // Prefer earlier .text offset when scores tie — user main precedes ctors on MinGW.
-                .then_with(|| a.1.cmp(&b.1))
+            final_main_score(text_data, a.1, &candidate_offsets)
+                .cmp(&final_main_score(text_data, b.1, &candidate_offsets))
+                .then_with(|| {
+                    let a_stdio = has_stdio_io_pattern(text_data, a.1) as i32;
+                    let b_stdio = has_stdio_io_pattern(text_data, b.1) as i32;
+                    a_stdio.cmp(&b_stdio)
+                })
         })
     {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
@@ -1218,6 +1346,32 @@ mod tests {
         assert!(
             !stub.windows(rsi_on_push_depth.len()).any(|w| w == rsi_on_push_depth),
             "bytecode rsi save must not use push-depth slot [rbp-0xE8]"
+        );
+    }
+
+    #[test]
+    fn test_detect_main_prefers_hello_over_crt___main() {
+        let pe_data = test_pe::create_pe64_hello_vs_crt___main();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let rva = super::detect_main_rva(&pe).unwrap();
+        assert_eq!(
+            rva,
+            text.virtual_address + 0x760,
+            "must pick user main, not CRT __main shim"
+        );
+    }
+
+    #[test]
+    fn test_detect_main_prefers_main_over_factorial_helper() {
+        let pe_data = test_pe::create_pe64_fact_helper_before_main();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let rva = super::detect_main_rva(&pe).unwrap();
+        assert_eq!(
+            rva,
+            text.virtual_address + 0x78f,
+            "must pick printf main, not factorial helper"
         );
     }
 
