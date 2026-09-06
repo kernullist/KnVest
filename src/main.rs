@@ -64,8 +64,18 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     if let Some(plan) = partial_plan {
         print!("{}", plan.format_ir_header(&opcode_map, dispatch_mode));
     }
+
+    let block_plan = packer::extract_block_map_from_packed(&pe).ok();
+    if let Some(ref plan) = block_plan {
+        print!("{}", plan.format_ir_header(&opcode_map, dispatch_mode));
+    }
     
-    let instructions = ir::Instruction::disassemble(&bytecode, &opcode_map, dispatch_mode);
+    let instructions = ir::Instruction::disassemble_with_block_maps(
+        &bytecode,
+        &opcode_map,
+        block_plan.as_ref(),
+        dispatch_mode,
+    );
     let output = ir::Instruction::pretty_print(&instructions);
     
     println!("{}", output);

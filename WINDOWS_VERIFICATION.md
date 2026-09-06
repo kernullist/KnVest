@@ -117,6 +117,34 @@ where `3` is the canonical index of `Add` and `splitmix64` matches `opcode_map.r
 
 To inspect handler bytes on Windows, disassemble the `.knvest` section (e.g. dumpbin /disasm or your favorite PE tool) and locate the handler table entry for the wire byte that encodes `add` for that seed.
 
+### L4e block opcode-map rotation
+
+After packing, `knvest ir` should show an **L4e block opcode maps** header with per-BB `decode_key` and differing `load_imm wire` values across blocks.
+
+Default verification (8 samples, seed A/B, table + threaded smoke, `--partial`):
+
+```bash
+# Default table dispatch — 8 gcc16 samples
+for exe in sample/gcc16/*.exe; do
+  knvest pack "$exe" "${exe%.exe}_packed.exe"
+  knvest ir "${exe%.exe}_packed.exe" | head -20
+done
+
+# Seed A / B (wire diversity)
+knvest pack sample/gcc16/hello.exe /tmp/hello_a.exe --seed 0xAAAA
+knvest pack sample/gcc16/hello.exe /tmp/hello_b.exe --seed 0xBBBB
+
+# Threaded dispatch smoke
+knvest pack sample/gcc16/hello.exe /tmp/hello_t.exe --dispatch threaded
+knvest ir /tmp/hello_t.exe | head -20
+
+# Partial + threaded (when fixture supports it)
+knvest pack sample/gcc16/countdown.exe /tmp/cd_p.exe --partial --seed 0x14D02026
+knvest pack sample/gcc16/countdown.exe /tmp/cd_pt.exe --partial --seed 0x14D02026 --dispatch threaded
+```
+
+Expect: IR lists `set_block_map` at BB entries; same semantic opcodes decode with different raw bytes in different blocks; default full pack stays green (exit 0).
+
 ## Technical Details
 
 ### Section Addition

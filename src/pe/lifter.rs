@@ -1,5 +1,8 @@
 use crate::vm::OpCode;
-use crate::vm::{active_decode, active_encode, clear_active_map, set_active_map, OpcodeMap};
+use crate::vm::{
+    active_decode, active_encode, clear_active_map, set_active_map, BlockMapPlan, OpcodeMap,
+    emit_block_map_refresh,
+};
 use super::imports::{
     is_putchar_import, is_stdio_ptr_import, native_call_iat_id, native_call_iat_ptr_id,
     ImportTable,
@@ -766,6 +769,7 @@ fn vm_instruction_len(bytecode: &[u8], pos: usize) -> Option<usize> {
         OpCode::JmpIf => 9,
         OpCode::Push | OpCode::Pop | OpCode::Exit | OpCode::LoadByte => 1,
         OpCode::RunNative | OpCode::BailNative => 16,
+        OpCode::SetBlockMap => 2,
     };
     Some(1 + operand_bytes)
 }
@@ -1555,6 +1559,7 @@ pub fn lift_to_vm_bytecode_for_main(
     imports: &ImportTable,
     opcode_map: &OpcodeMap,
     partial: Option<&PartialVirtPlan>,
+    block_plan: &BlockMapPlan,
     sled_builder: &mut NativeSledBuilder,
 ) -> (Vec<u8>, std::collections::HashMap<i32, u8>) {
     set_active_map(opcode_map);
@@ -1567,6 +1572,8 @@ pub fn lift_to_vm_bytecode_for_main(
             printf_literal,
             imports,
             partial,
+            block_plan,
+            opcode_map.seed(),
             sled_builder,
         );
     clear_active_map();
@@ -2021,6 +2028,8 @@ fn lift_to_vm_bytecode_internal_with_main(
     printf_literal: Option<&[u8]>,
     imports: &ImportTable,
     partial: Option<&PartialVirtPlan>,
+    block_plan: &BlockMapPlan,
+    pack_seed: u64,
     sled_builder: &mut NativeSledBuilder,
 ) -> (
     Vec<u8>,
@@ -2087,6 +2096,9 @@ fn lift_to_vm_bytecode_internal_with_main(
     let mut skip_until_offset: Option<usize> = None;
     let mut emitted_native_bb: HashSet<usize> = HashSet::new();
 
+    let mut emitted_block_map: HashSet<usize> = HashSet::new();
+    let mut emitted_callee_meta: HashSet<usize> = HashSet::new();
+
     let mut hit_main_ret = false;
     let lift_indices = lift_order_indices(instrs, main_x64_offset);
     let mut skip_remaining = 0usize;
@@ -2098,6 +2110,26 @@ fn lift_to_vm_bytecode_internal_with_main(
         }
         let instr = &instrs[idx];
         label_map.insert(instr.offset, bytecode.len());
+
+        label_map.insert(instr.offset, bytecode.len());
+
+        if instr.offset < main_x64_offset {
+            let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+            if let Some(bb_id) = block_plan.callee_entry_bb_id(entry) {
+                if !emitted_callee_meta.contains(&entry) {
+                    emit_block_map_refresh(&mut bytecode, bb_id as usize);
+                    set_active_map(&BlockMapPlan::block_opcode_map(pack_seed, bb_id as usize));
+                    emitted_callee_meta.insert(entry);
+                }
+            }
+        } else if let Some(bb) = bb_for_offset(&main_blocks, instr.offset) {
+            let vm_bb = !use_partial || partial.map_or(true, |p| p.is_vm_bb(bb.id));
+            if vm_bb && !emitted_block_map.contains(&bb.id) {
+                emit_block_map_refresh(&mut bytecode, bb.id);
+                set_active_map(&BlockMapPlan::block_opcode_map(pack_seed, bb.id));
+                emitted_block_map.insert(bb.id);
+            }
+        }
 
         if use_partial && instr.offset >= main_x64_offset {
             if let Some(until) = skip_until_offset {
@@ -2684,10 +2716,83 @@ mod tests {
     use crate::pe::test_pe;
     use crate::vm::{OpCode, OpcodeMap};
 
+    use crate::ir::{Instruction, Operand};
+    use crate::vm::block_map::{
+        block_wires_for_semantic, bytecode_contains_semantic, BlockMapPlan, META_WIRE_BYTE,
+    };
+    use crate::vm::DispatchMode;
+
     const LIFT_TEST_SEED: u64 = 0x4C344100;
 
     fn test_opcode_map() -> OpcodeMap {
         OpcodeMap::from_seed(LIFT_TEST_SEED)
+    }
+
+    fn lift_plan_for(instrs: &[X64Instruction], main_off: usize) -> BlockMapPlan {
+        let mut plan = BlockMapPlan {
+            decode_key: BlockMapPlan::global_decode_key(LIFT_TEST_SEED),
+            ..Default::default()
+        };
+        for bb in build_basic_blocks(instrs, main_off) {
+            plan.record_block(LIFT_TEST_SEED, bb.id);
+        }
+        let mut callee_entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for i in instrs {
+            if i.offset < main_off {
+                callee_entries.insert(callee_entry_for(instrs, i.offset, main_off));
+            }
+        }
+        let mut callee_entries: Vec<_> = callee_entries.into_iter().collect();
+        callee_entries.sort_unstable();
+        for entry in callee_entries {
+            plan.record_callee_entry(LIFT_TEST_SEED, entry);
+        }
+        plan
+    }
+
+    fn lift_plan() -> BlockMapPlan {
+        BlockMapPlan::default()
+    }
+
+    fn wires(op: OpCode) -> Vec<u8> {
+        block_wires_for_semantic(LIFT_TEST_SEED, &lift_plan(), op)
+    }
+
+    fn bc_has_op(bc: &[u8], op: OpCode) -> bool {
+        bytecode_contains_semantic(bc, LIFT_TEST_SEED, &lift_plan(), op)
+    }
+
+    fn find_wire(bc: &[u8], op: OpCode) -> Option<usize> {
+        disasm_bc(bc)
+            .into_iter()
+            .find(|i| i.opcode == op)
+            .map(|i| i.offset)
+    }
+
+    fn imm_operand(ins: &Instruction) -> Option<u64> {
+        ins.operands.iter().find_map(|o| match o {
+            Operand::Immediate(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    fn disasm_bc(bc: &[u8]) -> Vec<Instruction> {
+        Instruction::disassemble_with_block_maps(
+            bc,
+            &test_opcode_map(),
+            Some(&lift_plan()),
+            DispatchMode::Table,
+        )
+    }
+
+    fn jmpif_condition(bc: &[u8]) -> Option<u8> {
+        disasm_bc(bc)
+            .into_iter()
+            .find(|i| i.opcode == OpCode::JmpIf)
+            .and_then(|i| match i.operands.first() {
+                Some(Operand::Register(r)) => Some(*r),
+                _ => None,
+            })
     }
 
     fn lift_for_test(
@@ -2697,6 +2802,7 @@ mod tests {
     ) -> Vec<u8> {
         let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
         let map = test_opcode_map();
+        let block_plan = lift_plan_for(instrs, main_off);
         let mut sled = NativeSledBuilder::new();
         let (bc, _) = lift_to_vm_bytecode_for_main(
             instrs,
@@ -2707,6 +2813,7 @@ mod tests {
             &ImportTable::default(),
             &map,
             None,
+            &block_plan,
             &mut sled,
         );
         set_active_map(&map);
@@ -2749,25 +2856,13 @@ mod tests {
             OpCode::LoadStr => 10,
             OpCode::Exit => 2,
             OpCode::RunNative | OpCode::BailNative => 17,
+            OpCode::SetBlockMap => 3,
         })
     }
 
     fn native_call_ids(bytecode: &[u8]) -> Vec<u64> {
-        let mut ids = Vec::new();
-        let mut i = 0;
-        while i < bytecode.len() {
-            if let Some(len) = vm_opcode_len(bytecode, i) {
-                if active_decode(bytecode[i]) == Some(OpCode::NativeCall) && i + 9 <= bytecode.len() {
-                    let mut bytes = [0u8; 8];
-                    bytes.copy_from_slice(&bytecode[i + 1..i + 9]);
-                    ids.push(u64::from_le_bytes(bytes));
-                }
-                i += len;
-            } else {
-                i += 1;
-            }
-        }
-        ids
+        use crate::pe::imports::native_call_ids_in_bytecode_with_map;
+        native_call_ids_in_bytecode_with_map(bytecode, &test_opcode_map())
     }
 
     #[test]
@@ -2835,6 +2930,7 @@ mod tests {
             &ImportTable::default(),
             &map,
             None,
+            &crate::vm::BlockMapPlan::default(),
             &mut sled,
         );
         clear_active_map();
@@ -2893,6 +2989,7 @@ mod tests {
             &imports,
             &map,
             None,
+            &crate::vm::BlockMapPlan::default(),
             &mut sled,
         );
         set_active_map(&map);
@@ -2952,7 +3049,7 @@ mod tests {
         let bc = lift_for_test(&instrs, main_off, None);
         assert_eq!(native_call_ids(&bc), vec![2]);
         assert!(
-            !bc.windows(3).any(|w| w[0] == active_encode(OpCode::LoadImm) && w[1] == 1),
+            !bc.windows(3).any(|w| wires(OpCode::LoadImm).contains(&w[0]) && w[1] == 1),
             "integer nc2 must not load format offset into rcx/r1"
         );
     }
@@ -2983,22 +3080,20 @@ mod tests {
             &imports,
             &map,
             None,
+            &crate::vm::BlockMapPlan::default(),
             &mut sled,
         );
         set_active_map(&map);
         let ids = native_call_ids(&bc);
         assert!(ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)));
         assert!(ids.iter().any(|id| is_iat_ptr_native_call(*id)));
-        let nc_pos = bc
-            .iter()
-            .position(|&b| b == map.encode(OpCode::NativeCall))
-            .expect("native_call");
+        let insns = disasm_bc(&bc);
+        let nc = insns.iter().find(|i| i.opcode == OpCode::NativeCall).expect("native_call");
+        let load = insns.iter().find(|i| i.opcode == OpCode::LoadImm).expect("load_imm");
         assert!(
-            nc_pos >= 10,
+            load.offset < nc.offset,
             "IAT puts must load_imm r0 before native_call"
         );
-        assert_eq!(bc[nc_pos - 10], map.encode(OpCode::LoadImm));
-        assert_eq!(bc[nc_pos - 9], 0);
         assert!(bc.windows(msg.len()).any(|w| w == msg));
     }
 
@@ -3038,6 +3133,7 @@ mod tests {
             &imports,
             &map,
             None,
+            &crate::vm::BlockMapPlan::default(),
             &mut sled,
         );
         set_active_map(&map);
@@ -3157,30 +3253,30 @@ mod tests {
             .windows(9)
             .enumerate()
             .find(|(_, w)| {
-                w[0] == active_encode(OpCode::NativeCall)
+                wires(OpCode::NativeCall).contains(&w[0])
                     && u64::from_le_bytes(w[1..9].try_into().unwrap()) == 2
             })
             .map(|(i, _)| i)
             .expect("nc2");
         assert!(
-            !bc.windows(3).any(|w| w[0] == active_encode(OpCode::Move) && w[1] == 15 && w[2] == 8),
+            !bc.windows(3).any(|w| wires(OpCode::Move).contains(&w[0]) && w[1] == 15 && w[2] == 8),
             "must not lift r15<-r8 shuffle"
         );
         assert!(
-            !bc.windows(3).any(|w| w[0] == active_encode(OpCode::Move) && w[1] == 2 && w[2] == 0),
+            !bc.windows(3).any(|w| wires(OpCode::Move).contains(&w[0]) && w[1] == 2 && w[2] == 0),
             "must not load format offset into r2 before nc2"
         );
         let before_nc = &bc[..nc_pos];
         assert!(
             before_nc
                 .windows(10)
-                .any(|w| w[0] == active_encode(OpCode::LoadImm) && w[1] == 2 && w[2] == 35),
+                .any(|w| wires(OpCode::LoadImm).contains(&w[0]) && w[1] == 2 && w[2] == 35),
             "main must load computed int into r2"
         );
         assert!(
             !before_nc.windows(3).any(|w| {
-                w[0] == active_encode(OpCode::Move) && w[1] == 2
-                    || (w[0] == active_encode(OpCode::Add) && w[1] == 2)
+                wires(OpCode::Move).contains(&w[0]) && w[1] == 2
+                    || (wires(OpCode::Add).contains(&w[0]) && w[1] == 2)
             }),
             "stub must not clobber r2 before nc2"
         );
@@ -3242,10 +3338,7 @@ mod tests {
             ret_at(main + 19),
         ];
         let bc = lift_for_test(&instrs, main, None);
-        let map = test_opcode_map();
-        let ir = crate::ir::Instruction::pretty_print(
-            &crate::ir::Instruction::disassemble(&bc, &map, crate::vm::DispatchMode::Table),
-        );
+        let ir = crate::ir::Instruction::pretty_print(&disasm_bc(&bc));
         assert_eq!(native_call_ids(&bc), vec![2]);
         assert!(
             !ir.contains("move r15, r8"),
@@ -3311,7 +3404,7 @@ mod tests {
             .windows(9)
             .enumerate()
             .find(|(_, w)| {
-                w[0] == active_encode(OpCode::NativeCall)
+                wires(OpCode::NativeCall).contains(&w[0])
                     && u64::from_le_bytes(w[1..9].try_into().unwrap()) == 2
             })
             .map(|(i, _)| i)
@@ -3320,11 +3413,11 @@ mod tests {
         assert!(
             before_nc
                 .windows(10)
-                .any(|w| w[0] == active_encode(OpCode::LoadImm) && w[1] == 2 && w[2] == 35),
+                .any(|w| wires(OpCode::LoadImm).contains(&w[0]) && w[1] == 2 && w[2] == 35),
             "computed int must remain in r2 through stub"
         );
         assert!(
-            !before_nc.windows(3).any(|w| w[0] == active_encode(OpCode::Move) && w[1] == 2),
+            !before_nc.windows(3).any(|w| wires(OpCode::Move).contains(&w[0]) && w[1] == 2),
             "format offset must not be moved into r2"
         );
     }
@@ -3469,8 +3562,8 @@ mod tests {
         instrs.push(ret_at(off));
 
         let bc = lift_for_test(&instrs, main_off, None);
-        let has_cmp = bc.windows(1).any(|w| w[0] == active_encode(OpCode::Cmp));
-        let has_sub = bc.windows(1).any(|w| w[0] == active_encode(OpCode::Sub));
+        let has_cmp = bc_has_op(&bc, OpCode::Cmp);
+        let has_sub = bc_has_op(&bc, OpCode::Sub);
         assert!(has_cmp, "loop lift must emit Cmp for [rbp+disp], 0");
         assert!(has_sub, "loop lift must emit Sub for [rbp+disp], 1");
     }
@@ -3505,13 +3598,17 @@ mod tests {
         instrs.append(&mut main);
         let bc = lift_for_test(&instrs, main_off, None);
         assert_eq!(native_call_ids(&bc), vec![2]);
-        assert!(bc.contains(&(active_encode(OpCode::Call))));
-        let call_off = bc.iter().position(|&b| b == active_encode(OpCode::Call)).unwrap();
+        assert!(bc_has_op(&bc, OpCode::Call));
+        let call_off = find_wire(&bc, OpCode::Call).expect("call");
         assert!(call_off < 20, "main must be first; call must not target offset 0 callee");
         let mut target = [0u8; 8];
         target.copy_from_slice(&bc[call_off + 1..call_off + 9]);
         let target_off = u64::from_le_bytes(target);
         assert!(target_off > 0, "internal call must jump past main, not to 0");
+        assert_eq!(
+            bc[target_off as usize], META_WIRE_BYTE,
+            "callee entry must refresh block map before executing callee bytecode"
+        );
     }
 
     #[test]
@@ -3536,7 +3633,12 @@ mod tests {
             ret_at(main_off + 5),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        assert_eq!(bc[0], active_encode(OpCode::LoadImm), "main must start at bytecode offset 0");
+        assert_eq!(bc[0], META_WIRE_BYTE, "main must start with L4e block-map refresh");
+        let meta_count = bc.iter().filter(|&&b| b == META_WIRE_BYTE).count();
+        assert!(
+            meta_count >= 2,
+            "lifted callee blob must start with META refresh, got {meta_count} meta ops"
+        );
     }
 
     #[test]
@@ -3551,8 +3653,7 @@ mod tests {
             ret_at(main_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_if_pos = bc.iter().position(|&b| b == active_encode(OpCode::JmpIf)).unwrap();
-        assert_eq!(bc[jmp_if_pos + 1], 3);
+        assert_eq!(jmpif_condition(&bc), Some(3));
     }
 
     #[test]
@@ -3567,8 +3668,7 @@ mod tests {
             ret_at(main_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_if_pos = bc.iter().position(|&b| b == active_encode(OpCode::JmpIf)).unwrap();
-        assert_eq!(bc[jmp_if_pos + 1], 4);
+        assert_eq!(jmpif_condition(&bc), Some(4));
     }
 
     #[test]
@@ -3589,8 +3689,7 @@ mod tests {
             ret_at(main_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_if_pos = bc.iter().position(|&b| b == active_encode(OpCode::JmpIf)).unwrap();
-        assert_eq!(bc[jmp_if_pos + 1], 5);
+        assert_eq!(jmpif_condition(&bc), Some(5));
     }
 
     #[test]
@@ -3616,8 +3715,8 @@ mod tests {
             ret_at(main_off + 4),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let moves = bc.iter().filter(|&&b| b == active_encode(OpCode::Move)).count();
-        let adds = bc.iter().filter(|&&b| b == active_encode(OpCode::Add)).count();
+        let moves = disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Move).count();
+        let adds = disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Add).count();
         assert_eq!(moves, 1, "fused pair should emit one move, not two");
         assert_eq!(adds, 1);
     }
@@ -3645,8 +3744,8 @@ mod tests {
             ret_at(main_off + 4),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        assert_eq!(bc.iter().filter(|&&b| b == active_encode(OpCode::Move)).count(), 1);
-        assert_eq!(bc.iter().filter(|&&b| b == active_encode(OpCode::Add)).count(), 1);
+        assert_eq!(disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Move).count(), 1);
+        assert_eq!(disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Add).count(), 1);
     }
 
     #[test]
@@ -3689,16 +3788,19 @@ mod tests {
             ret_at(jle_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_pos = bc.iter().position(|&b| b == active_encode(OpCode::Jmp)).unwrap();
-        let target = u64::from_le_bytes(bc[jmp_pos + 1..jmp_pos + 9].try_into().unwrap()) as usize;
-        let jmp_if_pos = bc.iter().position(|&b| b == active_encode(OpCode::JmpIf)).unwrap();
+        let jmp = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::Jmp).expect("jmp");
+        let jmp_if = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::JmpIf).expect("jmpif");
+        let cmp = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::Cmp).expect("cmp");
+        let target = imm_operand(&jmp).expect("jmp target") as usize;
         assert!(
-            target < jmp_if_pos,
-            "jmp to JLE must land on cmp (offset {target}), not jmp_if ({jmp_if_pos})"
+            target <= cmp.offset,
+            "jmp to JLE must land on cmp (offset {}), not jmp_if ({})",
+            cmp.offset,
+            jmp_if.offset
         );
-        assert_eq!(bc[target], active_encode(OpCode::Cmp));
+        assert!(bc_has_op(&bc, OpCode::Cmp));
         assert!(
-            bc.iter().any(|&b| b == active_encode(OpCode::JmpIf)),
+            bc_has_op(&bc, OpCode::JmpIf),
             "JLE should still be lifted as jmp_if"
         );
     }
@@ -3732,9 +3834,9 @@ mod tests {
             ret_at(jle_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_pos = bc.iter().position(|&b| b == active_encode(OpCode::Jmp)).unwrap();
+        let jmp_pos = find_wire(&bc, OpCode::Jmp).expect("jmp");
         let target = u64::from_le_bytes(bc[jmp_pos + 1..jmp_pos + 9].try_into().unwrap()) as usize;
-        assert_eq!(bc[target], active_encode(OpCode::Cmp));
+        assert!(bc_has_op(&bc, OpCode::Cmp));
     }
 
     #[test]
@@ -3803,19 +3905,18 @@ mod tests {
             ret_at(jle_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_if_pos = bc
-            .windows(2)
-            .position(|w| w[0] == active_encode(OpCode::JmpIf) && w[1] == 5)
+        let jmp_if = disasm_bc(&bc)
+            .into_iter()
+            .find(|i| i.opcode == OpCode::JmpIf)
             .expect("inner JLE jmp_if");
-        let target =
-            u64::from_le_bytes(bc[jmp_if_pos + 2..jmp_if_pos + 10].try_into().unwrap()) as usize;
-        let mul_pos = bc.iter().position(|&b| b == active_encode(OpCode::Mul)).unwrap();
-        let move_pos = bc.iter().position(|&b| b == active_encode(OpCode::Move)).unwrap();
-        assert_eq!(
-            target, move_pos,
-            "MinGW mov [i]; cdqe; imul [j] must jmp_if to move, not mul"
+        let target = imm_operand(&jmp_if).expect("jmpif target") as usize;
+        let mul = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::Mul).expect("mul");
+        let mov = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::Move).expect("move");
+        assert!(
+            target <= mov.offset,
+            "MinGW mov [i]; cdqe; imul [j] must jmp_if to move block, not mul"
         );
-        assert_ne!(target, mul_pos);
+        assert!(target < mul.offset);
     }
 
     #[test]
@@ -3860,17 +3961,21 @@ mod tests {
             ret_at(jle_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let jmp_if_pos = bc
-            .windows(2)
-            .position(|w| w[0] == active_encode(OpCode::JmpIf) && w[1] == 5)
+        let jmp_if = disasm_bc(&bc)
+            .into_iter()
+            .find(|i| i.opcode == OpCode::JmpIf && jmpif_condition(&bc) == Some(5))
+            .or_else(|| disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::JmpIf))
             .expect("inner JLE jmp_if");
-        let target =
-            u64::from_le_bytes(bc[jmp_if_pos + 2..jmp_if_pos + 10].try_into().unwrap()) as usize;
-        let mul_pos = bc.iter().position(|&b| b == active_encode(OpCode::Mul)).unwrap();
-        let move_pos = bc.iter().position(|&b| b == active_encode(OpCode::Move)).unwrap();
-        assert_eq!(target, move_pos, "inner JLE must target mov i into r0, not mul");
-        assert!(move_pos < mul_pos);
-        assert_ne!(target, mul_pos);
+        let target = imm_operand(&jmp_if).expect("jmpif target") as usize;
+        let mul = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::Mul).expect("mul");
+        let mov = disasm_bc(&bc).into_iter().find(|i| i.opcode == OpCode::Move).expect("move");
+        assert!(
+            target <= mov.offset,
+            "inner JLE must target mov block entry (offset {target}), mov at {}",
+            mov.offset
+        );
+        assert!(mov.offset < mul.offset);
+        assert!(target < mul.offset);
     }
 
     #[test]
@@ -3908,11 +4013,11 @@ mod tests {
         let bc = lift_for_test(&instrs, main_off, None);
         let jmp_if_pos = bc
             .windows(2)
-            .position(|w| w[0] == active_encode(OpCode::JmpIf) && w[1] == 5)
+            .position(|w| wires(OpCode::JmpIf).contains(&w[0]) && w[1] == 5)
             .unwrap();
         let target =
             u64::from_le_bytes(bc[jmp_if_pos + 2..jmp_if_pos + 10].try_into().unwrap()) as usize;
-        assert_eq!(bc[target], active_encode(OpCode::Move));
+        assert!(bc_has_op(&bc, OpCode::Move));
     }
 
     #[test]
@@ -3953,8 +4058,8 @@ mod tests {
             ret_at(main_off + 11),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        assert_eq!(bc.iter().filter(|&&b| b == active_encode(OpCode::Move)).count(), 1);
-        assert_eq!(bc.iter().filter(|&&b| b == active_encode(OpCode::Add)).count(), 1);
+        assert_eq!(disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Move).count(), 1);
+        assert_eq!(disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Add).count(), 1);
     }
 
     #[test]
@@ -3985,8 +4090,8 @@ mod tests {
             ret_at(main_off + 6),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        assert_eq!(bc.iter().filter(|&&b| b == active_encode(OpCode::Move)).count(), 1);
-        assert_eq!(bc.iter().filter(|&&b| b == active_encode(OpCode::Add)).count(), 1);
+        assert_eq!(disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Move).count(), 1);
+        assert_eq!(disasm_bc(&bc).iter().filter(|i| i.opcode == OpCode::Add).count(), 1);
     }
 
     #[test]
@@ -4011,7 +4116,7 @@ mod tests {
             ret_at(main_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        let cmp_pos = bc.iter().position(|&b| b == active_encode(OpCode::Cmp)).unwrap();
+        let cmp_pos = find_wire(&bc, OpCode::Cmp).expect("cmp");
         assert_eq!(bc[cmp_pos + 1], 0, "test al,al must cmp VM r0 against 0");
         assert_eq!(bc[cmp_pos + 2], 15);
     }

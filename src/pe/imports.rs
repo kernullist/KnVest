@@ -70,50 +70,67 @@ pub fn native_call_ids_in_bytecode_with_map(
         bytecode,
         map,
         crate::vm::DispatchMode::Table,
+        None,
     )
 }
 
-/// Map-aware `native_call` scan that understands L4c threaded rel32 padding.
+/// Map-aware `native_call` scan that understands L4c threaded rel32 padding and L4e block maps.
 pub fn native_call_ids_in_bytecode_with_map_dispatch(
     bytecode: &[u8],
     map: &crate::vm::OpcodeMap,
     dispatch_mode: crate::vm::DispatchMode,
+    block_plan: Option<&crate::vm::BlockMapPlan>,
 ) -> Vec<u64> {
+    use crate::vm::block_map::{BlockMapPlan, META_OPERAND_LEN, META_WIRE_BYTE};
     use crate::vm::dispatch::THREAD_TARGET_SIZE;
     use crate::vm::{DispatchMode, OpCode};
     let mut ids = Vec::new();
-    if dispatch_mode == DispatchMode::Threaded {
-        let mut offset = 0usize;
-        while offset < bytecode.len() {
-            let wire = bytecode[offset];
-            let op = match map.decode(wire) {
-                Some(op) => op,
-                None => break,
-            };
-            let operand_len = op.operand_len();
-            let insn_len = 1 + THREAD_TARGET_SIZE + operand_len;
-            if offset + insn_len > bytecode.len() {
-                break;
+    let mut offset = 0usize;
+    let mut current_map = map.clone();
+    while offset < bytecode.len() {
+        if bytecode[offset] == META_WIRE_BYTE {
+            let mut meta_off = offset + 1;
+            if dispatch_mode == DispatchMode::Threaded {
+                meta_off += THREAD_TARGET_SIZE;
             }
-            if op == OpCode::NativeCall && operand_len >= 8 {
-                let id_off = offset + 1 + THREAD_TARGET_SIZE;
-                ids.push(u64::from_le_bytes(
-                    bytecode[id_off..id_off + 8].try_into().unwrap(),
-                ));
+            if meta_off + META_OPERAND_LEN <= bytecode.len() {
+                let bb_id = u16::from_le_bytes([bytecode[meta_off], bytecode[meta_off + 1]]);
+                current_map = block_plan
+                    .map(|p| p.map_for_bb_or_base(bb_id, map))
+                    .unwrap_or_else(|| BlockMapPlan::block_opcode_map(map.seed(), bb_id as usize));
+                offset = meta_off + META_OPERAND_LEN;
+                continue;
             }
-            offset += insn_len;
+            break;
         }
-        return ids;
-    }
-
-    let mut i = 0usize;
-    while i < bytecode.len() {
-        if map.decode(bytecode[i]) == Some(OpCode::NativeCall) && i + 9 <= bytecode.len() {
-            ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
-            i += 9;
+        let wire = bytecode[offset];
+        let op = match current_map.decode(wire) {
+            Some(op) => op,
+            None => {
+                offset += if dispatch_mode == DispatchMode::Threaded {
+                    1 + THREAD_TARGET_SIZE
+                } else {
+                    1
+                };
+                continue;
+            }
+        };
+        let operand_len = op.operand_len();
+        let header = if dispatch_mode == DispatchMode::Threaded {
+            1 + THREAD_TARGET_SIZE
         } else {
-            i += 1;
+            1
+        };
+        if offset + header + operand_len > bytecode.len() {
+            break;
         }
+        if op == OpCode::NativeCall && operand_len >= 8 {
+            let id_off = offset + header;
+            ids.push(u64::from_le_bytes(
+                bytecode[id_off..id_off + 8].try_into().unwrap(),
+            ));
+        }
+        offset += header + operand_len;
     }
     ids
 }
@@ -131,7 +148,12 @@ pub fn iat_native_call_ids_in_bytecode_with_map(
     bytecode: &[u8],
     map: &crate::vm::OpcodeMap,
 ) -> Vec<u64> {
-    iat_native_call_ids_in_bytecode_with_map_dispatch(bytecode, map, crate::vm::DispatchMode::Table)
+    iat_native_call_ids_in_bytecode_with_map_dispatch(
+        bytecode,
+        map,
+        crate::vm::DispatchMode::Table,
+        None,
+    )
 }
 
 /// IAT native_call ids from packed bytecode (table or threaded layout).
@@ -139,8 +161,9 @@ pub fn iat_native_call_ids_in_bytecode_with_map_dispatch(
     bytecode: &[u8],
     map: &crate::vm::OpcodeMap,
     dispatch_mode: crate::vm::DispatchMode,
+    block_plan: Option<&crate::vm::BlockMapPlan>,
 ) -> Vec<u64> {
-    native_call_ids_in_bytecode_with_map_dispatch(bytecode, map, dispatch_mode)
+    native_call_ids_in_bytecode_with_map_dispatch(bytecode, map, dispatch_mode, block_plan)
         .into_iter()
         .filter(|id| is_iat_native_call(*id))
         .collect()
@@ -455,26 +478,35 @@ mod tests {
 
     #[test]
     fn native_call_ids_in_threaded_bytecode_skip_rel32() {
-        use crate::pe::threaded::embed_thread_targets;
+        use crate::pe::threaded::{embed_thread_targets, handler_offset_for_op, handler_offset_for_set_block_map};
         use crate::pe::vm_stub::create_vm_interpreter_stub;
-        use crate::vm::{DispatchMode, OpCode, OpcodeMap};
+        use crate::vm::{BlockMapPlan, DispatchMode, OpCode, OpcodeMap};
 
         let map = OpcodeMap::from_seed(0x4C34_4100);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, &[], &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, &[], &BlockMapPlan::default(), &[], &[]);
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
-        let threaded = embed_thread_targets(&raw, &map, &|op| {
-            use crate::pe::threaded::handler_offset_for_op;
-            handler_offset_for_op(&stub, &map, op)
-        });
+        let set_map = handler_offset_for_set_block_map(&stub);
+        let threaded = embed_thread_targets(
+            &raw,
+            &map,
+            &BlockMapPlan::default(),
+            &|op| handler_offset_for_op(&stub, &map, op),
+            set_map,
+        );
         assert_eq!(
             native_call_ids_in_bytecode_with_map(&raw, &map),
             vec![ptr_id],
             "table-layout scan"
         );
         assert_eq!(
-            native_call_ids_in_bytecode_with_map_dispatch(&threaded, &map, DispatchMode::Threaded),
+            native_call_ids_in_bytecode_with_map_dispatch(
+                &threaded,
+                &map,
+                DispatchMode::Threaded,
+                None,
+            ),
             vec![ptr_id],
             "threaded scan must read id after rel32, not handler offset bytes"
         );
@@ -484,8 +516,37 @@ mod tests {
                     &threaded,
                     &map,
                     DispatchMode::Threaded,
+                    None,
                 )[0],
             )
+        );
+    }
+
+    #[test]
+    fn native_call_ids_in_l4e_threaded_puts_hello_sample() {
+        use crate::pe::packer::pack_function;
+        use crate::pe::parser::PEFile;
+        use crate::vm::DispatchMode;
+        use std::path::Path;
+
+        let path = Path::new("sample/puts_hello.exe");
+        if !path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
+        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded)
+            .unwrap();
+        let ids = native_call_ids_in_bytecode_with_map_dispatch(
+            &packed.bytecode,
+            &packed.opcode_map,
+            DispatchMode::Threaded,
+            Some(&packed.block_map_plan),
+        );
+        assert!(
+            ids.iter().any(|id| is_iat_ptr_native_call(*id)),
+            "L4e threaded puts_hello scan got {:?} from {} byte bytecode",
+            ids,
+            packed.bytecode.len()
         );
     }
 

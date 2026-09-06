@@ -1,4 +1,5 @@
 use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
+use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 use std::fmt;
@@ -37,9 +38,19 @@ impl fmt::Display for Operand {
 
 impl Instruction {
     pub fn disassemble(bytecode: &[u8], opcode_map: &OpcodeMap, dispatch_mode: DispatchMode) -> Vec<Self> {
+        Self::disassemble_with_block_maps(bytecode, opcode_map, None, dispatch_mode)
+    }
+
+    pub fn disassemble_with_block_maps(
+        bytecode: &[u8],
+        base_map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
+        dispatch_mode: DispatchMode,
+    ) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
         let mut consecutive_invalid = 0;
+        let mut current_map = base_map.clone();
 
         while offset < bytecode.len() {
             let start_offset = offset;
@@ -49,7 +60,24 @@ impl Instruction {
                 offset += THREAD_TARGET_SIZE;
             }
 
-            let opcode = match opcode_map.decode(opcode_byte) {
+            if opcode_byte == META_WIRE_BYTE {
+                consecutive_invalid = 0;
+                if offset + META_OPERAND_LEN <= bytecode.len() {
+                    let bb_id = u16::from_le_bytes([bytecode[offset], bytecode[offset + 1]]);
+                    offset += META_OPERAND_LEN;
+                    if let Some(plan) = block_plan {
+                        current_map = plan.map_for_bb_or_base(bb_id, base_map);
+                    }
+                    instructions.push(Instruction {
+                        offset: start_offset,
+                        opcode: OpCode::SetBlockMap,
+                        operands: vec![Operand::Immediate(u64::from(bb_id))],
+                    });
+                    continue;
+                }
+            }
+
+            let opcode = match current_map.decode(opcode_byte) {
                 Some(op) => op,
                 None => {
                     consecutive_invalid += 1;
@@ -70,7 +98,7 @@ impl Instruction {
             let mut operands = Vec::new();
 
             match opcode {
-                OpCode::Nop => {},
+                OpCode::Nop | OpCode::SetBlockMap => {},
                 
                 OpCode::LoadImm => {
                     if offset < bytecode.len() {

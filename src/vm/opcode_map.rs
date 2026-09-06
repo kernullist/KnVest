@@ -219,7 +219,7 @@ impl PackMetadata {
 }
 
 impl OpcodeMap {
-    fn from_parts(seed: u64, wire: [u8; CANONICAL_OPCODE_COUNT]) -> Self {
+    pub fn from_parts(seed: u64, wire: [u8; CANONICAL_OPCODE_COUNT]) -> Self {
         let decode = build_decode_table(&wire);
         let handler_emit_order = shuffle_indices(seed ^ 0x4853_4C48);
         Self {
@@ -314,7 +314,9 @@ fn build_decode_table(wire: &[u8; CANONICAL_OPCODE_COUNT]) -> [Option<OpCode>; 2
 }
 
 fn shuffle_wire_bytes(seed: u64) -> [u8; CANONICAL_OPCODE_COUNT] {
-    let mut pool: Vec<u8> = (0u8..=255).collect();
+    let mut pool: Vec<u8> = (0u8..=255)
+        .filter(|&b| b != super::block_map::META_WIRE_BYTE)
+        .collect();
     fisher_yates(&mut pool, seed);
     let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
     for i in 0..CANONICAL_OPCODE_COUNT {
