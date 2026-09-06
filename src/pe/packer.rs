@@ -2003,12 +2003,16 @@ mod tests {
             "run_native must set native rbp before sled call"
         );
         assert!(
-            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
-            "run_native must mov rsp,rcx before sled call (native_stack band)"
+            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "run_native must lea rsp,[rcx+0x80] (call stack above [rbp-4] locals)"
         );
         assert!(
-            !prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
-            "run_native must not lea rsp,[rcx+0x80]"
+            prefix.windows(4).any(|w| w == [0x48, 0x83, 0xE4, 0xF0]),
+            "run_native must and rsp,-16 before sled call"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "run_native must not mov rsp,rcx (shadow overlaps loop counter at [rbp-4])"
         );
     }
 
