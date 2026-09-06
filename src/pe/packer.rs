@@ -1923,8 +1923,8 @@ mod tests {
         );
         let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
         assert!(
-            stub.windows(4).any(|w| w == [0x49, 0x8B, 0x8C, 0x25]),
-            "run_native handler must load persistent native frame via [r13-0x110]"
+            stub.windows(7).any(|w| w == [0x48, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]),
+            "run_native handler must persist VM frame at [rbp-0x118]"
         );
         assert_run_native_stub_uses_native_rsp(&stub);
         for sled in collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map) {
@@ -1951,8 +1951,8 @@ mod tests {
         let sync = packed.native_sync.clone();
         let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
-        // Handler contract (Windows): r13=VM frame, r12=VM rsp, reload [r13-0x110]→rcx/rbp,
-        // pre-sync via [rbp+disp]; lea rsp,[rbp+0x80]; and rsp,-16; sub rsp 0x28; call r10 sled.
+        // Handler contract (Windows): save VM frame [rbp-0x118]; native ptr [rbp-0x110];
+        // frame_ready: mov r14,[rbp-0x110]; mov r13,[rbp-0x118]; mov rbp,r14; pre-sync; sled.
     }
 
     fn collect_run_native_sleds(
@@ -1989,8 +1989,20 @@ mod tests {
             .expect("run_native handler must call r10");
         let prefix = &stub[..call_at];
         assert!(
-            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
-            "run_native must set native rbp before sled call"
+            prefix.windows(3).any(|w| w == [0x4C, 0x89, 0xF5]),
+            "run_native must mov rbp,r14 before sled call (native frame from [vm_rbp-0x110])"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
+            "run_native must not mov rbp,rcx (rcx may hold VM counter)"
+        );
+        assert!(
+            prefix.windows(7).any(|w| w == [0x4C, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]),
+            "run_native must mov r14,[rbp-0x110] before native rbp switch"
+        );
+        assert!(
+            !prefix.windows(8).any(|w| w == [0x49, 0x8B, 0x8C, 0x25, 0xF0, 0xFE, 0xFF, 0xFF]),
+            "run_native must not load native frame via [r13-0x110]"
         );
         assert!(
             prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),

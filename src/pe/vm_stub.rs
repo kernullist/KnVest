@@ -18,6 +18,7 @@ use std::collections::HashMap;
 //   ret addrs      [rbp + depth*8 - 0x200]       (depth 3 → -0x1E8; must not use for scratch)
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
+//   VM frame save  [rbp-0x118]                  (run_native re-anchors r13 from here)
 //   native side    [rbp-0x110]                  (persistent native frame ptr for L4d run_native)
 pub fn create_vm_interpreter_stub(
     _image_base: u64,
@@ -515,6 +516,28 @@ impl StubEmitter {
         }
     }
 
+    fn emit_mov_qword_from_rbp_to_reg(&mut self, reg: u8, disp: i32) {
+        let rex = if reg >= 8 { 0x4C } else { 0x48 };
+        let reg = reg & 7;
+        if (-128..=127).contains(&disp) {
+            self.emit(&[rex, 0x8B, (reg << 3) | 0x45, disp as u8]);
+        } else {
+            self.emit(&[rex, 0x8B, (reg << 3) | 0x85]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_qword_to_rbp_from_reg(&mut self, reg: u8, disp: i32) {
+        let rex = if reg >= 8 { 0x4C } else { 0x48 };
+        let reg = reg & 7;
+        if (-128..=127).contains(&disp) {
+            self.emit(&[rex, 0x89, (reg << 3) | 0x45, disp as u8]);
+        } else {
+            self.emit(&[rex, 0x89, (reg << 3) | 0x85]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
     fn emit_handler_run_native(&mut self) {
         self.label("h_run_native");
         self.emit_native_sled_invoke("rn_frame_ready_run");
@@ -526,31 +549,36 @@ impl StubEmitter {
     }
 
     /// L4d: read sled offset + orig rva, sync VM spills↔native rbp locals, run sled, resume VM.
+    ///
+    /// Native frame ptr lives at `[vm_rbp-0x110]`; VM frame self-ptr at `[vm_rbp-0x118]`.
+    /// All slot access while `rbp` is still the VM frame — never via `[r13-0x110]` (r13 may
+    /// not match VM base if clobbered). At frame_ready load native ptr into r14, re-anchor r13
+    /// from `[vm_rbp-0x118]`, then `mov rbp, r14` before spill sync.
     fn emit_native_sled_invoke(&mut self, frame_ready_label: &'static str) {
         let sync_pairs = self.native_sync.clone();
         self.emit(&[0x48, 0x8B, 0x06]); // mov rax, [rsi] sled offset
         self.emit(&[0x49, 0x89, 0xC3]); // mov r11, rax
         self.emit(&[0x48, 0x83, 0xC6, 0x10]); // add rsi, 16 (skip orig rva)
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
-        self.emit(&[0x49, 0x89, 0xE5]); // mov r13, rbp — VM frame
+        // Persist VM frame on the VM frame itself before any rbp switch.
+        self.emit_mov_qword_to_rbp_from_reg(5, -0x118); // mov [rbp-0x118], rbp
+        self.emit(&[0x49, 0x89, 0xE5]); // mov r13, rbp — VM spill base
         self.emit(&[0x49, 0x89, 0xE4]); // mov r12, rsp
 
-        // rcx = persistent native side frame pointer [r13-0x110]
-        self.emit_mov_from_r13_slot(-0x110);
-        self.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+        self.emit_mov_qword_from_rbp_to_reg(0, -0x110); // mov rax, [rbp-0x110]
         self.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
         self.jcc_rel32(0x85, frame_ready_label); // jne frame_ready_label
 
         self.lea_rip_rel32(0x48, 4, "native_stack_top");
         self.emit(&[0x48, 0x2D, 0x00, 0x01, 0x00, 0x00]); // sub rax, 0x100
         self.emit(&[0x48, 0x83, 0xE0, 0xF0]); // and rax, -16
-        self.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax
-        self.emit_mov_to_r13_slot(-0x110); // mov [r13-0x110], rcx
+        self.emit_mov_qword_to_rbp_from_reg(0, -0x110); // mov [rbp-0x110], rax
 
         self.label(frame_ready_label);
-        // Reload native frame: rcx may still hold a VM reg (e.g. loop counter) after jne skips alloc.
-        self.emit_mov_from_r13_slot(-0x110);
-        self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — native locals base before spill sync
+        // rbp still VM frame: load native locals base without touching rcx.
+        self.emit_mov_qword_from_rbp_to_reg(14, -0x110); // mov r14, [rbp-0x110]
+        self.emit_mov_qword_from_rbp_to_reg(13, -0x118); // mov r13, [rbp-0x118] — VM spill base
+        self.emit(&[0x4C, 0x89, 0xF5]); // mov rbp, r14 — native locals base before spill sync
         for &(rbp_disp, spill) in &sync_pairs {
             self.emit_mov_dword_from_r13_spill(spill);
             self.emit_mov_dword_to_rbp_disp(rbp_disp);
@@ -1095,8 +1123,20 @@ mod tests {
             .expect("call r10");
         let prefix = &stub[..call_at];
         assert!(
-            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
-            "mov rbp, rcx before sled call"
+            prefix.windows(3).any(|w| w == [0x4C, 0x89, 0xF5]),
+            "mov rbp, r14 before sled call (native frame from [vm_rbp-0x110])"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
+            "must not mov rbp, rcx (rcx may hold VM counter)"
+        );
+        assert!(
+            prefix.windows(7).any(|w| w == [0x4C, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]),
+            "must mov r14, [rbp-0x110] before native rbp switch"
+        );
+        assert!(
+            !prefix.windows(8).any(|w| w == [0x49, 0x8B, 0x8C, 0x25, 0xF0, 0xFE, 0xFF, 0xFF]),
+            "must not load native frame via [r13-0x110]"
         );
         assert!(
             prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
@@ -1192,24 +1232,38 @@ mod tests {
             .position(|w| w == [0x41, 0xFF, 0xD2])
             .expect("call r10 in run_native");
         let before_call = &run_body[..call_at];
-        let reload_native = [0x49u8, 0x8B, 0x8C, 0x25, 0xF0, 0xFE, 0xFF, 0xFF]; // mov rcx,[r13-0x110]
-        let mov_rbp_rcx = [0x48u8, 0x89, 0xCD];
+        let save_vm_frame = [0x48u8, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]; // mov [rbp-0x118], rbp
+        let load_native = [0x4Cu8, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]; // mov r14, [rbp-0x110]
+        let reload_vm = [0x4Cu8, 0x8B, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]; // mov r13, [rbp-0x118]
+        let mov_rbp_r14 = [0x4Cu8, 0x89, 0xF5]; // mov rbp, r14
         let pre_sync_store = [0x89u8, 0x45, 0xFC];
-        let reload_at = before_call
-            .windows(reload_native.len())
-            .rposition(|w| w == reload_native)
-            .expect("reload native frame from [r13-0x110] at frame_ready");
+        assert!(
+            run_body.windows(save_vm_frame.len()).any(|w| w == save_vm_frame),
+            "handler must persist VM frame at [rbp-0x118] on entry"
+        );
+        let native_at = before_call
+            .windows(load_native.len())
+            .position(|w| w == load_native)
+            .expect("mov r14, [rbp-0x110] at frame_ready");
+        let vm_at = before_call
+            .windows(reload_vm.len())
+            .position(|w| w == reload_vm)
+            .expect("mov r13, [rbp-0x118] re-anchor before sync");
         let rbp_at = before_call
-            .windows(mov_rbp_rcx.len())
-            .position(|w| w == mov_rbp_rcx)
-            .expect("mov rbp, rcx before pre-sync");
+            .windows(mov_rbp_r14.len())
+            .position(|w| w == mov_rbp_r14)
+            .expect("mov rbp, r14 before pre-sync");
         let sync_at = before_call
             .windows(pre_sync_store.len())
             .position(|w| w == pre_sync_store)
             .expect("pre-sync mov [rbp-4], eax");
         assert!(
-            reload_at <= rbp_at && rbp_at < sync_at,
-            "native frame reload + mov rbp,rcx must precede spill sync stores"
+            native_at < vm_at && vm_at < rbp_at && rbp_at < sync_at,
+            "native frame load + VM re-anchor + rbp switch must precede spill sync stores"
+        );
+        assert!(
+            !before_call.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
+            "must not mov rbp, rcx before pre-sync"
         );
     }
 
