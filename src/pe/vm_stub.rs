@@ -119,6 +119,20 @@ impl StubEmitter {
         self.lea_rip.push((self.pos() - 4, target));
     }
 
+    /// Emit `mov dst, src` (Intel syntax, 64-bit reg-reg via opcode 89 /r).
+    fn emit_mov_reg_reg(&mut self, dst: u8, src: u8) {
+        debug_assert!(dst < 16 && src < 16);
+        let mut rex = 0x48u8; // REX.W
+        if src >= 8 {
+            rex |= 0x04; // REX.R — src in reg field
+        }
+        if dst >= 8 {
+            rex |= 0x01; // REX.B — dst in r/m field
+        }
+        let modrm = 0xC0 | ((src & 7) << 3) | (dst & 7);
+        self.emit(&[rex, 0x89, modrm]);
+    }
+
     fn emit_init_native_frame_ptr(&mut self) {
         // lea rax, [rip+native_stack_top]; sub rax,0x100; and rax,-16; mov [rip+native_frame_ptr], rax
         self.lea_rip_rel32(0x48, 0, "native_stack_top");
@@ -605,11 +619,11 @@ impl StubEmitter {
         self.emit(&[0x48, 0x83, 0xC6, 0x10]); // add rsi, 16 (skip orig rva)
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
         self.emit_mov_qword_to_rbp_from_reg(5, -0x118); // mov [rbp-0x118], rbp
-        self.emit(&[0x49, 0x89, 0xFD]); // mov r15, rbp — VM spill base (not r13/rsp)
-        self.emit(&[0x49, 0x89, 0xE4]); // mov r12, rsp
+        self.emit_mov_reg_reg(15, 5); // mov r15, rbp — VM spill base (not r13/rsp)
+        self.emit_mov_reg_reg(12, 4); // mov r12, rsp
 
         self.emit_load_native_locals_base_into_r14();
-        self.emit(&[0x4C, 0x89, 0xF5]); // mov rbp, r14 — native locals before spill sync
+        self.emit_mov_reg_reg(5, 14); // mov rbp, r14 — native locals before spill sync
         for &(rbp_disp, spill) in &sync_pairs {
             self.emit_mov_dword_from_r15_spill(spill);
             self.emit_mov_dword_to_rbp_disp(rbp_disp);
@@ -630,8 +644,8 @@ impl StubEmitter {
             self.emit_mov_dword_to_r15_spill(spill);
         }
 
-        self.emit(&[0x49, 0x89, 0xEF]); // mov rbp, r15 — restore VM frame (never via r13)
-        self.emit(&[0x49, 0x89, 0xE4]); // mov rsp, r12
+        self.emit_mov_reg_reg(5, 15); // mov rbp, r15 — restore VM frame (never via r13)
+        self.emit_mov_reg_reg(4, 12); // mov rsp, r12
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov rsi, [rbp-0x98]
         self.jmp_to_dispatch();
     }
@@ -1221,8 +1235,12 @@ mod tests {
             "must not mov r13,rbp before pre-sync (use r15 for VM spills)"
         );
         assert!(
-            prefix.windows(3).any(|w| w == [0x49, 0x89, 0xFD]),
+            prefix.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
             "must mov r15,rbp for VM spill base before native rbp switch"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x49, 0x89, 0xFD]),
+            "must not emit mov r13,rdi (wrong encoding for mov r15,rbp)"
         );
     }
 
@@ -1323,8 +1341,16 @@ mod tests {
             "post-sync must use dword store to VM spill via r15"
         );
         assert!(
-            after_call.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            after_call.windows(3).any(|w| w == [0x4C, 0x89, 0xFD]),
             "must restore VM frame via mov rbp,r15 (not mov rbp,r13)"
+        );
+        assert!(
+            !after_call.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            "must not emit mov r15,rbp after sled (wrong restore encoding)"
+        );
+        assert!(
+            after_call.windows(3).any(|w| w == [0x4C, 0x89, 0xE4]),
+            "must restore VM rsp via mov rsp,r12"
         );
         assert!(
             !after_call.windows(3).any(|w| w == [0x49, 0x89, 0xED]),
@@ -1352,7 +1378,7 @@ mod tests {
         let before_call = &run_body[..call_at];
         let save_vm_frame = [0x48u8, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF];
         let lea_native = [0x4Cu8, 0x8D, 0x35];
-        let mov_r15_rbp = [0x49u8, 0x89, 0xFD];
+        let mov_r15_rbp = [0x49u8, 0x89, 0xEF];
         let mov_rbp_r14 = [0x4Cu8, 0x89, 0xF5];
         let pre_sync_store = [0x89u8, 0x45, 0xFC];
         assert!(
@@ -1382,6 +1408,53 @@ mod tests {
         assert!(
             !before_call.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
             "must not mov rbp, rcx before pre-sync"
+        );
+    }
+
+    #[test]
+    fn run_native_r15_spill_base_mov_encoding() {
+        let sync = vec![(-4i32, 10u8)];
+        let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
+        let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &sled, &sync);
+        let (run_site, bail_site) = run_native_invoke_body(&stub);
+        let run_body = &stub[run_site..bail_site];
+        let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
+        let entry = run_body
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .expect("invoke prologue");
+        let spill_load = run_body[entry..]
+            .windows(4)
+            .position(|w| w == [0x41, 0x8B, 0x47, 0xD0])
+            .map(|p| entry + p)
+            .expect("mov eax,[r15-0x30] pre-sync spill load");
+        let setup = &run_body[entry..spill_load];
+        assert!(
+            setup.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            "handler entry must emit mov r15,rbp (49 89 ef) before first r15 spill load"
+        );
+        assert!(
+            !setup.windows(3).any(|w| w == [0x49, 0x89, 0xFD]),
+            "must not emit 49 89 fd (mov r13,rdi) instead of mov r15,rbp"
+        );
+        let call_at = run_body
+            .windows(3)
+            .position(|w| w == [0x41, 0xFF, 0xD2])
+            .expect("call r10");
+        let after_call = &run_body[call_at + 3..];
+        assert!(
+            after_call.windows(3).any(|w| w == [0x4C, 0x89, 0xFD]),
+            "post-sled must restore VM frame via mov rbp,r15 (4c 89 fd)"
+        );
+        assert!(
+            !after_call[..after_call
+                .windows(3)
+                .position(|w| w == [0x4C, 0x89, 0xFD])
+                .expect("restore mov")]
+            .windows(3)
+            .any(|w| w == [0x49, 0x89, 0xEF]),
+            "must not emit mov r15,rbp (49 89 ef) as restore"
         );
     }
 

@@ -1992,6 +1992,10 @@ mod tests {
                 || between.starts_with(&[0x41, 0x8B, 0x87]),
             "only r15 spill load may appear between mov rbp,r14 and first pre-sync store"
         );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            "must mov r15,rbp before native frame switch"
+        );
     }
 
     fn collect_run_native_sleds(
@@ -2046,6 +2050,14 @@ mod tests {
         assert!(
             !prefix.windows(3).any(|w| w == [0x49, 0x89, 0xE5]),
             "run_native must not use r13 as VM spill base"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            "run_native must mov r15,rbp before native rbp switch"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x49, 0x89, 0xFD]),
+            "run_native must not emit mov r13,rdi (wrong mov r15,rbp encoding)"
         );
         assert!(
             prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
