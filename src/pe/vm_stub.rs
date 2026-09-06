@@ -132,6 +132,12 @@ impl StubEmitter {
         self.lea_rip.push((self.pos() - 4, target));
     }
 
+    /// `lea rbx, [rip+handler_table]` — must match table/threaded dispatch exactly.
+    fn emit_lea_handler_table_rbx(&mut self) {
+        self.emit(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0]);
+        self.lea_rip.push((self.pos() - 4, "handler_table"));
+    }
+
     /// Emit `mov dst, src` (Intel syntax, 64-bit reg-reg via opcode 89 /r).
     fn emit_mov_reg_reg(&mut self, dst: u8, src: u8) {
         debug_assert!(dst < 16 && src < 16);
@@ -305,8 +311,7 @@ impl StubEmitter {
         self.exit_cmp_patch_pos = Some(self.pos() - 4);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
         self.jcc_rel32(0x84, "h_exit");
-        self.emit(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0]);
-        self.lea_rip.push((self.pos() - 4, "handler_table"));
+        self.emit_lea_handler_table_rbx();
         self.emit(&[0x48, 0x63, 0x04, 0x83]);
         self.emit(&[0x48, 0x01, 0xD8]);
         self.emit(&[0xFF, 0xE0]);
@@ -320,8 +325,7 @@ impl StubEmitter {
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
         self.jcc_rel32(0x84, "h_exit_threaded");
         self.emit(&[0x48, 0x63, 0x46, 0x01]); // movsxd rax, dword [rsi+1]
-        self.emit(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0]);
-        self.lea_rip.push((self.pos() - 4, "handler_table"));
+        self.emit_lea_handler_table_rbx();
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx
         self.emit(&[0x48, 0x83, 0xC6, 0x05]); // add rsi, 5 (opcode + rel32)
         self.emit(&[0xFF, 0xE0]); // jmp rax
@@ -401,15 +405,17 @@ impl StubEmitter {
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
         // push rsi — bytecode PC must survive handler-table copy
         self.emit(&[0x56]);
-        // lea r12, [r15+28] KNV6 handler-table source (rsi is rep movsq dest index)
+        // lea r12, [r15+28] KNV6 handler-table source (rsi is rep movsq source after mov below)
         self.emit(&[0x4D, 0x8D, 0x67, 0x1C]);
-        // lea rdi, [handler_table]
-        self.lea_rip_rel32(0x48, 7, "handler_table");
+        // lea rbx,[handler_table]; mov rdi,rbx — same base register path as dispatch
+        self.emit_lea_handler_table_rbx();
+        self.emit_mov_reg_reg(7, 3);
         // cld — rep movsq must run forward (DF=0)
         self.emit(&[0xFC]);
         // mov rsi, r12 — rep movsq source (REX.R for r12); 49 89 E6 wrongly encodes mov r14,rsp
         self.emit_mov_reg_reg(6, 12);
-        self.emit(&[0xB9, 0x80, 0x00, 0x00, 0x00]);
+        // mov rcx, 128 (1024-byte redirect table = 128 qwords)
+        self.emit(&[0x48, 0xC7, 0xC1, 0x80, 0x00, 0x00, 0x00]);
         self.emit(&[0xF3, 0x48, 0xA5]);
         // pop rsi
         self.emit(&[0x5E]);
@@ -1317,6 +1323,18 @@ mod tests {
             "h_set_block_map must lea r12,[r15+28] for rep movsq source"
         );
         assert!(
+            body.windows(3).any(|w| w == [0x48, 0x8D, 0x1D]),
+            "h_set_block_map must lea rbx,[handler_table] (same as dispatch) before copy"
+        );
+        assert!(
+            !body.windows(3).any(|w| w == [0x48, 0x8D, 0x3D]),
+            "h_set_block_map must not lea rdi,[handler_table] via separate modrm path"
+        );
+        assert!(
+            body.windows(3).any(|w| w == [0x48, 0x89, 0xDF]),
+            "h_set_block_map must mov rdi,rbx (48 89 df) for rep movsq dest"
+        );
+        assert!(
             body.windows(3).any(|w| w == [0x4C, 0x89, 0xE6]),
             "h_set_block_map must mov rsi,r12 (4c 89 e6) before rep movsq"
         );
@@ -1325,12 +1343,59 @@ mod tests {
             "h_set_block_map must not mov r14,rsp (49 89 e6)"
         );
         assert!(
+            body.windows(7).any(|w| w == [0x48, 0xC7, 0xC1, 0x80, 0x00, 0x00, 0x00]),
+            "h_set_block_map must mov rcx,128 before rep movsq"
+        );
+        assert!(
+            !body.windows(5).any(|w| w == [0xB9, 0x80, 0x00, 0x00, 0x00]),
+            "h_set_block_map must use 64-bit mov rcx,128 not mov ecx,128"
+        );
+        assert!(
             body.windows(4).any(|w| w == [0x66, 0x4D, 0x39, 0x07]),
             "h_set_block_map must cmp [r15],r8w with REX.R (66 4d 39 07)"
         );
         assert!(
             !body.windows(4).any(|w| w == [0x66, 0x45, 0x39, 0x07]),
             "h_set_block_map must not cmp [r15],ax (66 45 39 07 — missing REX.R)"
+        );
+    }
+
+    fn resolve_lea_rip(stub: &[u8], lea_pos: usize) -> usize {
+        let disp = i32::from_le_bytes(stub[lea_pos + 3..lea_pos + 7].try_into().unwrap());
+        ((lea_pos + 7) as i64 + disp as i64) as usize
+    }
+
+    #[test]
+    fn set_block_map_rep_movsq_dest_matches_dispatch_handler_table_lea() {
+        let (stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let dispatch_lea = stub
+            .windows(3)
+            .position(|w| w == [0x48, 0x8D, 0x1D])
+            .expect("dispatch lea rbx,[handler_table]");
+        let sig = [0x44u8, 0x0F, 0xB7, 0x06];
+        let set_map = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        let body = &stub[set_map..set_map.saturating_add(120).min(stub.len())];
+        let copy_lea = body
+            .windows(3)
+            .position(|w| w == [0x48, 0x8D, 0x1D])
+            .expect("h_set_block_map lea rbx,[handler_table]");
+        let copy_target = resolve_lea_rip(&stub, set_map + copy_lea);
+        let dispatch_target = resolve_lea_rip(&stub, dispatch_lea);
+        assert_eq!(
+            copy_target, dispatch_target,
+            "rep movsq dest must use the same handler_table base as table dispatch"
         );
     }
 
