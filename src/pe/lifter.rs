@@ -3244,7 +3244,7 @@ mod tests {
         let bc = lift_for_test(&instrs, main, None);
         let map = test_opcode_map();
         let ir = crate::ir::Instruction::pretty_print(
-            &crate::ir::Instruction::disassemble(&bc, &map),
+            &crate::ir::Instruction::disassemble(&bc, &map, crate::vm::DispatchMode::Table),
         );
         assert_eq!(native_call_ids(&bc), vec![2]);
         assert!(

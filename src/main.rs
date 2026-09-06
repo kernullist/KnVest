@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         Commands::Ir { input } => {
             handle_ir_command(input)?;
         }
-        Commands::Pack { input, output, rva, seed, partial } => {
+        Commands::Pack { input, output, rva, seed, partial, dispatch } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
                 Some(u32::from_str_radix(rva_str, 16)?)
@@ -27,7 +27,10 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            handle_pack_command(input, output, rva_value, seed_value, partial)?;
+            let dispatch_mode = dispatch
+                .parse::<crate::vm::DispatchMode>()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            handle_pack_command(input, output, rva_value, seed_value, partial, dispatch_mode)?;
         }
     }
 
@@ -46,15 +49,23 @@ fn parse_seed(seed_str: &str) -> Result<u64> {
 fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     let pe = PEFile::from_file(&input)?;
     
-    let opcode_map = packer::extract_opcode_map_from_packed(&pe)?;
+    let pack_meta = packer::extract_pack_metadata_from_packed(&pe)?;
+    let opcode_map = pack_meta.opcode_map;
+    let dispatch_mode = pack_meta.dispatch_mode;
     let partial_plan = packer::extract_partial_plan_from_packed(&pe).ok();
     let bytecode = packer::extract_bytecode_from_packed(&pe)?;
     
+    println!(
+        "L4c dispatch={} | L4a seed={:#x}",
+        dispatch_mode,
+        opcode_map.seed()
+    );
+    
     if let Some(plan) = partial_plan {
-        print!("{}", plan.format_ir_header(&opcode_map));
+        print!("{}", plan.format_ir_header(&opcode_map, dispatch_mode));
     }
     
-    let instructions = ir::Instruction::disassemble(&bytecode, &opcode_map);
+    let instructions = ir::Instruction::disassemble(&bytecode, &opcode_map, dispatch_mode);
     let output = ir::Instruction::pretty_print(&instructions);
     
     println!("{}", output);
@@ -68,8 +79,9 @@ fn handle_pack_command(
     rva: Option<u32>,
     seed: Option<u64>,
     partial: bool,
+    dispatch_mode: crate::vm::DispatchMode,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed, partial)?;
+    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode)?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }

@@ -1,10 +1,13 @@
+use super::dispatch::DispatchMode;
 use super::opcode::OpCode;
 use std::cell::RefCell;
 
 pub const KNV4_MAGIC: &[u8; 4] = b"KNV4";
-pub const KNV4_VERSION: u8 = 1;
+pub const KNV4_VERSION_V1: u8 = 1;
+pub const KNV4_VERSION: u8 = 2;
 pub const CANONICAL_OPCODE_COUNT: usize = 20;
-pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
+pub const KNV4_HEADER_SIZE_V1: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
+pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 
 /// Handler polymorphism (L4b): number of native bodies per logical opcode.
 pub const ADD_HANDLER_VARIANT_COUNT: u8 = 3;
@@ -128,39 +131,103 @@ impl OpcodeMap {
         entries
     }
 
+    pub fn handler_label(&self, op: OpCode) -> &'static str {
+        handler_label_for(op)
+    }
+
+    pub fn to_embedded_bytes(&self) -> Vec<u8> {
+        PackMetadata {
+            opcode_map: self.clone(),
+            dispatch_mode: DispatchMode::Table,
+        }
+            .to_embedded_bytes()
+    }
+
+    pub fn from_embedded(data: &[u8]) -> Option<Self> {
+        PackMetadata::from_embedded(data).map(|m| m.opcode_map)
+    }
+}
+
+/// L4a opcode map + L4c dispatch mode embedded in `.knvest`.
+#[derive(Clone, Debug)]
+pub struct PackMetadata {
+    pub opcode_map: OpcodeMap,
+    pub dispatch_mode: DispatchMode,
+}
+
+impl PackMetadata {
+    pub fn from_seed(seed: u64, dispatch_mode: DispatchMode) -> Self {
+        Self {
+            opcode_map: OpcodeMap::from_seed(seed),
+            dispatch_mode,
+        }
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.opcode_map.seed()
+    }
+
     pub fn to_embedded_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(KNV4_HEADER_SIZE);
         out.extend_from_slice(KNV4_MAGIC);
         out.push(KNV4_VERSION);
-        out.extend_from_slice(&self.seed.to_le_bytes());
-        out.extend_from_slice(&self.wire);
+        out.push(self.dispatch_mode.as_wire());
+        out.extend_from_slice(&self.opcode_map.seed.to_le_bytes());
+        out.extend_from_slice(&self.opcode_map.wire);
         out
     }
 
     pub fn from_embedded(data: &[u8]) -> Option<Self> {
-        if data.len() < KNV4_HEADER_SIZE {
+        if data.len() < 4 + 1 || &data[0..4] != KNV4_MAGIC {
             return None;
         }
-        if &data[0..4] != KNV4_MAGIC {
-            return None;
+        match data[4] {
+            KNV4_VERSION_V1 => {
+                if data.len() < KNV4_HEADER_SIZE_V1 {
+                    return None;
+                }
+                let seed = u64::from_le_bytes(data[5..13].try_into().unwrap());
+                let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
+                wire.copy_from_slice(&data[13..13 + CANONICAL_OPCODE_COUNT]);
+                if !wire_is_valid(&wire) {
+                    return None;
+                }
+                Some(Self {
+                    opcode_map: OpcodeMap::from_parts(seed, wire),
+                    dispatch_mode: DispatchMode::Table,
+                })
+            }
+            KNV4_VERSION => {
+                if data.len() < KNV4_HEADER_SIZE {
+                    return None;
+                }
+                let dispatch_mode = DispatchMode::from_wire(data[5])?;
+                let seed = u64::from_le_bytes(data[6..14].try_into().unwrap());
+                let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
+                wire.copy_from_slice(&data[14..14 + CANONICAL_OPCODE_COUNT]);
+                if !wire_is_valid(&wire) {
+                    return None;
+                }
+                Some(Self {
+                    opcode_map: OpcodeMap::from_parts(seed, wire),
+                    dispatch_mode,
+                })
+            }
+            _ => None,
         }
-        if data[4] != KNV4_VERSION {
-            return None;
-        }
-        let seed = u64::from_le_bytes(data[5..13].try_into().unwrap());
-        let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
-        wire.copy_from_slice(&data[13..13 + CANONICAL_OPCODE_COUNT]);
-        if !wire_is_valid(&wire) {
-            return None;
-        }
+    }
+}
+
+impl OpcodeMap {
+    fn from_parts(seed: u64, wire: [u8; CANONICAL_OPCODE_COUNT]) -> Self {
         let decode = build_decode_table(&wire);
         let handler_emit_order = shuffle_indices(seed ^ 0x4853_4C48);
-        Some(Self {
+        Self {
             seed,
             wire,
             decode,
             handler_emit_order,
-        })
+        }
     }
 }
 
@@ -288,6 +355,7 @@ fn splitmix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::DispatchMode;
 
     #[test]
     fn different_seeds_produce_different_wire_tables() {
@@ -303,6 +371,17 @@ mod tests {
             let wire = map.encode(op);
             assert_eq!(map.decode(wire), Some(op));
         }
+    }
+
+    #[test]
+    fn pack_metadata_v2_threaded_roundtrip() {
+        let meta = PackMetadata::from_seed(0xBEEF, DispatchMode::Threaded);
+        let bytes = meta.to_embedded_bytes();
+        assert_eq!(bytes[4], KNV4_VERSION);
+        assert_eq!(bytes[5], DispatchMode::Threaded.as_wire());
+        let parsed = PackMetadata::from_embedded(&bytes).unwrap();
+        assert_eq!(parsed.dispatch_mode, DispatchMode::Threaded);
+        assert_eq!(parsed.seed(), 0xBEEF);
     }
 
     #[test]

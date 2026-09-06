@@ -222,17 +222,22 @@ impl PartialVirtPlan {
         })
     }
 
-    pub fn format_ir_header(&self, opcode_map: &crate::vm::OpcodeMap) -> String {
+    pub fn format_ir_header(
+        &self,
+        opcode_map: &crate::vm::OpcodeMap,
+        dispatch_mode: crate::vm::DispatchMode,
+    ) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "L4d partial virt | decode_key={:#x} | seed={:#x} | mode={}\n",
+            "L4d partial virt | decode_key={:#x} | seed={:#x} | mode={} | dispatch={}\n",
             self.decode_key,
             opcode_map.seed(),
             if self.full_virt {
                 "full"
             } else {
                 "partial"
-            }
+            },
+            dispatch_mode
         ));
         out.push_str("BB id | RVA range        | VM?\n");
         out.push_str("------+------------------+-----\n");
