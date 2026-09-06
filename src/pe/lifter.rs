@@ -2057,6 +2057,7 @@ fn lift_to_vm_bytecode_internal_with_main(
     let u32_semantics = has_putchar_callees;
 
     let main_blocks = build_basic_blocks(instrs, main_x64_offset);
+    let main_block_refs: Vec<&BasicBlock> = main_blocks.iter().collect();
     let use_partial = partial.map_or(false, |p| !p.full_virt);
     let _stack_map_pre = prebuild_stack_map(instrs);
     let mut skip_until_offset: Option<usize> = None;
@@ -2082,7 +2083,9 @@ fn lift_to_vm_bytecode_internal_with_main(
                 skip_until_offset = None;
             }
             if let (Some(plan), Some(bb)) = (partial, bb_for_offset(&main_blocks, instr.offset)) {
-                if !plan.is_vm_bb(bb.id) && bb_can_run_native(instrs, bb) {
+                if !plan.is_vm_bb(bb.id)
+                    && bb_can_run_native(instrs, bb, &main_block_refs, main_x64_offset)
+                {
                     if !emitted_native_bb.contains(&bb.id) {
                         if let Ok((sled_idx, orig_rva)) =
                             sled_builder.add_range_sled(pe, instrs, bb)

@@ -2171,10 +2171,74 @@ mod tests {
             native_eligible: true,
             is_loop_header: false,
         };
+        let block_refs = vec![&bb];
         assert!(
-            !bb_can_run_native(&instrs, &bb),
+            !bb_can_run_native(&instrs, &bb, &block_refs, 0x100),
             "prologue mov rbp,rsp / sub rsp must not become run_native sled"
         );
+    }
+
+    #[test]
+    fn test_l4d_seed_14d02026_no_run_native_before_loop() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let main_off = pe.rva_to_file_offset(main_rva).unwrap();
+        let text_end = pe.rva_to_file_offset(text.virtual_address).unwrap()
+            + text.size_of_raw_data as usize;
+        let instrs = super::super::cfg::disassemble_main_window(&pe.data, main_off, text_end);
+        let blocks = super::super::cfg::build_basic_blocks(&instrs, main_off);
+        let loop_start = blocks
+            .iter()
+            .filter(|b| b.is_loop_header)
+            .map(|b| b.start)
+            .min()
+            .expect("loop header in countdown fixture");
+
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        assert!(!sleds.is_empty(), "partial countdown must emit run_native sleds");
+        assert_eq!(
+            sleds[0],
+            vec![0x83, 0x6D, 0xFC, 0x01, 0xC3],
+            "first run_native sled must be sub dword [rbp-4],1; ret"
+        );
+
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        let mut i = 0usize;
+        while i < packed.bytecode.len() {
+            if packed.bytecode[i] == run_wire && i + 17 <= packed.bytecode.len() {
+                let orig_rva =
+                    u64::from_le_bytes(packed.bytecode[i + 9..i + 17].try_into().unwrap()) as u32;
+                assert!(
+                    orig_rva >= loop_start as u32,
+                    "run_native orig_rva {orig_rva:#x} must not precede loop head {loop_start:#x}:\n{}",
+                    Instruction::pretty_print(&Instruction::disassemble(
+                        &packed.bytecode,
+                        &packed.opcode_map
+                    ))
+                );
+            }
+            i += 1;
+        }
+
+        for entry in &packed.partial_plan.blocks {
+            if entry.virtualized {
+                continue;
+            }
+            assert!(
+                entry.start_rva >= loop_start as u32,
+                "plan-native BB {} at {:#x} must not precede loop head {:#x}",
+                entry.id,
+                entry.start_rva,
+                loop_start
+            );
+        }
     }
 
     #[test]

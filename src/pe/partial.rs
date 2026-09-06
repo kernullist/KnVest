@@ -138,7 +138,7 @@ impl PartialVirtPlan {
             });
         }
 
-        let vm_bb_ids = select_vm_bb_ids(seed, &main_blocks, instrs);
+        let vm_bb_ids = select_vm_bb_ids(seed, &main_blocks, instrs, main_start);
         let full_virt = vm_bb_ids.len() == main_blocks.len();
 
         let mut infos = Vec::with_capacity(main_blocks.len());
@@ -254,6 +254,7 @@ fn select_vm_bb_ids(
     seed: u64,
     main_blocks: &[&BasicBlock],
     instrs: &[X64Instruction],
+    main_start: usize,
 ) -> HashSet<usize> {
     if main_blocks.len() <= 1 {
         return main_blocks.iter().map(|b| b.id).collect();
@@ -295,7 +296,7 @@ fn select_vm_bb_ids(
             main_blocks
                 .iter()
                 .find(|b| b.id == *id)
-                .map(|b| !bb_can_run_native(instrs, b))
+                .map(|b| !bb_can_run_native(instrs, b, main_blocks, main_start))
                 .unwrap_or(true)
         })
         .collect();
@@ -306,18 +307,26 @@ fn select_vm_bb_ids(
     };
     vm_ids.insert(pool[pick % pool.len()]);
 
+    // Never mark early/setup BBs native in the plan when they cannot host run_native.
+    for bb in main_blocks {
+        if !vm_ids.contains(&bb.id) && !bb_can_run_native(instrs, bb, main_blocks, main_start) {
+            vm_ids.insert(bb.id);
+        }
+    }
+
     if vm_ids.len() >= main_blocks.len() {
-        if let Some(strip) = native_eligible
+        if let Some(strip) = main_blocks
             .iter()
-            .find(|id| vm_ids.contains(id))
-            .copied()
+            .filter(|b| vm_ids.contains(&b.id) && bb_can_run_native(instrs, b, main_blocks, main_start))
+            .map(|b| b.id)
+            .next()
         {
             vm_ids.remove(&strip);
         }
     }
 
     if vm_ids.is_empty() {
-        vm_ids.insert(candidates[pick]);
+        vm_ids.insert(candidates[pick % candidates.len()]);
     }
 
     vm_ids
@@ -345,13 +354,23 @@ pub fn instr_safe_for_native_sled(kind: &X64InstrKind) -> bool {
     }
 }
 
-pub fn bb_can_run_native(instrs: &[X64Instruction], bb: &BasicBlock) -> bool {
+pub fn bb_can_run_native(
+    instrs: &[X64Instruction],
+    bb: &BasicBlock,
+    main_blocks: &[&BasicBlock],
+    main_start: usize,
+) -> bool {
     if bb.is_loop_header {
+        return false;
+    }
+    if !bb_in_loop_body(main_blocks, bb, main_start) {
         return false;
     }
     native_sled_instr_range(instrs, bb).is_some()
 }
 
+/// Straight-line prefix of a BB that may be copied into a run_native sled.
+/// Restricted to loop-counter `[rbp±disp]` updates (sub/add mem imm) inside the loop body.
 pub fn native_sled_instr_range(
     instrs: &[X64Instruction],
     bb: &BasicBlock,
@@ -359,36 +378,37 @@ pub fn native_sled_instr_range(
     let mut last_safe = None;
     for idx in bb.leader_idx..=bb.tail_idx {
         let kind = &instrs[idx].kind;
-        if !instr_safe_for_native_sled(kind) {
+        if !is_loop_counter_memop(kind) {
             break;
         }
-        match kind {
-            X64InstrKind::MovRegImm { reg, .. } if arg_reg_touched(*reg) || frame_ptr_reg(*reg) => {
-                return None
-            }
-            X64InstrKind::MovRegReg { dst, src } if {
-                arg_reg_touched(*dst)
-                    || arg_reg_touched(*src)
-                    || frame_ptr_reg(*dst)
-                    || frame_ptr_reg(*src)
-            } =>
-            {
-                return None
-            }
-            X64InstrKind::SubRegImm { reg, .. } | X64InstrKind::AddRegImm { reg, .. }
-                if arg_reg_touched(*reg) || frame_ptr_reg(*reg) =>
-            {
-                return None
-            }
-            X64InstrKind::Lea { dst, .. } | X64InstrKind::LeaRegReg { dst, .. }
-                if arg_reg_touched(*dst) || frame_ptr_reg(*dst) =>
-            {
-                return None
-            }
-            _ => last_safe = Some(idx),
-        }
+        last_safe = Some(idx);
     }
     last_safe.map(|end| (bb.leader_idx, end))
+}
+
+fn is_loop_counter_memop(kind: &X64InstrKind) -> bool {
+    match kind {
+        X64InstrKind::SubMemImm { base, .. } | X64InstrKind::AddMemImm { base, .. } => {
+            matches!(*base, X64Reg::Rbp | X64Reg::Ebp)
+        }
+        _ => false,
+    }
+}
+
+fn first_loop_header_start(main_blocks: &[&BasicBlock]) -> Option<usize> {
+    main_blocks
+        .iter()
+        .filter(|b| b.is_loop_header)
+        .map(|b| b.start)
+        .min()
+}
+
+/// True when the BB lies inside an established back-edge loop (after the loop head, not the head itself).
+fn bb_in_loop_body(main_blocks: &[&BasicBlock], bb: &BasicBlock, main_start: usize) -> bool {
+    let Some(loop_start) = first_loop_header_start(main_blocks) else {
+        return false;
+    };
+    bb.start >= main_start && bb.start >= loop_start && !bb.is_loop_header
 }
 
 fn frame_ptr_reg(reg: X64Reg) -> bool {
@@ -465,8 +485,76 @@ mod tests {
             native_eligible: true,
             is_loop_header: false,
         };
-        assert!(!bb_can_run_native(&instrs, &bb));
+        let blocks = build_basic_blocks(&instrs, 0);
+        let block_refs: Vec<&BasicBlock> = blocks.iter().collect();
+        assert!(!bb_can_run_native(&instrs, &bb, &block_refs, 0));
         assert!(native_sled_instr_range(&instrs, &bb).is_none());
+    }
+
+    #[test]
+    fn pre_loop_mov_mem_imm_bb_is_not_native_eligible() {
+        use crate::pe::lifter::{X64Instruction, X64InstrKind, X64Reg};
+        use crate::pe::cfg::BasicBlock;
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_off = pe.rva_to_file_offset(text.virtual_address).unwrap() + 0x20;
+        let end = main_off + 0x60;
+        let instrs = disassemble_main_window(&pe.data, main_off, end);
+        let blocks = build_basic_blocks(&instrs, main_off);
+        let block_refs: Vec<&BasicBlock> = blocks.iter().collect();
+        let setup = blocks
+            .iter()
+            .find(|b| {
+                (b.leader_idx..=b.tail_idx).any(|i| {
+                    matches!(
+                        instrs[i].kind,
+                        X64InstrKind::MovMemImm {
+                            base: X64Reg::Rbp,
+                            ..
+                        }
+                    )
+                })
+            })
+            .expect("setup mov [rbp+disp], imm bb");
+        assert!(
+            !bb_can_run_native(&instrs, setup, &block_refs, main_off),
+            "pre-loop mov [rbp+disp], imm must not become run_native"
+        );
+    }
+
+    #[test]
+    fn seed_14d02026_plan_has_no_early_native_bb() {
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_off = pe.rva_to_file_offset(text.virtual_address).unwrap() + 0x20;
+        let end = main_off + 0x60;
+        let instrs = disassemble_main_window(&pe.data, main_off, end);
+        let blocks = build_basic_blocks(&instrs, main_off);
+        let block_refs: Vec<&BasicBlock> = blocks.iter().collect();
+        let loop_start = first_loop_header_start(&block_refs).expect("loop header");
+        let plan =
+            PartialVirtPlan::from_seed(0x14D_2026, &blocks, main_off, &pe, true, &instrs).unwrap();
+        for entry in &plan.blocks {
+            if entry.virtualized {
+                continue;
+            }
+            let bb = blocks.iter().find(|b| b.id == entry.id).unwrap();
+            assert!(
+                bb.start >= loop_start,
+                "native BB {} at {:#x} must not precede loop head {:#x}",
+                bb.id,
+                bb.start,
+                loop_start
+            );
+            assert!(
+                bb_can_run_native(&instrs, bb, &block_refs, main_off),
+                "plan-native BB {} must pass bb_can_run_native",
+                bb.id
+            );
+        }
     }
 
     #[test]
