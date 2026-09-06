@@ -1,20 +1,45 @@
+use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::dispatch::THREAD_TARGET_SIZE;
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InsnKind {
+    Semantic(OpCode),
+    SetBlockMap,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct InsnLayout {
     start: usize,
-    op: OpCode,
+    kind: InsnKind,
     raw_len: usize,
 }
 
-fn enumerate_instructions(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<InsnLayout> {
+fn enumerate_instructions(bytecode: &[u8], base_map: &OpcodeMap, block_plan: &BlockMapPlan) -> Vec<InsnLayout> {
     let mut out = Vec::new();
     let mut offset = 0;
+    let mut current_bb: Option<u16> = None;
     while offset < bytecode.len() {
         let wire = bytecode[offset];
-        let op = match opcode_map.decode(wire) {
+        if wire == META_WIRE_BYTE {
+            if offset + 1 + META_OPERAND_LEN > bytecode.len() {
+                break;
+            }
+            let bb_id = u16::from_le_bytes([bytecode[offset + 1], bytecode[offset + 2]]);
+            current_bb = Some(bb_id);
+            out.push(InsnLayout {
+                start: offset,
+                kind: InsnKind::SetBlockMap,
+                raw_len: 1 + META_OPERAND_LEN,
+            });
+            offset += 1 + META_OPERAND_LEN;
+            continue;
+        }
+        let map = current_bb
+            .map(|id| block_plan.map_for_bb_or_base(id, base_map))
+            .unwrap_or_else(|| base_map.clone());
+        let op = match map.decode(wire) {
             Some(op) => op,
             None => break,
         };
@@ -25,7 +50,7 @@ fn enumerate_instructions(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<InsnLa
         }
         out.push(InsnLayout {
             start: offset,
-            op,
+            kind: InsnKind::Semantic(op),
             raw_len,
         });
         offset += raw_len;
@@ -61,12 +86,16 @@ fn is_insn_start(insns: &[InsnLayout], value: usize) -> bool {
 }
 
 fn patch_operands_for_threaded(
-    op: OpCode,
+    kind: InsnKind,
     operands: &mut [u8],
     insns: &[InsnLayout],
     bytecode_len: usize,
     relocate: &dyn Fn(usize) -> usize,
 ) {
+    let op = match kind {
+        InsnKind::Semantic(op) => op,
+        InsnKind::SetBlockMap => return,
+    };
     match op {
         OpCode::Jmp | OpCode::Call => {
             if operands.len() >= 8 {
@@ -104,9 +133,11 @@ fn patch_operands_for_threaded(
 pub fn embed_thread_targets(
     bytecode: &[u8],
     opcode_map: &OpcodeMap,
+    block_plan: &BlockMapPlan,
     handler_off_from_table: &dyn Fn(OpCode) -> i32,
+    set_map_off: i32,
 ) -> Vec<u8> {
-    let insns = enumerate_instructions(bytecode, opcode_map);
+    let insns = enumerate_instructions(bytecode, opcode_map, block_plan);
     let code_end = code_section_end(&insns);
     let relocate = |old: usize| relocate_offset(&insns, old);
 
@@ -114,11 +145,18 @@ pub fn embed_thread_targets(
         bytecode.len() + insns.len() * THREAD_TARGET_SIZE,
     );
     for insn in &insns {
-        let handler_off = handler_off_from_table(insn.op);
+        let handler_off = match insn.kind {
+            InsnKind::SetBlockMap => set_map_off,
+            InsnKind::Semantic(op) => handler_off_from_table(op),
+        };
         out.push(bytecode[insn.start]);
         out.extend_from_slice(&handler_off.to_le_bytes());
+        if insn.kind == InsnKind::SetBlockMap {
+            out.extend_from_slice(&bytecode[insn.start + 1..insn.start + insn.raw_len]);
+            continue;
+        }
         let mut operands = bytecode[insn.start + 1..insn.start + insn.raw_len].to_vec();
-        patch_operands_for_threaded(insn.op, &mut operands, &insns, bytecode.len(), &relocate);
+        patch_operands_for_threaded(insn.kind, &mut operands, &insns, bytecode.len(), &relocate);
         out.extend_from_slice(&operands);
     }
     if code_end < bytecode.len() {
@@ -136,6 +174,17 @@ pub fn handler_offset_for_op(stub: &[u8], opcode_map: &OpcodeMap, op: OpCode) ->
         return 0;
     }
     i32::from_le_bytes(stub[patch_at..patch_at + 4].try_into().unwrap())
+}
+
+/// Handler offset for the L4e block-map refresh meta handler.
+pub fn handler_offset_for_set_block_map(stub: &[u8]) -> i32 {
+    let sig = [0x45u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
+    let table_base = handler_table_base(stub);
+    let pos = stub
+        .windows(sig.len())
+        .position(|w| w == sig)
+        .expect("h_set_block_map signature missing from stub");
+    (pos as i64 - table_base as i64) as i32
 }
 
 pub fn handler_table_base(stub: &[u8]) -> usize {
@@ -231,11 +280,17 @@ pub fn threaded_string_pool_link(
 mod tests {
     use super::*;
     use crate::pe::vm_stub::create_vm_interpreter_stub;
-    use crate::vm::DispatchMode;
+    use crate::vm::{BlockMapPlan, DispatchMode};
 
     fn stub_for(map: &OpcodeMap) -> Vec<u8> {
-        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, &[], &[], &[])
+        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, &[], &BlockMapPlan::default(), &[], &[])
             .0
+    }
+
+    fn embed(map: &OpcodeMap, stub: &[u8], raw: &[u8]) -> Vec<u8> {
+        let plan = BlockMapPlan::default();
+        let set_map = handler_offset_for_set_block_map(stub);
+        embed_thread_targets(raw, map, &plan, &|op| handler_offset_for_op(stub, map, op), set_map)
     }
 
     #[test]
@@ -249,7 +304,7 @@ mod tests {
             b.push(0);
             b
         };
-        let threaded = embed_thread_targets(&raw, &map, &|op| handler_offset_for_op(&stub, &map, op));
+        let threaded = embed(&map, &stub, &raw);
         assert_eq!(threaded.len(), raw.len() + 2 * THREAD_TARGET_SIZE);
         assert_eq!(threaded[0], raw[0]);
         assert_eq!(
@@ -272,7 +327,7 @@ mod tests {
         raw.push(map.encode(OpCode::Exit));
         raw.push(0);
 
-        let threaded = embed_thread_targets(&raw, &map, &|op| handler_offset_for_op(&stub, &map, op));
+        let threaded = embed(&map, &stub, &raw);
         let jmp_insn_start = 1 + THREAD_TARGET_SIZE + 9;
         let target = u64::from_le_bytes(
             threaded[jmp_insn_start + 1 + THREAD_TARGET_SIZE..jmp_insn_start + 1 + THREAD_TARGET_SIZE + 8]
@@ -299,7 +354,7 @@ mod tests {
         raw[2..10].copy_from_slice(&(string_off as u64).to_le_bytes());
         raw.extend_from_slice(msg);
 
-        let threaded = embed_thread_targets(&raw, &map, &|op| handler_offset_for_op(&stub, &map, op));
+        let threaded = embed(&map, &stub, &raw);
         assert!(
             threaded.windows(msg.len()).any(|w| w == msg),
             "threaded embed must preserve trailing string pool"
@@ -326,7 +381,7 @@ mod tests {
         raw[2..10].copy_from_slice(&(string_off as u64).to_le_bytes());
         raw.extend_from_slice(msg);
 
-        let threaded = embed_thread_targets(&raw, &map, &|op| handler_offset_for_op(&stub, &map, op));
+        let threaded = embed(&map, &stub, &raw);
         let imm = u64::from_le_bytes(
             threaded[1 + THREAD_TARGET_SIZE + 1..1 + THREAD_TARGET_SIZE + 9]
                 .try_into()
@@ -351,7 +406,7 @@ mod tests {
         raw[2..10].copy_from_slice(&(string_off as u64).to_le_bytes());
         raw.extend_from_slice(msg);
 
-        let threaded = embed_thread_targets(&raw, &map, &|op| handler_offset_for_op(&stub, &map, op));
+        let threaded = embed(&map, &stub, &raw);
         let imm = u64::from_le_bytes(
             threaded[1 + THREAD_TARGET_SIZE + 1..1 + THREAD_TARGET_SIZE + 9]
                 .try_into()
