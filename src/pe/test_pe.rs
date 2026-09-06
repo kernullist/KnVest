@@ -419,6 +419,75 @@ pub fn create_pe64_with_forward_crt_call() -> Vec<u8> {
     pe
 }
 
+/// MinGW-like layout: user `main` at .text+0x760, `__do_global_ctors` at .text+0x7c0.
+pub fn create_pe64_hello_vs_global_ctors() -> Vec<u8> {
+    let mut pe = Vec::new();
+
+    pe.extend_from_slice(&create_dos_header(0x80));
+    pe.extend_from_slice(&vec![0u8; 0x80 - 64]);
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&create_coff_header(1));
+    pe.extend_from_slice(&create_optional_header_pe32plus());
+    pe.extend_from_slice(&create_section_header(
+        b".text\0\0\0",
+        0x1000,
+        0x1000,
+        0x1000,
+        0x400,
+    ));
+
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    let mut text = vec![0x90u8; 0x1000];
+
+    // hello-style main: lea rcx, [rip+str]; call printf; mov eax,0; ret
+    let main_off = 0x760usize;
+    let mut o = main_off;
+    text[o..o + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+    o += 4;
+    text[o..o + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    o += 4;
+    text[o..o + 7].copy_from_slice(&[0x48, 0x8D, 0x0D, 0x10, 0x00, 0x00, 0x00]);
+    o += 7;
+    text[o] = 0xE8;
+    text[o + 1..o + 5].copy_from_slice(&0x20i32.to_le_bytes());
+    o += 5;
+    text[o..o + 5].copy_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00]);
+    o += 5;
+    text[o..o + 4].copy_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+    o += 4;
+    text[o] = 0x5D;
+    text[o + 1] = 0xC3;
+
+    // __do_global_ctors walker at higher .text offset (after main)
+    let ctor_off = 0x7c0usize;
+    let mut c = ctor_off;
+    text[c..c + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+    c += 4;
+    text[c..c + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    c += 4;
+    text[c] = 0xE8; // call __main
+    text[c + 1..c + 5].copy_from_slice(&0x10i32.to_le_bytes());
+    c += 5;
+    text[c..c + 7].copy_from_slice(&[0x48, 0x8B, 0x1D, 0x20, 0x00, 0x00, 0x00]);
+    c += 7;
+    text[c..c + 3].copy_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c += 3;
+    text[c..c + 2].copy_from_slice(&[0xFF, 0x13]); // call [rbx]
+    c += 2;
+    text[c..c + 4].copy_from_slice(&[0x48, 0x83, 0xC3, 0x08]); // add rbx, 8
+    c += 4;
+    text[c] = 0xC3;
+
+    pe.extend_from_slice(&text);
+    while pe.len() < 0x1400 {
+        pe.push(0);
+    }
+    pe
+}
+
 /// PE64 with `call rel32` to an FF 25 import thunk for puts.
 pub fn create_pe64_with_puts_thunk_call() -> Vec<u8> {
     let mut pe = create_pe64_with_imports();

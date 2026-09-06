@@ -87,11 +87,55 @@ fn score_user_main(text_data: &[u8], offset: usize) -> i32 {
             }
         }
     }
+    // Typical `return 0` epilogue in user main.
+    if w.windows(2).any(|x| x == [0x31, 0xC0]) || w.windows(5).any(|x| x == [0xB8, 0, 0, 0, 0]) {
+        score += 4;
+    }
     score
 }
 
+/// MinGW `__do_global_ctors` / CRT walker patterns that must not win over user `main`.
+fn score_crt_ctor_penalty(text_data: &[u8], offset: usize) -> i32 {
+    let end = (offset + 0x80).min(text_data.len());
+    if offset >= end {
+        return 0;
+    }
+    let w = &text_data[offset..end];
+    let mut penalty = 0i32;
+    // ctor list pointer walk: add rbx/rsi, 8
+    if w.windows(4).any(|x| x == [0x48, 0x83, 0xC3, 0x08])
+        || w.windows(4).any(|x| x == [0x48, 0x83, 0xC6, 0x08])
+    {
+        penalty += 20;
+    }
+    // indirect call through ctor table slot (call [rbx] / call rax)
+    if w.windows(2).any(|x| x == [0xFF, 0x13])
+        || w.windows(2).any(|x| x == [0xFF, 0xD0])
+        || w.windows(2).any(|x| x == [0xFF, 0x10])
+    {
+        penalty += 15;
+    }
+    // ctor-list termination test before looping back
+    if w.windows(3).any(|x| x == [0x48, 0x85, 0xC0])
+        || w.windows(3).any(|x| x == [0x48, 0x85, 0xDB])
+    {
+        penalty += 8;
+    }
+    // load ctor list head into rbx right after early `call __main`
+    if w.windows(3).any(|x| x == [0x48, 0x8B, 0x1D])
+        || w.windows(3).any(|x| x == [0x48, 0x8B, 0x35])
+    {
+        penalty += 6;
+    }
+    penalty
+}
+
+fn net_main_score(text_data: &[u8], offset: usize) -> i32 {
+    score_user_main(text_data, offset) - score_crt_ctor_penalty(text_data, offset)
+}
+
 fn looks_like_user_main(text_data: &[u8], offset: usize) -> bool {
-    score_user_main(text_data, offset) > 0
+    net_main_score(text_data, offset) > 0
 }
 
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
@@ -134,9 +178,10 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     if let Some(&(rva, offset)) = pick_from
         .iter()
         .max_by(|a, b| {
-            score_user_main(text_data, a.1)
-                .cmp(&score_user_main(text_data, b.1))
-                .then_with(|| b.1.cmp(&a.1))
+            net_main_score(text_data, a.1)
+                .cmp(&net_main_score(text_data, b.1))
+                // Prefer earlier .text offset when scores tie — user main precedes ctors on MinGW.
+                .then_with(|| a.1.cmp(&b.1))
         })
     {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
@@ -1173,6 +1218,19 @@ mod tests {
         assert!(
             !stub.windows(rsi_on_push_depth.len()).any(|w| w == rsi_on_push_depth),
             "bytecode rsi save must not use push-depth slot [rbp-0xE8]"
+        );
+    }
+
+    #[test]
+    fn test_detect_main_prefers_hello_over_global_ctors() {
+        let pe_data = test_pe::create_pe64_hello_vs_global_ctors();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let rva = super::detect_main_rva(&pe).unwrap();
+        assert_eq!(
+            rva,
+            text.virtual_address + 0x760,
+            "must pick lea+call user main, not __do_global_ctors walker"
         );
     }
 
