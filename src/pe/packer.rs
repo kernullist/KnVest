@@ -150,12 +150,38 @@ fn has_stack_local_init(body: &[u8]) -> bool {
     body.windows(2).any(|x| x[0] == 0xC7 && x[1] == 0x45)
 }
 
-/// CRT `__main` shim: short body, no stdio, forwards to another in-text candidate.
-fn is_crt___main_shim(body: &[u8], in_text_targets: usize) -> bool {
+/// CRT `__main` shim: short body, no stdio; may call in-text CRT helpers or be
+/// called from user `main` (MinGW: user main calls __main, not the reverse).
+fn is_crt___main_shim(body: &[u8], in_text_targets: usize, caller_count: usize) -> bool {
     if is_global_ctors_walker(body) || has_stdio_in_body(body) {
         return false;
     }
-    body.len() <= 0x34 && in_text_targets >= 1
+    body.len() <= 0x34 && (in_text_targets >= 1 || caller_count >= 1)
+}
+
+fn candidates_calling_target(
+    text_data: &[u8],
+    candidates: &[(u32, usize)],
+    target_off: usize,
+    body_len_at: &impl Fn(usize) -> usize,
+) -> Vec<(u32, usize)> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|&(_, off)| {
+            let len = body_len_at(off);
+            near_rel32_call_targets(text_data, off, len).contains(&target_off)
+        })
+        .collect()
+}
+
+fn count_candidate_callers(
+    text_data: &[u8],
+    candidates: &[(u32, usize)],
+    target_off: usize,
+    body_len_at: &impl Fn(usize) -> usize,
+) -> usize {
+    candidates_calling_target(text_data, candidates, target_off, body_len_at).len()
 }
 
 /// Helper like `factorial`: callee of a stdio-bearing function, no stdio itself.
@@ -163,6 +189,7 @@ fn is_in_text_helper(
     text_data: &[u8],
     offset: usize,
     body_len: usize,
+    candidates: &[(u32, usize)],
     sorted_offsets: &[usize],
     body_len_at: &impl Fn(usize) -> usize,
 ) -> bool {
@@ -182,6 +209,7 @@ fn is_in_text_helper(
                 .iter()
                 .filter(|t| sorted_offsets.contains(t))
                 .count(),
+            count_candidate_callers(text_data, candidates, *caller_off, body_len_at),
         ) {
             return false;
         }
@@ -245,33 +273,58 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
                     .iter()
                     .filter(|t| sorted_offsets.contains(t))
                     .count(),
+                count_candidate_callers(text_data, &candidates, off, &body_len_at),
             )
-            && !is_in_text_helper(text_data, off, len, &sorted_offsets, &body_len_at)
+            && !is_in_text_helper(
+                text_data,
+                off,
+                len,
+                &candidates,
+                &sorted_offsets,
+                &body_len_at,
+            )
     };
 
-    // Primary (MinGW): CRT `__main` forwards to user `main` via a single near call.
+    // Primary (MinGW): user `main` calls CRT `__main`; find callers of the shim.
     for &(shim_rva, shim_off) in &candidates {
         let shim_len = body_len_at(shim_off);
         let shim_body = &text_data[shim_off..shim_off + shim_len];
         let in_text = near_rel32_call_targets(text_data, shim_off, shim_len)
-            .into_iter()
+            .iter()
             .filter(|t| sorted_offsets.contains(t))
-            .collect::<Vec<_>>();
-        if !is_crt___main_shim(shim_body, in_text.len()) {
+            .count();
+        let callers = count_candidate_callers(text_data, &candidates, shim_off, &body_len_at);
+        if !is_crt___main_shim(shim_body, in_text, callers) {
             continue;
         }
-        for target_off in in_text {
-            if !is_eligible_user_main(target_off) {
-                continue;
-            }
-            let target_rva = text_start_rva + target_off as u32;
+        let main_callers: Vec<(u32, usize)> = candidates_calling_target(
+            text_data,
+            &candidates,
+            shim_off,
+            &body_len_at,
+        )
+        .into_iter()
+        .filter(|&(_, off)| is_eligible_user_main(off))
+        .collect();
+        if let Some(&(main_rva, main_off)) = main_callers.iter().max_by(|a, b| {
+            let a_body = &text_data[a.1..a.1 + body_len_at(a.1)];
+            let b_body = &text_data[b.1..b.1 + body_len_at(b.1)];
+            fallback_user_main_score(a_body)
+                .cmp(&fallback_user_main_score(b_body))
+                .then_with(|| {
+                    let a_stdio = has_stdio_in_body(a_body) as i32;
+                    let b_stdio = has_stdio_in_body(b_body) as i32;
+                    a_stdio.cmp(&b_stdio)
+                })
+                .then_with(|| b.1.cmp(&a.1))
+        }) {
             eprintln!(
-                "Auto-detected main at RVA {:#x} (.text+{:#x}) via CRT __main shim at {:#x}",
-                target_rva,
-                target_off,
+                "Auto-detected main at RVA {:#x} (.text+{:#x}) as caller of CRT __main at {:#x}",
+                main_rva,
+                main_off,
                 shim_rva
             );
-            return Ok(target_rva);
+            return Ok(main_rva);
         }
     }
 
