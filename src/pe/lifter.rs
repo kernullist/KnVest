@@ -2097,6 +2097,7 @@ fn lift_to_vm_bytecode_internal_with_main(
     let mut emitted_native_bb: HashSet<usize> = HashSet::new();
 
     let mut emitted_block_map: HashSet<usize> = HashSet::new();
+    let mut emitted_callee_meta: HashSet<usize> = HashSet::new();
 
     let mut hit_main_ret = false;
     let lift_indices = lift_order_indices(instrs, main_x64_offset);
@@ -2112,14 +2113,21 @@ fn lift_to_vm_bytecode_internal_with_main(
 
         label_map.insert(instr.offset, bytecode.len());
 
-        if instr.offset >= main_x64_offset {
-            if let Some(bb) = bb_for_offset(&main_blocks, instr.offset) {
-                let vm_bb = !use_partial || partial.map_or(true, |p| p.is_vm_bb(bb.id));
-                if vm_bb && !emitted_block_map.contains(&bb.id) {
-                    emit_block_map_refresh(&mut bytecode, bb.id);
-                    set_active_map(&BlockMapPlan::block_opcode_map(pack_seed, bb.id));
-                    emitted_block_map.insert(bb.id);
+        if instr.offset < main_x64_offset {
+            let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
+            if let Some(bb_id) = block_plan.callee_entry_bb_id(entry) {
+                if !emitted_callee_meta.contains(&entry) {
+                    emit_block_map_refresh(&mut bytecode, bb_id as usize);
+                    set_active_map(&BlockMapPlan::block_opcode_map(pack_seed, bb_id as usize));
+                    emitted_callee_meta.insert(entry);
                 }
+            }
+        } else if let Some(bb) = bb_for_offset(&main_blocks, instr.offset) {
+            let vm_bb = !use_partial || partial.map_or(true, |p| p.is_vm_bb(bb.id));
+            if vm_bb && !emitted_block_map.contains(&bb.id) {
+                emit_block_map_refresh(&mut bytecode, bb.id);
+                set_active_map(&BlockMapPlan::block_opcode_map(pack_seed, bb.id));
+                emitted_block_map.insert(bb.id);
             }
         }
 
@@ -2720,6 +2728,28 @@ mod tests {
         OpcodeMap::from_seed(LIFT_TEST_SEED)
     }
 
+    fn lift_plan_for(instrs: &[X64Instruction], main_off: usize) -> BlockMapPlan {
+        let mut plan = BlockMapPlan {
+            decode_key: BlockMapPlan::global_decode_key(LIFT_TEST_SEED),
+            ..Default::default()
+        };
+        for bb in build_basic_blocks(instrs, main_off) {
+            plan.record_block(LIFT_TEST_SEED, bb.id);
+        }
+        let mut callee_entries: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for i in instrs {
+            if i.offset < main_off {
+                callee_entries.insert(callee_entry_for(instrs, i.offset, main_off));
+            }
+        }
+        let mut callee_entries: Vec<_> = callee_entries.into_iter().collect();
+        callee_entries.sort_unstable();
+        for entry in callee_entries {
+            plan.record_callee_entry(LIFT_TEST_SEED, entry);
+        }
+        plan
+    }
+
     fn lift_plan() -> BlockMapPlan {
         BlockMapPlan::default()
     }
@@ -2772,6 +2802,7 @@ mod tests {
     ) -> Vec<u8> {
         let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
         let map = test_opcode_map();
+        let block_plan = lift_plan_for(instrs, main_off);
         let mut sled = NativeSledBuilder::new();
         let (bc, _) = lift_to_vm_bytecode_for_main(
             instrs,
@@ -2782,7 +2813,7 @@ mod tests {
             &ImportTable::default(),
             &map,
             None,
-            &crate::vm::BlockMapPlan::default(),
+            &block_plan,
             &mut sled,
         );
         set_active_map(&map);
@@ -3574,6 +3605,10 @@ mod tests {
         target.copy_from_slice(&bc[call_off + 1..call_off + 9]);
         let target_off = u64::from_le_bytes(target);
         assert!(target_off > 0, "internal call must jump past main, not to 0");
+        assert_eq!(
+            bc[target_off as usize], META_WIRE_BYTE,
+            "callee entry must refresh block map before executing callee bytecode"
+        );
     }
 
     #[test]
@@ -3599,6 +3634,11 @@ mod tests {
         ];
         let bc = lift_for_test(&instrs, main_off, None);
         assert_eq!(bc[0], META_WIRE_BYTE, "main must start with L4e block-map refresh");
+        let meta_count = bc.iter().filter(|&&b| b == META_WIRE_BYTE).count();
+        assert!(
+            meta_count >= 2,
+            "lifted callee blob must start with META refresh, got {meta_count} meta ops"
+        );
     }
 
     #[test]

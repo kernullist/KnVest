@@ -28,6 +28,8 @@ pub struct BlockMapEntry {
 pub struct BlockMapPlan {
     pub decode_key: u32,
     pub entries: Vec<BlockMapEntry>,
+    /// Pre-main callee function entry (file offset) → dense KNV6 bb_id.
+    pub callee_entry_bb_ids: std::collections::HashMap<usize, u16>,
 }
 
 impl BlockMapPlan {
@@ -54,6 +56,19 @@ impl BlockMapPlan {
             handler_table: [0u8; 256 * 4],
         });
         map
+    }
+
+    /// Register a pre-main callee with the next dense bb_id and remember its entry offset.
+    pub fn record_callee_entry(&mut self, pack_seed: u64, entry_offset: usize) -> u16 {
+        let bb_id = self.entries.len();
+        self.record_block(pack_seed, bb_id);
+        self.callee_entry_bb_ids
+            .insert(entry_offset, bb_id as u16);
+        bb_id as u16
+    }
+
+    pub fn callee_entry_bb_id(&self, entry_offset: usize) -> Option<u16> {
+        self.callee_entry_bb_ids.get(&entry_offset).copied()
     }
 
     pub fn map_for_bb(&self, bb_id: u16) -> Option<&BlockMapEntry> {
@@ -134,7 +149,11 @@ impl BlockMapPlan {
                 handler_table,
             });
         }
-        Some(Self { decode_key, entries })
+        Some(Self {
+            decode_key,
+            entries,
+            callee_entry_bb_ids: Default::default(),
+        })
     }
 
     pub fn format_ir_header(
@@ -449,6 +468,7 @@ mod tests {
         let mut plan = BlockMapPlan {
             decode_key: 0xAABB,
             entries: Vec::new(),
+            ..Default::default()
         };
         plan.record_block(42, 0);
         plan.record_block(42, 1);

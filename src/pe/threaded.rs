@@ -240,12 +240,15 @@ pub fn threaded_load_imm_immediates_with_blocks(
     let mut current_map = opcode_map.clone();
     while offset < bytecode.len() {
         if bytecode[offset] == META_WIRE_BYTE {
-            if offset + 1 + META_OPERAND_LEN <= bytecode.len() {
-                let bb_id = u16::from_le_bytes([bytecode[offset + 1], bytecode[offset + 2]]);
+            if offset + 1 + THREAD_TARGET_SIZE + META_OPERAND_LEN <= bytecode.len() {
+                let bb_id = u16::from_le_bytes([
+                    bytecode[offset + 1 + THREAD_TARGET_SIZE],
+                    bytecode[offset + 1 + THREAD_TARGET_SIZE + 1],
+                ]);
                 current_map = block_plan
                     .map(|p| p.map_for_bb_or_base(bb_id, opcode_map))
                     .unwrap_or_else(|| BlockMapPlan::block_opcode_map(opcode_map.seed(), bb_id as usize));
-                offset += 1 + META_OPERAND_LEN + THREAD_TARGET_SIZE;
+                offset += 1 + THREAD_TARGET_SIZE + META_OPERAND_LEN;
                 continue;
             }
             break;

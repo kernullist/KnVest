@@ -873,7 +873,10 @@ impl StubEmitter {
         self.lea_rip_rel32(0x48, 6, "bytecode"); // lea rsi, [bytecode]
         self.emit(&[0x48, 0x01, 0xF0]); // add rax, rsi — return bytecode pointer
         self.emit(&[0x48, 0x89, 0xC6]); // mov rsi, rax
-        self.jmp_rel32("h_set_block_map_resolve");
+        match self.dispatch_mode {
+            DispatchMode::Table => self.jmp_rel32("h_set_block_map_resolve"),
+            DispatchMode::Threaded => self.jmp_to_dispatch(),
+        }
     }
 
     fn emit_handler_native_call(&mut self) {
@@ -1462,6 +1465,31 @@ mod tests {
     }
 
     #[test]
+    fn h_ret_skips_block_map_refresh_in_threaded_mode() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Threaded,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let ret_sig = [0x48u8, 0x25, 0xFF, 0xFF, 0xFF, 0xFF];
+        let ret_pos = stub
+            .windows(ret_sig.len())
+            .position(|w| w == ret_sig)
+            .expect("h_ret and eax,0xffffffff");
+        let after = &stub[ret_pos..ret_pos.saturating_add(48).min(stub.len())];
+        let resolve = [0x0Fu8, 0xB7, 0x0D]; // movzx ecx, [rip+knv6_count] — start of resolve
+        assert!(
+            !after.windows(resolve.len()).any(|w| w == resolve),
+            "threaded h_ret must not jmp into h_set_block_map_resolve"
+        );
+    }
+
+    #[test]
     fn h_ret_restores_block_map_via_knv6_search() {
         let (stub, _, _, _) = create_vm_interpreter_stub(
             0,
@@ -1742,6 +1770,7 @@ mod tests {
         let mut plan = BlockMapPlan {
             decode_key: BlockMapPlan::global_decode_key(seed),
             entries: Vec::new(),
+            ..Default::default()
         };
         plan.record_block(seed, 0);
         plan.record_block(seed, 1);

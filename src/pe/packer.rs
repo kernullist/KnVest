@@ -573,9 +573,15 @@ fn translate_to_vm_bytecode(
     let mut block_map_plan = BlockMapPlan {
         decode_key: BlockMapPlan::global_decode_key(pack_seed),
         entries: Vec::new(),
+        ..Default::default()
     };
     for bb in &main_blocks {
         block_map_plan.record_block(pack_seed, bb.id);
+    }
+    for &entry in &cfg_entries {
+        if entry < file_offset {
+            block_map_plan.record_callee_entry(pack_seed, entry);
+        }
     }
     let mut sled_builder = NativeSledBuilder::new();
 
@@ -1196,7 +1202,12 @@ mod tests {
         let packed = pack_pe(&mut pe, None);
         let bc = packed.bytecode;
         let map = packed.opcode_map;
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map, crate::vm::DispatchMode::Table));
+        let ir = Instruction::pretty_print(&Instruction::disassemble_with_block_maps(
+            &bc,
+            &map,
+            Some(&packed.block_map_plan),
+            crate::vm::DispatchMode::Table,
+        ));
         assert!(
             ir.contains("native_call  | 0x1"),
             "hello must use nc1 WriteFile string path:\n{ir}"

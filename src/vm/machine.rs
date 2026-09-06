@@ -442,6 +442,7 @@ mod tests {
         let mut plan = BlockMapPlan {
             decode_key: BlockMapPlan::global_decode_key(seed),
             entries: vec![],
+            ..Default::default()
         };
         plan.record_block(seed, 0);
         plan.record_block(seed, 1);
