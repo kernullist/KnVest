@@ -392,13 +392,18 @@ impl StubEmitter {
         // mov [rip+exit_wire_cmp_slot], al
         self.emit(&[0x88, 0x05, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
-        // lea rsi, [r15+28] handler_table image in KNV6 entry
-        self.emit(&[0x49, 0x8D, 0x77, 0x1C]);
+        // push rsi — bytecode PC must survive handler-table copy
+        self.emit(&[0x56]);
+        // lea r12, [r15+28] KNV6 handler-table source (rsi is rep movsq dest index)
+        self.emit(&[0x4D, 0x8D, 0x67, 0x1C]);
         // lea rdi, [handler_table]
         self.lea_rip_rel32(0x48, 7, "handler_table");
-        // mov ecx, 128; rep movsq
+        // mov rsi, r12; mov ecx, 128; rep movsq
+        self.emit(&[0x49, 0x89, 0xE6]);
         self.emit(&[0xB9, 0x80, 0x00, 0x00, 0x00]);
         self.emit(&[0xF3, 0x48, 0xA5]);
+        // pop rsi
+        self.emit(&[0x5E]);
         self.jmp_to_dispatch();
     }
 
@@ -1205,6 +1210,42 @@ mod tests {
             &walk_region[init.len()..init.len() + advance.len()],
             advance,
             "module_loop must not advance rcx before comparing the current entry"
+        );
+    }
+
+    #[test]
+    fn set_block_map_handler_preserves_bytecode_rsi() {
+        let (stub, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let sig = [0x45u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
+        let pos = stub
+            .windows(sig.len())
+            .position(|w| w == sig)
+            .expect("h_set_block_map");
+        let body = &stub[pos..pos.saturating_add(120).min(stub.len())];
+        assert!(
+            body.contains(&0x56),
+            "h_set_block_map must push rsi before handler-table copy"
+        );
+        assert!(
+            body.contains(&0x5E),
+            "h_set_block_map must pop rsi after handler-table copy"
+        );
+        assert!(
+            !body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
+            "h_set_block_map must not lea rsi,[r15+28] (clobbers bytecode PC)"
+        );
+        assert!(
+            body.windows(4).any(|w| w == [0x4D, 0x8D, 0x67, 0x1C]),
+            "h_set_block_map must lea r12,[r15+28] for rep movsq source"
         );
     }
 

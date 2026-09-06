@@ -140,7 +140,12 @@ pub fn iat_native_call_ids_in_bytecode_with_map(
     bytecode: &[u8],
     map: &crate::vm::OpcodeMap,
 ) -> Vec<u64> {
-    iat_native_call_ids_in_bytecode_with_map_dispatch(bytecode, map, crate::vm::DispatchMode::Table)
+    iat_native_call_ids_in_bytecode_with_map_dispatch(
+        bytecode,
+        map,
+        crate::vm::DispatchMode::Table,
+        None,
+    )
 }
 
 /// IAT native_call ids from packed bytecode (table or threaded layout).
@@ -148,8 +153,9 @@ pub fn iat_native_call_ids_in_bytecode_with_map_dispatch(
     bytecode: &[u8],
     map: &crate::vm::OpcodeMap,
     dispatch_mode: crate::vm::DispatchMode,
+    block_plan: Option<&crate::vm::BlockMapPlan>,
 ) -> Vec<u64> {
-    native_call_ids_in_bytecode_with_map_dispatch(bytecode, map, dispatch_mode, None)
+    native_call_ids_in_bytecode_with_map_dispatch(bytecode, map, dispatch_mode, block_plan)
         .into_iter()
         .filter(|id| is_iat_native_call(*id))
         .collect()

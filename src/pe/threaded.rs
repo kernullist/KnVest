@@ -213,12 +213,36 @@ pub fn bytecode_prefix_offset(bytecode: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Walk threaded bytecode and collect every `load_imm` immediate.
-pub fn threaded_load_imm_immediates(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<usize> {
+pub fn threaded_load_imm_immediates(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+) -> Vec<usize> {
+    threaded_load_imm_immediates_with_blocks(bytecode, opcode_map, None)
+}
+
+/// Block-map-aware variant for L4e threaded bytecode.
+pub fn threaded_load_imm_immediates_with_blocks(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+) -> Vec<usize> {
     let mut out = Vec::new();
     let mut offset = 0;
+    let mut current_map = opcode_map.clone();
     while offset < bytecode.len() {
+        if bytecode[offset] == META_WIRE_BYTE {
+            if offset + 1 + META_OPERAND_LEN <= bytecode.len() {
+                let bb_id = u16::from_le_bytes([bytecode[offset + 1], bytecode[offset + 2]]);
+                current_map = block_plan
+                    .map(|p| p.map_for_bb_or_base(bb_id, opcode_map))
+                    .unwrap_or_else(|| BlockMapPlan::block_opcode_map(opcode_map.seed(), bb_id as usize));
+                offset += 1 + META_OPERAND_LEN + THREAD_TARGET_SIZE;
+                continue;
+            }
+            break;
+        }
         let wire = bytecode[offset];
-        let op = match opcode_map.decode(wire) {
+        let op = match current_map.decode(wire) {
             Some(op) => op,
             None => break,
         };
@@ -249,13 +273,35 @@ pub fn threaded_load_imm_points_at(
     threaded_load_imm_immediates(bytecode, opcode_map).contains(&target)
 }
 
+pub fn threaded_load_imm_points_at_with_blocks(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    target: usize,
+) -> bool {
+    threaded_load_imm_immediates_with_blocks(bytecode, opcode_map, block_plan).contains(&target)
+}
+
 /// Walk threaded bytecode and find a `load_imm` whose immediate points at `needle`.
 /// Uses prefix matching so embedded pools may include a trailing NUL after `needle`.
-pub fn threaded_load_imm_target(bytecode: &[u8], opcode_map: &OpcodeMap, needle: &[u8]) -> Option<usize> {
+pub fn threaded_load_imm_target(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    needle: &[u8],
+) -> Option<usize> {
+    threaded_load_imm_target_with_blocks(bytecode, opcode_map, None, needle)
+}
+
+pub fn threaded_load_imm_target_with_blocks(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    needle: &[u8],
+) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    for imm in threaded_load_imm_immediates(bytecode, opcode_map) {
+    for imm in threaded_load_imm_immediates_with_blocks(bytecode, opcode_map, block_plan) {
         if bytecode_starts_with_at(bytecode, imm, needle) {
             return Some(imm);
         }
@@ -269,11 +315,21 @@ pub fn threaded_string_pool_link(
     opcode_map: &OpcodeMap,
     needle: &[u8],
 ) -> Option<(usize, usize)> {
+    threaded_string_pool_link_with_blocks(bytecode, opcode_map, None, needle)
+}
+
+pub fn threaded_string_pool_link_with_blocks(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    needle: &[u8],
+) -> Option<(usize, usize)> {
     let str_off = bytecode_prefix_offset(bytecode, needle)?;
-    if threaded_load_imm_points_at(bytecode, opcode_map, str_off) {
+    if threaded_load_imm_points_at_with_blocks(bytecode, opcode_map, block_plan, str_off) {
         return Some((str_off, str_off));
     }
-    threaded_load_imm_target(bytecode, opcode_map, needle).map(|imm| (str_off, imm))
+    threaded_load_imm_target_with_blocks(bytecode, opcode_map, block_plan, needle)
+        .map(|imm| (str_off, imm))
 }
 
 #[cfg(test)]

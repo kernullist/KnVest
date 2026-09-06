@@ -29,6 +29,8 @@ pub enum OpCode {
     RunNative = 0x15,
     /// Bail out to a single native instruction sled (L4d unknown lift).
     BailNative = 0x16,
+    /// L4e block-map refresh at BB entry (meta wire 0xFD only; not in wire shuffle).
+    SetBlockMap = 0xFE,
     Exit = 0xFF,
 }
 
@@ -58,6 +60,7 @@ impl OpCode {
             0x14 => Some(OpCode::And),
             0x15 => Some(OpCode::RunNative),
             0x16 => Some(OpCode::BailNative),
+            0xFE => Some(OpCode::SetBlockMap),
             0xFF => Some(OpCode::Exit),
             _ => None,
         }
@@ -75,6 +78,7 @@ impl OpCode {
             OpCode::JmpIf => 1 + 8,
             OpCode::Push | OpCode::Pop | OpCode::Exit => 1,
             OpCode::RunNative | OpCode::BailNative => 8 + 8,
+            OpCode::SetBlockMap => 2,
         }
     }
 
@@ -103,6 +107,7 @@ impl OpCode {
             OpCode::And => "and",
             OpCode::RunNative => "run_native",
             OpCode::BailNative => "bail_native",
+            OpCode::SetBlockMap => "set_block_map",
             OpCode::Exit => "exit",
         }
     }

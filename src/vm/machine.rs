@@ -1,5 +1,6 @@
 use super::opcode::OpCode;
 use super::opcode_map::OpcodeMap;
+use super::block_map::{BlockMapPlan, META_WIRE_BYTE};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -38,6 +39,7 @@ pub struct VirtualMachine {
     memory: Vec<u8>,
     bytecode: Vec<u8>,
     opcode_map: Option<OpcodeMap>,
+    block_map_plan: Option<BlockMapPlan>,
     native_functions: HashMap<u64, fn(&mut VirtualMachine) -> VMResult<()>>,
     pub exit_code: Option<i32>,
     pub data_section: Vec<u8>,
@@ -54,6 +56,7 @@ impl VirtualMachine {
             memory: vec![0; MEMORY_SIZE],
             bytecode,
             opcode_map: None,
+            block_map_plan: None,
             native_functions: HashMap::new(),
             exit_code: None,
             data_section: Vec::new(),
@@ -63,6 +66,16 @@ impl VirtualMachine {
     pub fn with_opcode_map(bytecode: Vec<u8>, opcode_map: OpcodeMap) -> Self {
         let mut vm = Self::new(bytecode);
         vm.opcode_map = Some(opcode_map);
+        vm
+    }
+
+    pub fn with_block_maps(
+        bytecode: Vec<u8>,
+        opcode_map: OpcodeMap,
+        block_map_plan: BlockMapPlan,
+    ) -> Self {
+        let mut vm = Self::with_opcode_map(bytecode, opcode_map);
+        vm.block_map_plan = Some(block_map_plan);
         vm
     }
 
@@ -127,6 +140,15 @@ impl VirtualMachine {
         self.stack.pop().ok_or(VMError::StackUnderflow)
     }
 
+    fn read_u16(&mut self) -> VMResult<u16> {
+        if self.pc + 2 > self.bytecode.len() {
+            return Err(VMError::PCOutOfBounds);
+        }
+        let value = u16::from_le_bytes([self.bytecode[self.pc], self.bytecode[self.pc + 1]]);
+        self.pc += 2;
+        Ok(value)
+    }
+
     pub fn run(&mut self) -> VMResult<()> {
         while self.exit_code.is_none() && self.pc < self.bytecode.len() {
             self.step()?;
@@ -136,6 +158,23 @@ impl VirtualMachine {
 
     pub fn step(&mut self) -> VMResult<()> {
         let opcode_byte = self.read_u8()?;
+
+        if opcode_byte == META_WIRE_BYTE {
+            let base_seed = self
+                .opcode_map
+                .as_ref()
+                .ok_or(VMError::InvalidOpcode(opcode_byte))?
+                .seed();
+            let bb_id = self.read_u16()?;
+            let new_map = if let Some(plan) = &self.block_map_plan {
+                plan.map_for_bb_or_base(bb_id, self.opcode_map.as_ref().unwrap())
+            } else {
+                BlockMapPlan::block_opcode_map(base_seed, bb_id as usize)
+            };
+            self.opcode_map = Some(new_map);
+            return Ok(());
+        }
+
         let opcode = if let Some(map) = &self.opcode_map {
             map.decode(opcode_byte)
                 .ok_or(VMError::InvalidOpcode(opcode_byte))?
@@ -145,6 +184,9 @@ impl VirtualMachine {
 
         match opcode {
             OpCode::Nop => {},
+            OpCode::SetBlockMap => {
+                // Handled via META_WIRE_BYTE before decode; unreachable in normal bytecode.
+            },
             
             OpCode::LoadImm => {
                 let reg = self.read_u8()?;
@@ -388,6 +430,34 @@ mod tests {
         let mut vm = VirtualMachine::new(bytecode);
         vm.run().unwrap();
         assert_eq!(vm.get_register(2).unwrap(), 30);
+    }
+
+    #[test]
+    fn test_set_block_map_meta_wire_rotates_opcode_map() {
+        use crate::vm::block_map::{emit_block_map_refresh, BlockMapPlan, META_WIRE_BYTE};
+        use crate::vm::OpcodeMap;
+
+        let seed = 0x4C34_4100u64;
+        let base = OpcodeMap::from_seed(seed);
+        let mut plan = BlockMapPlan {
+            decode_key: BlockMapPlan::global_decode_key(seed),
+            entries: vec![],
+        };
+        plan.record_block(seed, 0);
+        plan.record_block(seed, 1);
+
+        let mut bytecode = Vec::new();
+        emit_block_map_refresh(&mut bytecode, 0);
+        assert_eq!(bytecode[0], META_WIRE_BYTE);
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::LoadImm));
+        bytecode.push(0);
+        bytecode.extend_from_slice(&7u64.to_le_bytes());
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::Exit));
+        bytecode.push(0);
+
+        let mut vm = VirtualMachine::with_block_maps(bytecode, base, plan);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 7);
     }
 
     #[test]

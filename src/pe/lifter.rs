@@ -769,6 +769,7 @@ fn vm_instruction_len(bytecode: &[u8], pos: usize) -> Option<usize> {
         OpCode::JmpIf => 9,
         OpCode::Push | OpCode::Pop | OpCode::Exit | OpCode::LoadByte => 1,
         OpCode::RunNative | OpCode::BailNative => 16,
+        OpCode::SetBlockMap => 2,
     };
     Some(1 + operand_bytes)
 }
@@ -2824,6 +2825,7 @@ mod tests {
             OpCode::LoadStr => 10,
             OpCode::Exit => 2,
             OpCode::RunNative | OpCode::BailNative => 17,
+            OpCode::SetBlockMap => 3,
         })
     }
 

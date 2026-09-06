@@ -70,11 +70,8 @@ impl Instruction {
                     }
                     instructions.push(Instruction {
                         offset: start_offset,
-                        opcode: OpCode::Nop,
-                        operands: vec![
-                            Operand::Immediate(u64::from(bb_id)),
-                            Operand::Unknown(b"set_block_map".to_vec()),
-                        ],
+                        opcode: OpCode::SetBlockMap,
+                        operands: vec![Operand::Immediate(u64::from(bb_id))],
                     });
                     continue;
                 }
@@ -101,7 +98,7 @@ impl Instruction {
             let mut operands = Vec::new();
 
             match opcode {
-                OpCode::Nop => {},
+                OpCode::Nop | OpCode::SetBlockMap => {},
                 
                 OpCode::LoadImm => {
                     if offset < bytecode.len() {

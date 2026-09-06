@@ -883,7 +883,8 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::pe::imports::{
-        iat_native_call_ids_in_bytecode_with_map, is_iat_native_call, is_iat_ptr_native_call,
+        iat_native_call_ids_in_bytecode_with_map_dispatch,
+        is_iat_native_call, is_iat_ptr_native_call,
         native_call_iat_ptr_id, native_call_ids_in_bytecode_with_map,
         native_call_ids_in_bytecode_with_map_dispatch,
     };
@@ -1171,9 +1172,15 @@ mod tests {
         vm: &mut crate::vm::VirtualMachine,
         bytecode: &[u8],
         map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
         putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
     ) {
-        for id in iat_native_call_ids_in_bytecode_with_map(bytecode, map) {
+        for id in iat_native_call_ids_in_bytecode_with_map_dispatch(
+            bytecode,
+            map,
+            crate::vm::DispatchMode::Table,
+            block_plan,
+        ) {
             if !is_iat_ptr_native_call(id) {
                 vm.register_native(id, putchar);
             }
@@ -1185,10 +1192,16 @@ mod tests {
         vm: &mut crate::vm::VirtualMachine,
         bytecode: &[u8],
         map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
         putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
         printf: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
     ) {
-        for id in native_call_ids_in_bytecode_with_map(bytecode, map) {
+        for id in native_call_ids_in_bytecode_with_map_dispatch(
+            bytecode,
+            map,
+            crate::vm::DispatchMode::Table,
+            block_plan,
+        ) {
             if is_iat_ptr_native_call(id) {
                 vm.register_native(id, printf);
             } else if is_iat_native_call(id) {
@@ -1240,10 +1253,25 @@ mod tests {
         assert!(
             bytecode_has_char_output_native(&bc, &map),
             "packed nested must emit at least one native_call for char output, got {:?}",
-            native_call_ids_in_bytecode_with_map(&bc, &map)
+            native_call_ids_in_bytecode_with_map_dispatch(
+                &bc,
+                &map,
+                crate::vm::DispatchMode::Table,
+                Some(&packed.block_map_plan),
+            )
         );
-        let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
-        register_packed_putchar_natives(&mut vm, &bc, &map, putchar_native);
+        let mut vm = crate::vm::VirtualMachine::with_block_maps(
+            bc.clone(),
+            map.clone(),
+            packed.block_map_plan.clone(),
+        );
+        register_packed_putchar_natives(
+            &mut vm,
+            &bc,
+            &map,
+            Some(&packed.block_map_plan),
+            putchar_native,
+        );
         vm.run().expect("nested VM run");
 
         let out = NESTED_OUT.with(|buf| buf.borrow().clone());
@@ -1300,8 +1328,19 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
-        register_packed_stdio_natives(&mut vm, &bc, &map, putchar_native, printf_native);
+        let mut vm = crate::vm::VirtualMachine::with_block_maps(
+            bc.clone(),
+            map.clone(),
+            packed.block_map_plan.clone(),
+        );
+        register_packed_stdio_natives(
+            &mut vm,
+            &bc,
+            &map,
+            Some(&packed.block_map_plan),
+            putchar_native,
+            printf_native,
+        );
         vm.run().expect("loop VM run");
 
         let out = LOOP_OUT.with(|buf| buf.borrow().clone());
@@ -1348,8 +1387,19 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
-        register_packed_stdio_natives(&mut vm, &bc, &map, putchar_native, printf_native);
+        let mut vm = crate::vm::VirtualMachine::with_block_maps(
+            bc.clone(),
+            map.clone(),
+            packed.block_map_plan.clone(),
+        );
+        register_packed_stdio_natives(
+            &mut vm,
+            &bc,
+            &map,
+            Some(&packed.block_map_plan),
+            putchar_native,
+            printf_native,
+        );
         vm.run().expect("fact VM run");
 
         let out = FACT_OUT.with(|buf| buf.borrow().clone());
@@ -1723,16 +1773,22 @@ mod tests {
         let str_off = bytecode_prefix_offset(&packed.bytecode, msg).expect(
             "threaded hello must retain embedded Hello string in bytecode",
         );
-        let (pool_off, imm) = threaded_string_pool_link(&packed.bytecode, &packed.opcode_map, msg)
+        let (pool_off, imm) = threaded::threaded_string_pool_link_with_blocks(
+            &packed.bytecode,
+            &packed.opcode_map,
+            Some(&packed.block_map_plan),
+            msg,
+        )
             .expect("load_imm must point at Hello string pool");
         assert_eq!(pool_off, str_off);
         assert!(
             packed.bytecode[imm..].starts_with(msg),
             "load_imm must reference Hello prefix at {imm}"
         );
-        let ir = Instruction::pretty_print(&Instruction::disassemble(
+        let ir = Instruction::pretty_print(&Instruction::disassemble_with_block_maps(
             &packed.bytecode,
             &packed.opcode_map,
+            Some(&packed.block_map_plan),
             packed.dispatch_mode,
         ));
         assert!(
@@ -1763,7 +1819,12 @@ mod tests {
         let str_off = bytecode_prefix_offset(&packed.bytecode, msg).expect(
             "threaded puts_hello must retain embedded string in bytecode",
         );
-        let (pool_off, imm) = threaded_string_pool_link(&packed.bytecode, &packed.opcode_map, msg)
+        let (pool_off, imm) = threaded::threaded_string_pool_link_with_blocks(
+            &packed.bytecode,
+            &packed.opcode_map,
+            Some(&packed.block_map_plan),
+            msg,
+        )
             .expect("load_imm must point at IAT puts string pool");
         assert_eq!(pool_off, str_off);
         assert!(
@@ -2175,11 +2236,7 @@ mod tests {
         assert_eq!(block_plan.entries.len(), packed.block_map_plan.entries.len());
         let insns = disasm_packed(&packed);
         assert!(
-            insns.iter().any(|i| {
-                i.operands
-                    .iter()
-                    .any(|o| matches!(o, crate::ir::Operand::Unknown(v) if v == b"set_block_map"))
-            }),
+            insns.iter().any(|i| i.opcode == OpCode::SetBlockMap),
             "IR disassembly must surface set_block_map refresh ops"
         );
     }
