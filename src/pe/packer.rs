@@ -1711,6 +1711,42 @@ mod tests {
     }
 
     #[test]
+    fn test_l4b_add_handler_polymorphism_changes_stub_not_ir() {
+        use crate::ir::Instruction;
+        use crate::pe::vm_stub::create_vm_interpreter_stub;
+
+        fn seed_for_add_variant(target: u8) -> u64 {
+            for seed in 0..512u64 {
+                if OpcodeMap::from_seed(seed).add_handler_variant() == target {
+                    return seed;
+                }
+            }
+            panic!("no seed for Add variant {target}");
+        }
+
+        let seed_a = seed_for_add_variant(0);
+        let seed_b = seed_for_add_variant(1);
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe_a = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_b = PEFile::from_bytes(pe_data).unwrap();
+        let packed_a = pack_pe_seed(&mut pe_a, None, seed_a);
+        let packed_b = pack_pe_seed(&mut pe_b, None, seed_b);
+
+        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map);
+        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map);
+        assert_ne!(stub_a, stub_b, "different Add variants must change stub bytes");
+
+        let ir_a = Instruction::pretty_print(
+            &Instruction::disassemble(&packed_a.bytecode, &packed_a.opcode_map),
+        );
+        let ir_b = Instruction::pretty_print(
+            &Instruction::disassemble(&packed_b.bytecode, &packed_b.opcode_map),
+        );
+        assert_eq!(ir_a, ir_b, "logical IR must match across Add handler variants");
+        assert!(ir_a.contains("exit"));
+    }
+
+    #[test]
     fn test_l4a_embedded_map_roundtrip_in_section() {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();

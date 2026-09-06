@@ -87,6 +87,36 @@ cargo test --release
 - Entry point: Contains JMP stub (E9 XX XX XX XX)
 - Handles overlays: New section placed after actual file size if needed
 
+### 5. L4b Add handler polymorphism (optional spot-check)
+
+When comparing two packed builds that differ only by `--seed`, logical IR and stdout should match while native Add handler bytes in `.knvest` may differ.
+
+```bash
+knvest pack sample/hello.exe -o /tmp/a.exe --seed 0x8
+knvest pack sample/hello.exe -o /tmp/b.exe --seed 0x9
+knvest ir /tmp/a.exe > /tmp/ir_a.txt
+knvest ir /tmp/b.exe > /tmp/ir_b.txt
+fc /tmp/ir_a.txt /tmp/ir_b.txt
+```
+
+Expected: IR text identical (same mnemonics/operands); `.knvest` section bytes differ (wire shuffle + handler body selection).
+
+**Variant selection (Add only, L4b):** read the pack seed from the embedded `KNV4` header (offset +5, 8-byte LE `u64`). Compute:
+
+```
+variant = splitmix64(seed ^ 0x504F4C59 ^ 3) % 3
+```
+
+where `3` is the canonical index of `Add` and `splitmix64` matches `opcode_map.rs`. The stub emits exactly one Add handler body for that variant; dispatch still uses the L4a wire-byte handler table (no runtime variant compare in the stub).
+
+| Variant | Native sequence (equivalent) |
+|---------|------------------------------|
+| 0 | `mov rax,[src1]; add rax,[src2]` |
+| 1 | `mov rax,[src1]; mov rbx,[src2]; lea rax,[rax+rbx]` |
+| 2 | store `[src1]`→`dst`, reload `dst`, `add [src2]` |
+
+To inspect handler bytes on Windows, disassemble the `.knvest` section (e.g. dumpbin /disasm or your favorite PE tool) and locate the handler table entry for the wire byte that encodes `add` for that seed.
+
 ## Technical Details
 
 ### Section Addition

@@ -6,6 +6,10 @@ pub const KNV4_VERSION: u8 = 1;
 pub const CANONICAL_OPCODE_COUNT: usize = 18;
 pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 
+/// Handler polymorphism (L4b): number of native bodies per logical opcode.
+pub const ADD_HANDLER_VARIANT_COUNT: u8 = 3;
+const HANDLER_VARIANT_SALT: u64 = 0x504F_4C59; // "POLY"
+
 /// Logical opcodes implemented by the in-process stub (stable index order).
 pub const CANONICAL_OPCODES: [OpCode; CANONICAL_OPCODE_COUNT] = [
     OpCode::Nop,
@@ -85,6 +89,15 @@ impl OpcodeMap {
 
     pub fn handler_emit_order(&self) -> &[u8; CANONICAL_OPCODE_COUNT] {
         &self.handler_emit_order
+    }
+
+    /// Native handler body index for polymorphic opcodes (L4b). Derived from pack seed.
+    pub fn handler_variant(&self, op: OpCode) -> u8 {
+        handler_variant_for(self.seed, op)
+    }
+
+    pub fn add_handler_variant(&self) -> u8 {
+        self.handler_variant(OpCode::Add)
     }
 
     pub fn encode(&self, op: OpCode) -> u8 {
@@ -192,6 +205,24 @@ fn handler_label_for(op: OpCode) -> &'static str {
     CANONICAL_HANDLER_LABELS[idx]
 }
 
+/// Polymorphic handler bodies supported per opcode (0 = single body only).
+pub fn handler_variant_count(op: OpCode) -> u8 {
+    match op {
+        OpCode::Add => ADD_HANDLER_VARIANT_COUNT,
+        _ => 1,
+    }
+}
+
+fn handler_variant_for(seed: u64, op: OpCode) -> u8 {
+    let count = handler_variant_count(op);
+    if count <= 1 {
+        return 0;
+    }
+    let idx = canonical_index(op).expect("variant for unknown opcode") as u64;
+    let mixed = splitmix64(seed ^ HANDLER_VARIANT_SALT ^ idx);
+    (mixed % u64::from(count)) as u8
+}
+
 fn wire_is_valid(wire: &[u8; CANONICAL_OPCODE_COUNT]) -> bool {
     let mut seen = [false; 256];
     for &b in wire {
@@ -287,5 +318,35 @@ mod tests {
         let a = OpcodeMap::from_seed(10);
         let b = OpcodeMap::from_seed(11);
         assert_ne!(a.handler_emit_order(), b.handler_emit_order());
+    }
+
+    #[test]
+    fn add_handler_variant_is_seed_derived_and_bounded() {
+        for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX] {
+            let map = OpcodeMap::from_seed(seed);
+            assert!(map.add_handler_variant() < ADD_HANDLER_VARIANT_COUNT);
+        }
+    }
+
+    #[test]
+    fn add_handler_variant_differs_for_some_seed_pairs() {
+        let mut seen = [false; ADD_HANDLER_VARIANT_COUNT as usize];
+        for seed in 0..64u64 {
+            seen[OpcodeMap::from_seed(seed).add_handler_variant() as usize] = true;
+        }
+        assert!(
+            seen.iter().filter(|&&v| v).count() >= 2,
+            "expected at least two Add handler variants across seeds 0..63"
+        );
+    }
+
+    #[test]
+    fn non_polymorphic_ops_always_variant_zero() {
+        let map = OpcodeMap::from_seed(0x1234);
+        for &op in &CANONICAL_OPCODES {
+            if op != OpCode::Add {
+                assert_eq!(map.handler_variant(op), 0);
+            }
+        }
     }
 }
