@@ -291,15 +291,51 @@ impl StubEmitter {
 
     fn emit_handler_add(&mut self) {
         self.label("h_add");
-        self.emit(&[0x0F, 0xB6, 0x0E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x3E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x16]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
-        self.emit(&[0x48, 0x03, 0x44, 0xD5, 0x80]);
-        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+        match self.opcode_map.add_handler_variant() {
+            0 => self.emit_handler_add_v0(),
+            1 => self.emit_handler_add_v1(),
+            _ => self.emit_handler_add_v2(),
+        }
+    }
+
+    /// Add v0: `add rax, [src2]` after loading src1 into rax.
+    fn emit_handler_add_v0(&mut self) {
+        self.emit_add_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x03, 0x44, 0xD5, 0x80]); // add rax, [rbp+rdx*8-0x80]
+        self.emit_add_store_and_dispatch();
+    }
+
+    /// Add v1: `lea rax, [rax+rbx]` after loading both operands.
+    fn emit_handler_add_v1(&mut self) {
+        self.emit_add_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit(&[0x48, 0x8D, 0x04, 0x03]); // lea rax, [rbx+rax]
+        self.emit_add_store_and_dispatch();
+    }
+
+    /// Add v2: store src1 to dst, reload dst, then add src2 (two-phase add).
+    fn emit_handler_add_v2(&mut self) {
+        self.emit_add_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
+        self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]); // mov rax, [rbp+rcx*8-0x80]
+        self.emit(&[0x48, 0x03, 0x44, 0xD5, 0x80]); // add rax, [rbp+rdx*8-0x80]
+        self.emit_add_store_and_dispatch();
+    }
+
+    fn emit_add_operand_reads(&mut self) {
+        self.emit(&[0x0F, 0xB6, 0x0E]); // movzx ecx, byte [rsi]
+        self.emit(&[0x48, 0xFF, 0xC6]); // inc rsi
+        self.emit(&[0x0F, 0xB6, 0x3E]); // movzx edi, byte [rsi]
+        self.emit(&[0x48, 0xFF, 0xC6]); // inc rsi
+        self.emit(&[0x0F, 0xB6, 0x16]); // movzx edx, byte [rsi]
+        self.emit(&[0x48, 0xFF, 0xC6]); // inc rsi
+    }
+
+    fn emit_add_store_and_dispatch(&mut self) {
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
 
@@ -1012,8 +1048,9 @@ mod tests {
             "h_push/h_pop data stack must use [rbp-0x380] (80 FC FF FF)"
         );
         assert!(
-            !stub.windows(4).any(|w| w == [0x80, 0xF6, 0xFF, 0xFF]),
-            "data stack must not use [rbp-0x980] (80 F6 FF FF — out of frame)"
+            !stub.windows(8).any(|w| w == [0x48, 0x89, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF])
+                && !stub.windows(8).any(|w| w == [0x48, 0x8B, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]),
+            "data stack push/pop must not use [rbp-0x980] (80 F6 FF FF — out of frame)"
         );
         assert!(
             !stub.windows(4).any(|w| w == [0x80, 0xFB, 0xFF, 0xFF]),
@@ -1273,5 +1310,97 @@ mod tests {
         assert_eq!(frame.get(StubFrame::reg_slot(12)), 3);
         assert_eq!(frame.get(-0xE8), 1, "only main r5 remains on data stack");
         assert_eq!(frame.get(StubFrame::data_slot(1)), 1, "stack[1] holds spilled r10");
+    }
+
+    fn handler_table_base(stub: &[u8]) -> usize {
+        let dispatch_lea = [0x48u8, 0x8D, 0x1D];
+        for i in 0..stub.len().saturating_sub(7) {
+            if stub[i..i + 3] == dispatch_lea {
+                let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
+                return ((i + 7) as isize + disp as isize) as usize;
+            }
+        }
+        panic!("dispatch lea rbx,[handler_table] not found");
+    }
+
+    fn add_handler_offset(stub: &[u8], map: &crate::vm::OpcodeMap) -> usize {
+        let table_base = handler_table_base(stub);
+        let wire = map.encode(crate::vm::OpCode::Add) as usize;
+        let off = i32::from_le_bytes([
+            stub[table_base + wire * 4],
+            stub[table_base + wire * 4 + 1],
+            stub[table_base + wire * 4 + 2],
+            stub[table_base + wire * 4 + 3],
+        ]);
+        table_base + off as usize
+    }
+
+    fn seed_for_add_variant(target: u8) -> u64 {
+        for seed in 0..512u64 {
+            if crate::vm::OpcodeMap::from_seed(seed).add_handler_variant() == target {
+                return seed;
+            }
+        }
+        panic!("no seed yields Add handler variant {target}");
+    }
+
+    /// L4b: pack-time seed picks one of several semantically equivalent Add handler bodies.
+    #[test]
+    fn add_handler_polymorphism_varies_native_bytes_by_seed() {
+        use crate::vm::opcode_map::ADD_HANDLER_VARIANT_COUNT;
+        let seed_v0 = seed_for_add_variant(0);
+        let seed_v1 = seed_for_add_variant(1);
+        let map_v0 = crate::vm::OpcodeMap::from_seed(seed_v0);
+        let map_v1 = crate::vm::OpcodeMap::from_seed(seed_v1);
+        let (stub_v0, _) = create_vm_interpreter_stub(0, 0, &map_v0);
+        let (stub_v1, _) = create_vm_interpreter_stub(0, 0, &map_v1);
+
+        let h0 = add_handler_offset(&stub_v0, &map_v0);
+        let h1 = add_handler_offset(&stub_v1, &map_v1);
+        let body_v0 = &stub_v0[h0..h0 + 48];
+        let body_v1 = &stub_v1[h1..h1 + 48];
+        assert_ne!(body_v0, body_v1, "Add handlers for variant 0 vs 1 must differ");
+
+        let lea_add = [0x48u8, 0x8D, 0x04, 0x03];
+        let direct_add = [0x48u8, 0x03, 0x44, 0xD5, 0x80];
+        assert!(
+            body_v0.windows(direct_add.len()).any(|w| w == direct_add),
+            "Add v0 must use direct add rax,[src2]"
+        );
+        assert!(
+            body_v1.windows(lea_add.len()).any(|w| w == lea_add),
+            "Add v1 must use lea rax,[rbx+rax]"
+        );
+        assert!(
+            !body_v1.windows(direct_add.len()).any(|w| w == direct_add),
+            "Add v1 must not use the v0 direct-add sequence"
+        );
+
+        if ADD_HANDLER_VARIANT_COUNT >= 3 {
+            let seed_v2 = seed_for_add_variant(2);
+            let map_v2 = crate::vm::OpcodeMap::from_seed(seed_v2);
+            let (stub_v2, _) = create_vm_interpreter_stub(0, 0, &map_v2);
+            let h2 = add_handler_offset(&stub_v2, &map_v2);
+            let body_v2 = &stub_v2[h2..h2 + 48];
+            assert_ne!(body_v0, body_v2);
+            assert_ne!(body_v1, body_v2);
+            // v2 stores partial sum before final add
+            let partial_store = [0x48u8, 0x89, 0x44, 0xCD, 0x80, 0x48, 0x8B, 0x44, 0xCD, 0x80];
+            assert!(
+                body_v2.windows(partial_store.len()).any(|w| w == partial_store),
+                "Add v2 must store src1 then reload dst before adding src2"
+            );
+        }
+    }
+
+    #[test]
+    fn add_handler_polymorphism_same_seed_is_stable() {
+        let seed = seed_for_add_variant(1);
+        let map = crate::vm::OpcodeMap::from_seed(seed);
+        let (a, _) = create_vm_interpreter_stub(0, 0, &map);
+        let (b, _) = create_vm_interpreter_stub(0, 0, &map);
+        let ha = add_handler_offset(&a, &map);
+        let hb = add_handler_offset(&b, &map);
+        assert_eq!(&a[ha..ha + 48], &b[hb..hb + 48]);
     }
 }

@@ -61,7 +61,7 @@ knvest pack input.exe -o output.exe --rva 0x1234
 knvest pack input.exe -o output.exe --seed 0xdeadbeef
 ```
 
-Each pack (or explicit `--seed`) permutes the 18 implemented opcode wire bytes and shuffles handler placement in the stub. The seed and wire table are embedded in `.knvest` immediately before the `VMBC` marker as a `KNV4` header so `knvest ir` can decode shuffled bytecode. Packing without a reproducible seed picks a random value and records it in the image.
+Each pack (or explicit `--seed`) permutes the 18 implemented opcode wire bytes, shuffles handler placement in the stub, and (L4b) selects native handler bodies for polymorphic opcodes. The seed and wire table are embedded in `.knvest` immediately before the `VMBC` marker as a `KNV4` header so `knvest ir` can decode shuffled bytecode. Handler variant indices are derived from the same seed at pack time (not stored separately). Packing without a reproducible seed picks a random value and records it in the image.
 
 ### View IR
 
@@ -107,6 +107,24 @@ Placed in `.knvest` after string blobs, 16-byte aligned, immediately before `VMB
 | 13 | 18 | Wire bytes for canonical opcodes (Nop, LoadImm, Move, …, Exit) |
 
 `knvest ir` scans `.knvest` for `KNV4`, rebuilds the decode table, and prints logical mnemonics. Raw bytecode without this header cannot be disassembled.
+
+### L4b handler polymorphism (n:1)
+
+Some logical opcodes can map to **multiple semantically equivalent native handler bodies** chosen at pack time. The stub still dispatches through the same 256-entry handler table keyed by L4a wire bytes; only the target handler bytes change.
+
+Currently polymorphic:
+
+| Logical opcode | Variants | Selection |
+|----------------|----------|-----------|
+| `add` | 3 | `splitmix64(seed ^ 0x504F4C59 ^ canonical_index(Add)) % 3` |
+
+Variant bodies (all read `dst, src1, src2` from bytecode and store `src1 + src2` into `dst`):
+
+- **v0** — `mov rax, [src1]; add rax, [src2]`
+- **v1** — `mov rax, [src1]; mov rbx, [src2]; lea rax, [rax+rbx]`
+- **v2** — store `[src1]` to `dst`, reload `dst`, then `add [src2]`
+
+Different `--seed` values therefore change Add handler machine code while IR mnemonics and program output stay the same. Extend by adding variants in `vm_stub.rs` and bumping `ADD_HANDLER_VARIANT_COUNT` in `opcode_map.rs`.
 
 Overwriting the original EP bytes with `0xCC` still works.
 
