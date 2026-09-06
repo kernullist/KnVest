@@ -825,6 +825,7 @@ mod tests {
     use crate::pe::imports::{
         iat_native_call_ids_in_bytecode_with_map, is_iat_native_call, is_iat_ptr_native_call,
         native_call_iat_ptr_id, native_call_ids_in_bytecode_with_map,
+        native_call_ids_in_bytecode_with_map_dispatch,
     };
     use crate::pe::test_pe;
     use crate::vm::{OpCode, OpcodeMap};
@@ -1701,7 +1702,11 @@ mod tests {
             packed.bytecode[imm..].starts_with(msg),
             "load_imm must reference IAT puts prefix at {imm}"
         );
-        let ids = native_call_ids_in_bytecode_with_map(&packed.bytecode, &packed.opcode_map);
+        let ids = native_call_ids_in_bytecode_with_map_dispatch(
+            &packed.bytecode,
+            &packed.opcode_map,
+            packed.dispatch_mode,
+        );
         assert!(
             ids.iter().any(|id| is_iat_ptr_native_call(*id)),
             "threaded puts_hello must keep IAT ptr native_call, got {:?}",
