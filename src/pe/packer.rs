@@ -1,7 +1,10 @@
 use super::parser::{PEFile, PEResult, PEError};
-use super::lifter::lift_to_vm_bytecode_for_main;
+use super::lifter::{
+    lift_to_vm_bytecode_for_main, native_stack_sync_pairs_from_map, prebuild_stack_map,
+};
 use super::vm_stub::create_vm_interpreter_stub;
-use super::cfg::{collect_cfg_entries, disassemble_cfg_function};
+use super::cfg::{collect_cfg_entries, disassemble_cfg_function, build_basic_blocks};
+use super::partial::{NativeSledBuilder, PartialVirtPlan, KNV5_MAGIC};
 use crate::vm::{OpcodeMap, random_seed, set_active_map, clear_active_map};
 use crate::vm::opcode_map::KNV4_MAGIC;
 
@@ -12,9 +15,17 @@ pub struct PackResult {
     pub bytecode: Vec<u8>,
     pub opcode_map: OpcodeMap,
     pub seed: u64,
+    pub partial_plan: PartialVirtPlan,
+    pub native_sleds: Vec<u8>,
+    pub native_sync: Vec<(i32, u8)>,
 }
 
-pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u64>) -> PEResult<PackResult> {
+pub fn pack_function(
+    pe: &mut PEFile,
+    function_rva: Option<u32>,
+    seed: Option<u64>,
+    partial_enabled: bool,
+) -> PEResult<PackResult> {
     let explicit_rva = function_rva.is_some();
     let target_rva = if let Some(rva) = function_rva {
         rva
@@ -26,14 +37,33 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u6
     let pack_seed = seed.unwrap_or_else(random_seed);
     let opcode_map = OpcodeMap::from_seed(pack_seed);
 
-    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva, explicit_rva, &opcode_map)?;
-    
-    add_vm_section(pe, &[], &bytecode, &opcode_map)?;
-    
+    let translated = translate_to_vm_bytecode(
+        pe,
+        target_rva,
+        original_entry_rva,
+        explicit_rva,
+        &opcode_map,
+        pack_seed,
+        partial_enabled,
+    )?;
+
+    add_vm_section(
+        pe,
+        &[],
+        &translated.bytecode,
+        &opcode_map,
+        &translated.partial_plan,
+        &translated.native_sleds,
+        &translated.native_sync,
+    )?;
+
     Ok(PackResult {
-        bytecode,
+        bytecode: translated.bytecode,
         opcode_map,
         seed: pack_seed,
+        partial_plan: translated.partial_plan,
+        native_sleds: translated.native_sleds,
+        native_sync: translated.native_sync,
     })
 }
 
@@ -370,13 +400,22 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     Ok(pe.entry_point_rva)
 }
 
+struct TranslateResult {
+    bytecode: Vec<u8>,
+    partial_plan: PartialVirtPlan,
+    native_sleds: Vec<u8>,
+    native_sync: Vec<(i32, u8)>,
+}
+
 fn translate_to_vm_bytecode(
     pe: &PEFile,
     target_rva: u32,
     _original_entry: u32,
     explicit_rva: bool,
     opcode_map: &OpcodeMap,
-) -> PEResult<Vec<u8>> {
+    pack_seed: u64,
+    partial_enabled: bool,
+) -> PEResult<TranslateResult> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
     if file_offset + 16 > pe.data.len() {
@@ -419,8 +458,20 @@ fn translate_to_vm_bytecode(
     }
 
     let string_literal = find_string_literal_in_pe(pe);
+
+    let main_blocks = build_basic_blocks(&all_instrs, file_offset);
+    let partial_plan = PartialVirtPlan::from_seed(
+        pack_seed,
+        &main_blocks,
+        file_offset,
+        pe,
+        partial_enabled,
+        &all_instrs,
+    )?;
+    let mut sled_builder = NativeSledBuilder::new();
+
     set_active_map(opcode_map);
-    let bytecode = lift_to_vm_bytecode_for_main(
+    let (bytecode, stack_map) = lift_to_vm_bytecode_for_main(
         &all_instrs,
         target_rva,
         file_offset,
@@ -428,10 +479,19 @@ fn translate_to_vm_bytecode(
         string_literal.as_deref(),
         &imports,
         opcode_map,
+        Some(&partial_plan),
+        &mut sled_builder,
     );
     clear_active_map();
 
-    Ok(bytecode)
+    let native_sleds = sled_builder.blob();
+    let native_sync = native_stack_sync_pairs_from_map(&stack_map, &all_instrs, file_offset);
+    Ok(TranslateResult {
+        bytecode,
+        partial_plan,
+        native_sleds,
+        native_sync,
+    })
 }
 
 fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
@@ -459,7 +519,15 @@ fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
     None
 }
 
-fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8], opcode_map: &OpcodeMap) -> PEResult<()> {
+fn add_vm_section(
+    pe: &mut PEFile,
+    _vm_stub_template: &[u8],
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    partial_plan: &PartialVirtPlan,
+    native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
+) -> PEResult<()> {
     let _original_entry_rva = pe.entry_point_rva;
     
     let last_section = get_last_section(pe)?;
@@ -482,7 +550,15 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8], op
     };
     
     let image_base = 0x140000000u64;
-    let (vm_stub, _) = create_vm_interpreter_stub(image_base, new_virtual_address, opcode_map);
+    let knv5 = partial_plan.to_embedded_bytes();
+    let (vm_stub, _) = create_vm_interpreter_stub(
+        image_base,
+        new_virtual_address,
+        opcode_map,
+        &knv5,
+        native_sleds,
+        native_sync,
+    );
     
     let mut section_data = Vec::new();
     section_data.extend_from_slice(&vm_stub);
@@ -644,6 +720,26 @@ pub fn extract_opcode_map_from_packed(pe: &PEFile) -> PEResult<OpcodeMap> {
     ))
 }
 
+pub fn extract_partial_plan_from_packed(pe: &PEFile) -> PEResult<PartialVirtPlan> {
+    let section = pe.get_section(".knvest")?;
+    let section_start = section.pointer_to_raw_data as usize;
+    let section_end = section_start + section.size_of_raw_data as usize;
+    if section_end > pe.data.len() {
+        return Err(PEError::InvalidPE("Section data out of bounds".to_string()));
+    }
+    let section_data = &pe.data[section_start..section_end];
+    for i in 0..section_data.len().saturating_sub(KNV5_MAGIC.len()) {
+        if &section_data[i..i + KNV5_MAGIC.len()] == KNV5_MAGIC {
+            if let Some(plan) = PartialVirtPlan::from_embedded(&section_data[i..]) {
+                return Ok(plan);
+            }
+        }
+    }
+    Err(PEError::InvalidPE(
+        "Packed image missing KNV5 partial-virt metadata (L4d)".to_string(),
+    ))
+}
+
 pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
     let knvest_section = pe.get_section(".knvest");
     
@@ -697,11 +793,15 @@ mod tests {
     const TEST_SEED: u64 = 0x4C344100;
 
     fn pack_pe(pe: &mut PEFile, rva: Option<u32>) -> PackResult {
-        pack_function(pe, rva, Some(TEST_SEED)).unwrap()
+        pack_function(pe, rva, Some(TEST_SEED), false).unwrap()
     }
 
     fn pack_pe_seed(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
-        pack_function(pe, rva, Some(seed)).unwrap()
+        pack_function(pe, rva, Some(seed), false).unwrap()
+    }
+
+    fn pack_pe_partial(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
+        pack_function(pe, rva, Some(seed), true).unwrap()
     }
 
     /// MinGW gcc 16 educational samples: user `main` at `.text+offset` (see sample/README).
@@ -1261,7 +1361,7 @@ mod tests {
     
     #[test]
     fn test_stub_encoding_correctness() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         
         let mut i = 0;
         while i < stub.len() {
@@ -1296,7 +1396,7 @@ mod tests {
 
     #[test]
     fn test_stub_does_not_clobber_writefile_slot() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
         let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1313,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_loadbyte_uses_rip_rel_bytecode_base() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
@@ -1349,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_prologue_uses_near_jb_ja_not_jl_jg() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let cmp_a = [0x83u8, 0xF8, 0x41];
         let mut found_jb = false;
         for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
@@ -1375,7 +1475,7 @@ mod tests {
     #[test]
     fn test_handler_table_resolves_handlers() {
         let map = OpcodeMap::from_seed(0);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &[]);
         let dispatch_lea = [0x48u8, 0x8D, 0x1D];
         let mut table_base = None;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1401,7 +1501,7 @@ mod tests {
 
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1495,7 +1595,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let ne_cond = [0x83u8, 0xF9, 0x02];
         let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
@@ -1527,7 +1627,7 @@ mod tests {
 
     #[test]
     fn test_h_cmp_preserves_zf_in_flag_mask() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
         assert!(
             stub.windows(mask.len()).any(|w| w == mask),
@@ -1537,7 +1637,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_taken_uses_add_rsi_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let taken_add = [0x48u8, 0x01, 0xDE];
         assert!(
             stub.windows(taken_add.len()).any(|w| w == taken_add),
@@ -1547,7 +1647,7 @@ mod tests {
 
     #[test]
     fn test_three_digit_printer_uses_rcx_buffer() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
         let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1617,7 +1717,7 @@ mod tests {
 
     #[test]
     fn test_module_next_advances_rcx_not_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let advance_rcx = [0x48u8, 0x8B, 0x09];
         let advance_rbx = [0x48u8, 0x8B, 0x1B];
         assert!(
@@ -1632,7 +1732,7 @@ mod tests {
 
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
         let pat = [0x48u8, 0x8D, 0x1D];
         let mut table_base = 0usize;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1732,8 +1832,8 @@ mod tests {
         let packed_a = pack_pe_seed(&mut pe_a, None, seed_a);
         let packed_b = pack_pe_seed(&mut pe_b, None, seed_b);
 
-        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map);
-        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map);
+        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, &[], &[], &[]);
+        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, &[], &[], &[]);
         assert_ne!(stub_a, stub_b, "different Add variants must change stub bytes");
 
         let ir_a = Instruction::pretty_print(
@@ -1768,6 +1868,573 @@ mod tests {
             bc.len() < 400,
             "forward CRT must not be lifted into bytecode, got {} bytes",
             bc.len()
+        );
+    }
+
+    #[test]
+    fn test_default_pack_full_virt_no_run_native() {
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_pe(&mut pe, None);
+        assert!(
+            packed.partial_plan.full_virt,
+            "default pack must stay full VM (L4b-compatible)"
+        );
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        assert!(
+            !packed.bytecode.contains(&run_wire),
+            "default pack must not emit run_native"
+        );
+    }
+
+    #[test]
+    fn test_l4d_partial_virt_emits_run_native_for_native_bb() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), 0x14D0_2026);
+        assert!(
+            !packed.partial_plan.full_virt,
+            "countdown loop fixture should use partial virt"
+        );
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        assert!(
+            packed.bytecode.contains(&run_wire),
+            "partial pack must emit run_native, got plan {:?}",
+            packed.partial_plan.blocks
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(
+            &packed.bytecode,
+            &packed.opcode_map,
+        ));
+        assert!(ir.contains("run_native"), "IR must show run_native:\n{ir}");
+        let plan = extract_partial_plan_from_packed(&pe).unwrap();
+        assert_eq!(plan.decode_key, packed.partial_plan.decode_key);
+
+        // Documented Windows verify seed: --partial --seed 0x14D02026
+        let sync = packed.native_sync.clone();
+        assert!(
+            sync.iter().any(|(off, _)| *off == -4),
+            "countdown loop counter [rbp-4] must sync across run_native"
+        );
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
+        assert!(
+            stub.windows(7).any(|w| w == [0x48, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]),
+            "run_native handler must persist VM frame at [rbp-0x118]"
+        );
+        assert!(
+            stub.windows(3).any(|w| w == [0x48, 0x89, 0x05]),
+            "prologue must store native frame ptr in .knvest native_frame_ptr"
+        );
+        assert_run_native_stub_uses_native_rsp(&stub);
+        assert_run_native_pre_sync_order(&stub);
+        for sled in collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map) {
+            assert_run_native_sled_straight_line(&sled);
+        }
+    }
+
+    /// In-repo evidence for Windows L4d debugging: first sled + handler contract.
+    #[test]
+    fn test_l4d_run_native_evidence_countdown_fixture() {
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        assert!(!sleds.is_empty(), "partial countdown must emit run_native sleds");
+        assert_eq!(
+            sleds[0],
+            vec![0x83, 0x6D, 0xFC, 0x01, 0xC3],
+            "first run_native sled bytes (sub dword [rbp-4],1; ret)"
+        );
+        let sync = packed.native_sync.clone();
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
+        assert_run_native_stub_uses_native_rsp(&stub);
+        // Handler contract: prologue caches native_frame_ptr; invoke lea r14 + mov rbp,r14 before sync.
+    }
+
+    fn assert_run_native_pre_sync_order(stub: &[u8]) {
+        let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
+        let run_site = stub
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .expect("h_run_native invoke prologue");
+        let bail_site = stub[run_site + 1..]
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .map(|p| run_site + 1 + p)
+            .expect("h_bail_native invoke prologue");
+        let run_body = &stub[run_site..bail_site];
+        let call_at = run_body
+            .windows(3)
+            .position(|w| w == [0x41, 0xFF, 0xD2])
+            .expect("call r10");
+        let before_call = &run_body[..call_at];
+        let sync_at = before_call
+            .windows(3)
+            .position(|w| w == [0x89, 0x45, 0xFC])
+            .expect("pre-sync mov [rbp-4], eax");
+        let prefix = &before_call[..sync_at];
+        let rbp_at = prefix
+            .windows(3)
+            .rposition(|w| w == [0x4C, 0x89, 0xF5])
+            .expect("mov rbp,r14 before first pre-sync store");
+        let between = &prefix[rbp_at + 3..];
+        assert!(
+            between.is_empty()
+                || between.starts_with(&[0x41, 0x8B, 0x47])
+                || between.starts_with(&[0x41, 0x8B, 0x87]),
+            "only r15 spill load may appear between mov rbp,r14 and first pre-sync store"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            "must mov r15,rbp before native frame switch"
+        );
+    }
+
+    fn collect_run_native_sleds(
+        bytecode: &[u8],
+        native_sleds: &[u8],
+        map: &OpcodeMap,
+    ) -> Vec<Vec<u8>> {
+        let wire = map.encode(OpCode::RunNative);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bytecode.len() {
+            if bytecode[i] == wire && i + 17 <= bytecode.len() {
+                let off = u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()) as usize;
+                if off < native_sleds.len() {
+                    let tail = &native_sleds[off..];
+                    let end = tail
+                        .iter()
+                        .position(|&b| b == 0xC3)
+                        .map(|p| p + 1)
+                        .unwrap_or(tail.len());
+                    out.push(tail[..end].to_vec());
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn assert_run_native_stub_uses_native_rsp(stub: &[u8]) {
+        let call_r10 = [0x41u8, 0xFF, 0xD2];
+        let call_at = stub
+            .windows(call_r10.len())
+            .position(|w| w == call_r10)
+            .expect("run_native handler must call r10");
+        let prefix = &stub[..call_at];
+        assert!(
+            prefix.windows(3).any(|w| w == [0x4C, 0x89, 0xF5]),
+            "run_native must mov rbp,r14 before sled call (direct lea r14 from native_stack_top)"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
+            "run_native must not mov rbp,rcx (rcx may hold VM counter)"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x4C, 0x8D, 0x35]),
+            "run_native must lea r14,[rip+native_stack_top] before native rbp switch"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x4C, 0x8B, 0x35]),
+            "run_native must not indirect-load native frame in handler"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x49, 0x89, 0xE5]),
+            "run_native must not use r13 as VM spill base"
+        );
+        assert!(
+            prefix.windows(3).any(|w| w == [0x49, 0x89, 0xEF]),
+            "run_native must mov r15,rbp before native rbp switch"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x49, 0x89, 0xFD]),
+            "run_native must not emit mov r13,rdi (wrong mov r15,rbp encoding)"
+        );
+        assert!(
+            prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
+            "run_native must lea rsp,[rbp+0x80] (call stack above [rbp-4] locals)"
+        );
+        assert!(
+            !prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "run_native must not lea rsp,[rcx+0x80] (rcx may hold stale VM reg during sync)"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x89, 0x41, 0xFC]),
+            "pre-sync must not store via [rcx-4] (rcx may hold VM counter)"
+        );
+        assert!(
+            prefix.windows(4).any(|w| w == [0x48, 0x83, 0xE4, 0xF0]),
+            "run_native must and rsp,-16 before sled call"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "run_native must not mov rsp,rcx (shadow overlaps loop counter at [rbp-4])"
+        );
+    }
+
+    fn assert_run_native_sled_straight_line(sled: &[u8]) {
+        assert!(sled.ends_with(&[0xC3]), "sled must end with ret, got {sled:02x?}");
+        let body = &sled[..sled.len() - 1];
+        assert!(!body.contains(&0xE8), "sled must not contain call rel32: {sled:02x?}");
+        assert!(
+            !body.windows(2).any(|w| w == [0xFF, 0x25] || w == [0xFF, 0x15]),
+            "sled must not contain indirect call: {sled:02x?}"
+        );
+        assert!(
+            !body.contains(&0xEB) && !body.contains(&0xE9),
+            "sled must not branch: {sled:02x?}"
+        );
+        for i in 0..body.len().saturating_sub(1) {
+            if body[i] == 0x0F {
+                let b = body[i + 1];
+                assert!(
+                    !(0x80..=0x8F).contains(&b),
+                    "sled must not contain near jcc: {sled:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_l4d_minimal_call_then_native_dec_partial() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_call_then_native_dec();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        assert!(
+            packed.bytecode.contains(&run_wire),
+            "minimal call→native fixture must emit run_native"
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(
+            &packed.bytecode,
+            &packed.opcode_map,
+        ));
+        assert!(ir.contains("run_native"), "IR must show run_native:\n{ir}");
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        assert!(!sleds.is_empty(), "expected at least one native sled");
+        assert!(
+            sleds.iter().any(|s| s.starts_with(&[0x83, 0x6D])),
+            "expected decrement sled sub [rbp+disp], got {:?}",
+            sleds
+        );
+        let sync = packed.native_sync.clone();
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
+        assert_run_native_stub_uses_native_rsp(&stub);
+        for sled in &sleds {
+            assert_run_native_sled_straight_line(sled);
+        }
+    }
+
+    #[test]
+    fn test_l4d_unknown_emits_bail_native_in_partial_mode() {
+        use crate::vm::OpCode;
+        use super::super::lifter::{X64Instruction, X64InstrKind, lift_to_vm_bytecode_for_main};
+        use super::super::partial::{NativeSledBuilder, PartialVirtPlan};
+        use super::super::cfg::{build_basic_blocks, disassemble_main_window};
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_off = pe.rva_to_file_offset(text.virtual_address).unwrap() + 0x20;
+        let text_end = pe.rva_to_file_offset(text.virtual_address).unwrap()
+            + text.size_of_raw_data as usize;
+        let mut instrs = disassemble_main_window(&pe.data, main_off, text_end);
+        let loop_idx = instrs
+            .iter()
+            .position(|i| matches!(i.kind, X64InstrKind::CmpMemImm { .. }))
+            .unwrap_or(0);
+        instrs.insert(
+            loop_idx + 1,
+            X64Instruction {
+                offset: instrs[loop_idx].offset + instrs[loop_idx].bytes.len(),
+                bytes: vec![0x0F, 0x0B],
+                kind: X64InstrKind::Unknown,
+            },
+        );
+        let blocks = build_basic_blocks(&instrs, main_off);
+        let plan = PartialVirtPlan::from_seed(0x14D0_2026, &blocks, main_off, &pe, true, &instrs).unwrap();
+        let map = OpcodeMap::from_seed(0x14D0_2026);
+        let mut sled = NativeSledBuilder::new();
+        set_active_map(&map);
+        let (bc, _) = lift_to_vm_bytecode_for_main(
+            &instrs,
+            text.virtual_address + 0x20,
+            main_off,
+            &pe,
+            None,
+            &pe.parse_imports().unwrap(),
+            &map,
+            Some(&plan),
+            &mut sled,
+        );
+        clear_active_map();
+        let bail_wire = map.encode(OpCode::BailNative);
+        assert!(
+            bc.contains(&bail_wire),
+            "Unknown in VM BB must emit bail_native in partial mode"
+        );
+        assert!(!sled.sleds.is_empty(), "bail_native needs a native sled");
+    }
+
+    #[test]
+    fn test_l4d_prologue_frame_setup_bb_cannot_run_native() {
+        use super::super::lifter::{X64Instruction, X64InstrKind, X64Reg};
+        use super::super::cfg::BasicBlock;
+        use super::super::partial::bb_can_run_native;
+
+        let instrs = vec![
+            X64Instruction {
+                offset: 0x100,
+                bytes: vec![0x48, 0x89, 0xE5],
+                kind: X64InstrKind::MovRegReg {
+                    dst: X64Reg::Rbp,
+                    src: X64Reg::Rsp,
+                },
+            },
+            X64Instruction {
+                offset: 0x103,
+                bytes: vec![0x48, 0x83, 0xEC, 0x20],
+                kind: X64InstrKind::SubRegImm {
+                    reg: X64Reg::Rsp,
+                    imm: 0x20,
+                },
+            },
+            X64Instruction {
+                offset: 0x107,
+                bytes: vec![0xC7, 0x45, 0xFC, 0x03, 0x00, 0x00, 0x00],
+                kind: X64InstrKind::MovMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                    imm: 3,
+                },
+            },
+        ];
+        let bb = BasicBlock {
+            id: 0,
+            start: 0x100,
+            end: 0x10E,
+            leader_idx: 0,
+            tail_idx: 2,
+            has_back_edge: false,
+            native_eligible: true,
+            is_loop_header: false,
+        };
+        let block_refs = vec![&bb];
+        assert!(
+            !bb_can_run_native(&instrs, &bb, &block_refs, 0x100),
+            "prologue mov rbp,rsp / sub rsp must not become run_native sled"
+        );
+    }
+
+    #[test]
+    fn test_l4d_seed_14d02026_no_run_native_before_loop() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let main_off = pe.rva_to_file_offset(main_rva).unwrap();
+        let text_end = pe.rva_to_file_offset(text.virtual_address).unwrap()
+            + text.size_of_raw_data as usize;
+        let instrs = super::super::cfg::disassemble_main_window(&pe.data, main_off, text_end);
+        let blocks = super::super::cfg::build_basic_blocks(&instrs, main_off);
+        let loop_start = blocks
+            .iter()
+            .filter(|b| b.is_loop_header)
+            .map(|b| b.start)
+            .min()
+            .expect("loop header in countdown fixture");
+
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        assert!(!sleds.is_empty(), "partial countdown must emit run_native sleds");
+        assert_eq!(
+            sleds[0],
+            vec![0x83, 0x6D, 0xFC, 0x01, 0xC3],
+            "first run_native sled must be sub dword [rbp-4],1; ret"
+        );
+
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        let mut i = 0usize;
+        while i < packed.bytecode.len() {
+            if packed.bytecode[i] == run_wire && i + 17 <= packed.bytecode.len() {
+                let orig_rva =
+                    u64::from_le_bytes(packed.bytecode[i + 9..i + 17].try_into().unwrap()) as u32;
+                assert!(
+                    orig_rva >= loop_start as u32,
+                    "run_native orig_rva {orig_rva:#x} must not precede loop head {loop_start:#x}:\n{}",
+                    Instruction::pretty_print(&Instruction::disassemble(
+                        &packed.bytecode,
+                        &packed.opcode_map
+                    ))
+                );
+            }
+            i += 1;
+        }
+
+        for entry in &packed.partial_plan.blocks {
+            if entry.virtualized {
+                continue;
+            }
+            assert!(
+                entry.start_rva >= loop_start as u32,
+                "plan-native BB {} at {:#x} must not precede loop head {:#x}",
+                entry.id,
+                entry.start_rva,
+                loop_start
+            );
+        }
+    }
+
+    #[test]
+    fn test_l4d_native_sleds_must_not_touch_host_rbp_rsp() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let sleds = collect_run_native_sleds(&packed.bytecode, &packed.native_sleds, &packed.opcode_map);
+        for sled in &sleds {
+            let body = &sled[..sled.len().saturating_sub(1)];
+            assert!(
+                !body.windows(3).any(|w| w == [0x48, 0x89, 0xE5]),
+                "sled must not contain mov rbp,rsp (clobbers VM/native frame): {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w == [0x48, 0x89, 0xE1]),
+                "sled must not contain mov rcx,rsp: {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w == [0x48, 0x89, 0xEC]),
+                "sled must not contain mov rsp,rbp: {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w == [0x48, 0x89, 0xCC]),
+                "sled must not contain mov rsp,rsp: {sled:02x?}"
+            );
+            assert!(
+                !body.windows(4).any(|w| w.starts_with(&[0x48, 0x83, 0xEC])
+                    || w.starts_with(&[0x48, 0x83, 0xC4])
+                    || w.starts_with(&[0x48, 0x81, 0xEC])
+                    || w.starts_with(&[0x48, 0x81, 0xC4])),
+                "sled must not adjust host rsp: {sled:02x?}"
+            );
+        }
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        let nc_wire = packed.opcode_map.encode(OpCode::NativeCall);
+        let first_rn = packed.bytecode.iter().position(|&b| b == run_wire);
+        let first_nc = packed.bytecode.iter().position(|&b| b == nc_wire);
+        if let (Some(rn), Some(nc)) = (first_rn, first_nc) {
+            assert!(
+                rn > nc,
+                "run_native must not precede first native_call (printf) in bytecode:\n{}",
+                Instruction::pretty_print(&Instruction::disassemble(
+                    &packed.bytecode,
+                    &packed.opcode_map
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn test_l4d_stub_has_native_sled_handlers() {
+        let map = OpcodeMap::from_seed(0xDEAD_BEEF);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &[]);
+        let call_r10 = [0x41u8, 0xFF, 0xD2];
+        assert!(
+            stub.windows(call_r10.len()).any(|w| w == call_r10),
+            "L4d native sled invoke must call r10 (not rax) to avoid IAT clash"
+        );
+    }
+
+    #[test]
+    fn test_packed_native_sync_matches_lift_stack_map_for_counter() {
+        let seed = 0x14D0_2026;
+        let pe_data = test_pe::create_pe64_call_then_native_dec();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let main_off = pe.rva_to_file_offset(main_rva).unwrap();
+        let text_end = pe.rva_to_file_offset(text.virtual_address).unwrap()
+            + text.size_of_raw_data as usize;
+        let imports = pe.parse_imports().unwrap();
+        let mut all_instrs = Vec::new();
+        let cfg = super::super::cfg::collect_cfg_entries(
+            &pe,
+            main_off,
+            main_off,
+            pe.rva_to_file_offset(text.virtual_address).unwrap(),
+            text_end,
+            &imports,
+            false,
+        )
+        .unwrap();
+        for entry in cfg {
+            let instrs = super::super::cfg::disassemble_cfg_function(
+                &pe.data[entry..entry + super::super::cfg::MAX_FUNCTION_BYTES.min(pe.data.len() - entry)],
+                entry,
+            );
+            all_instrs.extend(instrs);
+        }
+        all_instrs.sort_by_key(|i| i.offset);
+        let blocks = build_basic_blocks(&all_instrs, main_off);
+        let plan = PartialVirtPlan::from_seed(seed, &blocks, main_off, &pe, true, &all_instrs).unwrap();
+        let map = OpcodeMap::from_seed(seed);
+        let mut sled = NativeSledBuilder::new();
+        set_active_map(&map);
+        let (_, lift_map) = lift_to_vm_bytecode_for_main(
+            &all_instrs,
+            main_rva,
+            main_off,
+            &pe,
+            None,
+            &imports,
+            &map,
+            Some(&plan),
+            &mut sled,
+        );
+        clear_active_map();
+        let packed = pack_pe_partial(&mut pe, Some(main_rva), seed);
+        let prebuild = prebuild_stack_map(&all_instrs);
+        if prebuild.get(&-4) != lift_map.get(&-4) {
+            assert_ne!(
+                prebuild.get(&-4),
+                packed.native_sync.iter().find(|(o, _)| *o == -4).map(|(_, r)| r),
+                "packed sync must follow lift map, not prebuild file order"
+            );
+        }
+        let sync_reg = packed
+            .native_sync
+            .iter()
+            .find(|(off, _)| *off == -4)
+            .map(|(_, reg)| *reg)
+            .expect("counter [rbp-4] sync pair");
+        assert_eq!(
+            lift_map.get(&-4),
+            Some(&sync_reg),
+            "native_sync must use lifter stack_map for [rbp-4]"
         );
     }
 }

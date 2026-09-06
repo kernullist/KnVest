@@ -3,7 +3,7 @@ use std::cell::RefCell;
 
 pub const KNV4_MAGIC: &[u8; 4] = b"KNV4";
 pub const KNV4_VERSION: u8 = 1;
-pub const CANONICAL_OPCODE_COUNT: usize = 18;
+pub const CANONICAL_OPCODE_COUNT: usize = 20;
 pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 
 /// Handler polymorphism (L4b): number of native bodies per logical opcode.
@@ -29,6 +29,8 @@ pub const CANONICAL_OPCODES: [OpCode; CANONICAL_OPCODE_COUNT] = [
     OpCode::LoadByte,
     OpCode::Cmp32,
     OpCode::And,
+    OpCode::RunNative,
+    OpCode::BailNative,
     OpCode::Exit,
 ];
 
@@ -51,6 +53,8 @@ pub const CANONICAL_HANDLER_LABELS: [&str; CANONICAL_OPCODE_COUNT] = [
     "h_load_byte",
     "h_cmp32",
     "h_and",
+    "h_run_native",
+    "h_bail_native",
     "h_exit",
 ];
 

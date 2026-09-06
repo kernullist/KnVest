@@ -6,6 +6,7 @@ pub mod vm_stub;
 pub mod imports;
 pub mod cfg;
 pub mod thunk;
+pub mod partial;
 
 pub use parser::{PEFile, PEError};
 pub use packer::pack_function;

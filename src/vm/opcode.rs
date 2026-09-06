@@ -25,6 +25,10 @@ pub enum OpCode {
     /// 32-bit dword compare (MinGW `cmpl` on stack locals); nested u32 only.
     Cmp32 = 0x13,
     And = 0x14,
+    /// Execute a native sled copied into `.knvest` (L4d partial virt).
+    RunNative = 0x15,
+    /// Bail out to a single native instruction sled (L4d unknown lift).
+    BailNative = 0x16,
     Exit = 0xFF,
 }
 
@@ -52,6 +56,8 @@ impl OpCode {
             0x12 => Some(OpCode::LoadStr),
             0x13 => Some(OpCode::Cmp32),
             0x14 => Some(OpCode::And),
+            0x15 => Some(OpCode::RunNative),
+            0x16 => Some(OpCode::BailNative),
             0xFF => Some(OpCode::Exit),
             _ => None,
         }
@@ -80,6 +86,8 @@ impl OpCode {
             OpCode::LoadStr => "load_str",
             OpCode::Cmp32 => "cmp32",
             OpCode::And => "and",
+            OpCode::RunNative => "run_native",
+            OpCode::BailNative => "bail_native",
             OpCode::Exit => "exit",
         }
     }

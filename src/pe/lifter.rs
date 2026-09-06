@@ -5,8 +5,11 @@ use super::imports::{
     ImportTable,
 };
 use super::parser::PEFile;
+use super::partial::{bb_can_run_native, native_sled_instr_range, NativeSledBuilder, PartialVirtPlan};
+use super::cfg::{BasicBlock, build_basic_blocks};
 use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct X64Instruction {
@@ -762,6 +765,7 @@ fn vm_instruction_len(bytecode: &[u8], pos: usize) -> Option<usize> {
         OpCode::Jmp | OpCode::Call | OpCode::NativeCall | OpCode::LoadStr => 8,
         OpCode::JmpIf => 9,
         OpCode::Push | OpCode::Pop | OpCode::Exit | OpCode::LoadByte => 1,
+        OpCode::RunNative | OpCode::BailNative => 16,
     };
     Some(1 + operand_bytes)
 }
@@ -1550,9 +1554,11 @@ pub fn lift_to_vm_bytecode_for_main(
     printf_literal: Option<&[u8]>,
     imports: &ImportTable,
     opcode_map: &OpcodeMap,
-) -> Vec<u8> {
+    partial: Option<&PartialVirtPlan>,
+    sled_builder: &mut NativeSledBuilder,
+) -> (Vec<u8>, std::collections::HashMap<i32, u8>) {
     set_active_map(opcode_map);
-    let (mut bytecode, _, string_patch_positions, _main_has_printf, _) =
+    let (mut bytecode, _, string_patch_positions, _main_has_printf, _, stack_map) =
         lift_to_vm_bytecode_internal_with_main(
             instrs,
             base_rva,
@@ -1560,6 +1566,8 @@ pub fn lift_to_vm_bytecode_for_main(
             pe,
             printf_literal,
             imports,
+            partial,
+            sled_builder,
         );
     clear_active_map();
 
@@ -1589,7 +1597,82 @@ pub fn lift_to_vm_bytecode_for_main(
         }
     }
 
-    bytecode
+    (bytecode, stack_map)
+}
+
+fn emit_run_native(bytecode: &mut Vec<u8>, sled_offset: u64, orig_rva: u64) {
+    bytecode.push(active_encode(OpCode::RunNative));
+    bytecode.extend_from_slice(&sled_offset.to_le_bytes());
+    bytecode.extend_from_slice(&orig_rva.to_le_bytes());
+}
+
+fn emit_bail_native(bytecode: &mut Vec<u8>, sled_offset: u64, orig_rva: u64) {
+    bytecode.push(active_encode(OpCode::BailNative));
+    bytecode.extend_from_slice(&sled_offset.to_le_bytes());
+    bytecode.extend_from_slice(&orig_rva.to_le_bytes());
+}
+
+fn bb_for_offset(blocks: &[BasicBlock], offset: usize) -> Option<&BasicBlock> {
+    blocks
+        .iter()
+        .find(|b| offset >= b.start && offset < b.end)
+}
+
+fn rbp_local_offset(kind: &X64InstrKind) -> Option<i32> {
+    match kind {
+        X64InstrKind::MovMemImm { base, offset, .. }
+        | X64InstrKind::MovMemReg { base, offset, .. }
+        | X64InstrKind::MovRegMem { base, offset, .. }
+        | X64InstrKind::SubMemImm { base, offset, .. }
+        | X64InstrKind::AddMemImm { base, offset, .. }
+        | X64InstrKind::CmpMemImm { base, offset, .. }
+            if *base == X64Reg::Rbp || *base == X64Reg::Ebp =>
+        {
+            Some(*offset)
+        }
+        _ => None,
+    }
+}
+
+/// Spill sync pairs for `run_native` using the lifter's stack_map (main rbp locals only).
+pub fn native_stack_sync_pairs_from_map(
+    stack_map: &std::collections::HashMap<i32, u8>,
+    instrs: &[X64Instruction],
+    main_x64_offset: usize,
+) -> Vec<(i32, u8)> {
+    let main_offs: std::collections::HashSet<i32> = instrs
+        .iter()
+        .filter(|i| i.offset >= main_x64_offset)
+        .filter_map(|i| rbp_local_offset(&i.kind))
+        .collect();
+    let mut pairs: Vec<(i32, u8)> = stack_map
+        .iter()
+        .filter(|(off, _)| main_offs.contains(off))
+        .map(|(&off, &reg)| (off, reg))
+        .collect();
+    pairs.sort_unstable_by_key(|(off, _)| *off);
+    pairs
+}
+
+/// Legacy prebuild order (file offset, callees first) — must not be used for run_native sync.
+pub fn prebuild_stack_map(instrs: &[X64Instruction]) -> std::collections::HashMap<i32, u8> {
+    let mut stack_map = std::collections::HashMap::new();
+    let mut next_stack_reg = VM_STACK_SPILL_REG_FIRST;
+    for instr in instrs {
+        if let Some(off) = rbp_local_offset(&instr.kind) {
+            stack_map
+                .entry(off)
+                .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
+        }
+    }
+    stack_map
+}
+
+/// All rbp-local slots that need bidirectional sync across `run_native` transitions.
+pub fn native_stack_sync_pairs(instrs: &[X64Instruction]) -> Vec<(i32, u8)> {
+    let mut pairs: Vec<(i32, u8)> = prebuild_stack_map(instrs).into_iter().collect();
+    pairs.sort_unstable_by_key(|(off, _)| *off);
+    pairs
 }
 
 fn lift_to_vm_bytecode_internal(
@@ -1937,12 +2020,15 @@ fn lift_to_vm_bytecode_internal_with_main(
     pe: &PEFile,
     printf_literal: Option<&[u8]>,
     imports: &ImportTable,
+    partial: Option<&PartialVirtPlan>,
+    sled_builder: &mut NativeSledBuilder,
 ) -> (
     Vec<u8>,
     std::collections::HashMap<usize, usize>,
     Vec<usize>,
     bool,
     Option<Vec<u8>>,
+    std::collections::HashMap<i32, u8>,
 ) {
     let mut bytecode = Vec::new();
     let mut label_map = std::collections::HashMap::new();
@@ -1995,6 +2081,12 @@ fn lift_to_vm_bytecode_internal_with_main(
         || printf_literal.is_some();
     let u32_semantics = has_putchar_callees;
 
+    let main_blocks = build_basic_blocks(instrs, main_x64_offset);
+    let main_block_refs: Vec<&BasicBlock> = main_blocks.iter().collect();
+    let use_partial = partial.map_or(false, |p| !p.full_virt);
+    let mut skip_until_offset: Option<usize> = None;
+    let mut emitted_native_bb: HashSet<usize> = HashSet::new();
+
     let mut hit_main_ret = false;
     let lift_indices = lift_order_indices(instrs, main_x64_offset);
     let mut skip_remaining = 0usize;
@@ -2006,6 +2098,44 @@ fn lift_to_vm_bytecode_internal_with_main(
         }
         let instr = &instrs[idx];
         label_map.insert(instr.offset, bytecode.len());
+
+        if use_partial && instr.offset >= main_x64_offset {
+            if let Some(until) = skip_until_offset {
+                if instr.offset < until {
+                    continue;
+                }
+                skip_until_offset = None;
+            }
+            if let (Some(plan), Some(bb)) = (partial, bb_for_offset(&main_blocks, instr.offset)) {
+                if !plan.is_vm_bb(bb.id)
+                    && bb_can_run_native(instrs, bb, &main_block_refs, main_x64_offset)
+                {
+                    if !emitted_native_bb.contains(&bb.id) {
+                        if let Ok((sled_idx, orig_rva)) =
+                            sled_builder.add_range_sled(pe, instrs, bb)
+                        {
+                            let sled_off = sled_builder.sled_offset(sled_idx);
+                            let vm_pc = bytecode.len();
+                            emit_run_native(&mut bytecode, sled_off, orig_rva as u64);
+                            if let Some((start_idx, end_idx)) = native_sled_instr_range(instrs, bb)
+                            {
+                                for j in start_idx..=end_idx {
+                                    label_map.insert(instrs[j].offset, vm_pc);
+                                }
+                            }
+                            emitted_native_bb.insert(bb.id);
+                        }
+                    }
+                    if let Some((_, end_idx)) = native_sled_instr_range(instrs, bb) {
+                        let prefix_end = instrs[end_idx].offset + instrs[end_idx].bytes.len();
+                        if instr.offset < prefix_end {
+                            skip_until_offset = Some(prefix_end);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         if let Some(fused_end_pos) = try_fuse_index_base_mov_pair(
             instrs,
@@ -2506,9 +2636,16 @@ fn lift_to_vm_bytecode_internal_with_main(
             }
             X64InstrKind::Lea { .. }
             | X64InstrKind::Nop
-            | X64InstrKind::Unknown
             | X64InstrKind::Cdqe
             | X64InstrKind::Movsxd { .. } => {}
+            X64InstrKind::Unknown => {
+                if use_partial {
+                    if let Ok((sled_idx, orig_rva)) = sled_builder.add_instr_sled(pe, instr) {
+                        let sled_off = sled_builder.sled_offset(sled_idx);
+                        emit_bail_native(&mut bytecode, sled_off, orig_rva as u64);
+                    }
+                }
+            }
         }
     }
 
@@ -2537,6 +2674,7 @@ fn lift_to_vm_bytecode_internal_with_main(
         string_patch_positions,
         main_has_printf,
         None,
+        stack_map,
     )
 }
 
@@ -2559,7 +2697,8 @@ mod tests {
     ) -> Vec<u8> {
         let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
         let map = test_opcode_map();
-        let bc = lift_to_vm_bytecode_for_main(
+        let mut sled = NativeSledBuilder::new();
+        let (bc, _) = lift_to_vm_bytecode_for_main(
             instrs,
             0x1000,
             main_off,
@@ -2567,6 +2706,8 @@ mod tests {
             literal,
             &ImportTable::default(),
             &map,
+            None,
+            &mut sled,
         );
         set_active_map(&map);
         bc
@@ -2607,6 +2748,7 @@ mod tests {
             OpCode::LoadByte => 3,
             OpCode::LoadStr => 10,
             OpCode::Exit => 2,
+            OpCode::RunNative | OpCode::BailNative => 17,
         })
     }
 
@@ -2653,6 +2795,58 @@ mod tests {
     }
 
     #[test]
+    fn prebuild_stack_map_mismatches_lift_when_premain_callee_has_rbp_locals() {
+        use crate::pe::parser::PEFile;
+        use crate::pe::imports::ImportTable;
+
+        let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
+        let callee_off = 0x410usize;
+        let main_off = 0x420usize;
+        let instrs = vec![
+            X64Instruction {
+                offset: callee_off,
+                bytes: vec![0xC7, 0x45, 0xF8, 0, 0, 0, 0],
+                kind: X64InstrKind::MovMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -8,
+                    imm: 0,
+                },
+            },
+            X64Instruction {
+                offset: main_off,
+                bytes: vec![0xC7, 0x45, 0xFC, 3, 0, 0, 0],
+                kind: X64InstrKind::MovMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                    imm: 3,
+                },
+            },
+        ];
+        let pre = prebuild_stack_map(&instrs);
+        let map = test_opcode_map();
+        let mut sled = NativeSledBuilder::new();
+        set_active_map(&map);
+        let (_, lift) = lift_to_vm_bytecode_for_main(
+            &instrs,
+            0x1000,
+            main_off,
+            &pe,
+            None,
+            &ImportTable::default(),
+            &map,
+            None,
+            &mut sled,
+        );
+        clear_active_map();
+        assert_eq!(pre.get(&-8), Some(&10));
+        assert_eq!(pre.get(&-4), Some(&11));
+        assert_eq!(lift.get(&-4), Some(&10));
+        assert_eq!(lift.get(&-8), Some(&11));
+        let sync = native_stack_sync_pairs_from_map(&lift, &instrs, main_off);
+        assert_eq!(sync.iter().find(|(o, _)| *o == -4).map(|(_, r)| *r), Some(10));
+    }
+
+    #[test]
     fn alloc_stack_spill_reg_never_exceeds_vm_max() {
         let mut next = VM_STACK_SPILL_REG_FIRST;
         let regs: Vec<u8> = (0..32).map(|_| alloc_stack_spill_reg(&mut next)).collect();
@@ -2689,7 +2883,8 @@ mod tests {
         let instrs = disassemble_cfg_function(code, main_off);
         let map = test_opcode_map();
         set_active_map(&map);
-        let bc = lift_to_vm_bytecode_for_main(
+        let mut sled = NativeSledBuilder::new();
+        let (bc, _) = lift_to_vm_bytecode_for_main(
             &instrs,
             text.virtual_address + 0x20,
             main_off,
@@ -2697,6 +2892,8 @@ mod tests {
             None,
             &imports,
             &map,
+            None,
+            &mut sled,
         );
         set_active_map(&map);
         let ids = native_call_ids(&bc);
@@ -2776,7 +2973,8 @@ mod tests {
         let msg = b"IAT puts hello\0";
         let map = test_opcode_map();
         set_active_map(&map);
-        let bc = lift_to_vm_bytecode_for_main(
+        let mut sled = NativeSledBuilder::new();
+        let (bc, _) = lift_to_vm_bytecode_for_main(
             &instrs,
             text.virtual_address + 0x20,
             main_off,
@@ -2784,6 +2982,8 @@ mod tests {
             Some(msg),
             &imports,
             &map,
+            None,
+            &mut sled,
         );
         set_active_map(&map);
         let ids = native_call_ids(&bc);
@@ -2828,7 +3028,8 @@ mod tests {
         );
         let map = test_opcode_map();
         set_active_map(&map);
-        let bc = lift_to_vm_bytecode_for_main(
+        let mut sled = NativeSledBuilder::new();
+        let (bc, _) = lift_to_vm_bytecode_for_main(
             &instrs,
             text.virtual_address,
             main_off,
@@ -2836,6 +3037,8 @@ mod tests {
             None,
             &imports,
             &map,
+            None,
+            &mut sled,
         );
         set_active_map(&map);
         let ids = native_call_ids(&bc);

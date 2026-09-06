@@ -343,6 +343,11 @@ impl VirtualMachine {
                 let code = self.get_register(code_reg)? as i32;
                 self.exit_code = Some(code);
             },
+
+            OpCode::RunNative | OpCode::BailNative => {
+                let _sled_offset = self.read_u64()?;
+                let _orig_rva = self.read_u64()?;
+            },
         }
 
         Ok(())

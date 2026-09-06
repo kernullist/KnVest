@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         Commands::Ir { input } => {
             handle_ir_command(input)?;
         }
-        Commands::Pack { input, output, rva, seed } => {
+        Commands::Pack { input, output, rva, seed, partial } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
                 Some(u32::from_str_radix(rva_str, 16)?)
@@ -27,7 +27,7 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            handle_pack_command(input, output, rva_value, seed_value)?;
+            handle_pack_command(input, output, rva_value, seed_value, partial)?;
         }
     }
 
@@ -47,7 +47,12 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     let pe = PEFile::from_file(&input)?;
     
     let opcode_map = packer::extract_opcode_map_from_packed(&pe)?;
+    let partial_plan = packer::extract_partial_plan_from_packed(&pe).ok();
     let bytecode = packer::extract_bytecode_from_packed(&pe)?;
+    
+    if let Some(plan) = partial_plan {
+        print!("{}", plan.format_ir_header(&opcode_map));
+    }
     
     let instructions = ir::Instruction::disassemble(&bytecode, &opcode_map);
     let output = ir::Instruction::pretty_print(&instructions);
@@ -62,8 +67,9 @@ fn handle_pack_command(
     output: std::path::PathBuf,
     rva: Option<u32>,
     seed: Option<u64>,
+    partial: bool,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed)?;
+    pack::pack_executable(&input, &output, rva, seed, partial)?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }

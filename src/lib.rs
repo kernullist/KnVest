@@ -6,6 +6,7 @@ pub mod pack;
 pub use pe::test_pe;
 pub use vm::{OpCode, OpcodeMap};
 pub use pe::{PEFile, packer};
+pub use pe::partial::{PartialVirtPlan, KNV5_MAGIC};
 pub use ir::Instruction;
 
 pub fn pack_executable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
@@ -13,8 +14,9 @@ pub fn pack_executable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     output: Q,
     rva: Option<u32>,
     seed: Option<u64>,
+    partial: bool,
 ) -> anyhow::Result<OpcodeMap> {
-    pack::pack_executable(input, output, rva, seed)
+    pack::pack_executable(input, output, rva, seed, partial)
 }
 
 pub fn extract_opcode_map(pe: &PEFile) -> Result<OpcodeMap, pe::PEError> {
@@ -31,4 +33,8 @@ pub fn disassemble(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<Instruction> 
 
 pub fn pretty_print(instructions: &[Instruction]) -> String {
     Instruction::pretty_print(instructions)
+}
+
+pub fn extract_partial_plan(pe: &PEFile) -> Result<PartialVirtPlan, pe::PEError> {
+    packer::extract_partial_plan_from_packed(pe)
 }
