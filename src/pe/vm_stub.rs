@@ -19,7 +19,7 @@ use std::collections::HashMap;
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
 //   VM frame save  [rbp-0x118]                  (run_native re-anchors r13 from here)
-//   native side    [rbp-0x110]                  (persistent native frame ptr for L4d run_native)
+//   native side    native_frame_ptr in .knvest   (absolute ptr; init once in prologue)
 pub fn create_vm_interpreter_stub(
     _image_base: u64,
     _section_rva: u32,
@@ -103,8 +103,28 @@ impl StubEmitter {
     }
 
     fn lea_rip_rel32(&mut self, rex: u8, modrm_reg: u8, target: &'static str) {
-        self.emit(&[rex, 0x8D, 0x05 | (modrm_reg << 3), 0, 0, 0, 0]);
+        self.emit_rip_rel32(rex, 0x8D, modrm_reg, target);
+    }
+
+    fn emit_mov_qword_from_rip_label(&mut self, dst_reg: u8, target: &'static str) {
+        self.emit_rip_rel32(if dst_reg >= 8 { 0x4C } else { 0x48 }, 0x8B, dst_reg, target);
+    }
+
+    fn emit_mov_qword_to_rip_label(&mut self, src_reg: u8, target: &'static str) {
+        self.emit_rip_rel32(if src_reg >= 8 { 0x4C } else { 0x48 }, 0x89, src_reg, target);
+    }
+
+    fn emit_rip_rel32(&mut self, rex: u8, opcode: u8, modrm_reg: u8, target: &'static str) {
+        self.emit(&[rex, opcode, 0x05 | ((modrm_reg & 7) << 3), 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, target));
+    }
+
+    fn emit_init_native_frame_ptr(&mut self) {
+        // lea rax, [rip+native_stack_top]; sub rax,0x100; and rax,-16; mov [rip+native_frame_ptr], rax
+        self.lea_rip_rel32(0x48, 0, "native_stack_top");
+        self.emit(&[0x48, 0x2D, 0x00, 0x01, 0x00, 0x00]); // sub rax, 0x100
+        self.emit(&[0x48, 0x83, 0xE0, 0xF0]); // and rax, -16
+        self.emit_mov_qword_to_rip_label(0, "native_frame_ptr");
     }
 
     fn jmp_to_dispatch(&mut self) {
@@ -119,8 +139,6 @@ impl StubEmitter {
         // Zero L2 call depth [rbp-0xC8] and push depth [rbp-0xE8]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
-        // Zero L4d persistent native side frame pointer [rbp-0x110]
-        self.emit(&[0x48, 0xC7, 0x85, 0xF0, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x8B, 0x40, 0x18]);
         self.emit(&[0x4C, 0x8D, 0x58, 0x10]);
@@ -228,6 +246,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
         self.emit(&[0x48, 0x89, 0x85, 0x60, 0xFF, 0xFF, 0xFF]);
 
+        self.emit_init_native_frame_ptr();
         self.lea_rip_rel32(0x48, 6, "bytecode");
         self.emit(&[0x48, 0x89, 0xF6]);
         self.jmp_rel32("dispatch");
@@ -540,45 +559,32 @@ impl StubEmitter {
 
     fn emit_handler_run_native(&mut self) {
         self.label("h_run_native");
-        self.emit_native_sled_invoke("rn_frame_ready_run");
+        self.emit_native_sled_invoke();
     }
 
     fn emit_handler_bail_native(&mut self) {
         self.label("h_bail_native");
-        self.emit_native_sled_invoke("rn_frame_ready_bail");
+        self.emit_native_sled_invoke();
     }
 
     /// L4d: read sled offset + orig rva, sync VM spills↔native rbp locals, run sled, resume VM.
     ///
-    /// Native frame ptr lives at `[vm_rbp-0x110]`; VM frame self-ptr at `[vm_rbp-0x118]`.
-    /// All slot access while `rbp` is still the VM frame — never via `[r13-0x110]` (r13 may
-    /// not match VM base if clobbered). At frame_ready load native ptr into r14, re-anchor r13
-    /// from `[vm_rbp-0x118]`, then `mov rbp, r14` before spill sync.
-    fn emit_native_sled_invoke(&mut self, frame_ready_label: &'static str) {
+    /// Native locals base lives in `.knvest` `native_frame_ptr` (initialized once in prologue).
+    /// VM frame self-ptr at `[vm_rbp-0x118]`. At invoke: load native ptr from rip slot into r14,
+    /// re-anchor r13 from `[vm_rbp-0x118]`, then `mov rbp, r14` before spill sync.
+    fn emit_native_sled_invoke(&mut self) {
         let sync_pairs = self.native_sync.clone();
         self.emit(&[0x48, 0x8B, 0x06]); // mov rax, [rsi] sled offset
         self.emit(&[0x49, 0x89, 0xC3]); // mov r11, rax
         self.emit(&[0x48, 0x83, 0xC6, 0x10]); // add rsi, 16 (skip orig rva)
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
-        // Persist VM frame on the VM frame itself before any rbp switch.
         self.emit_mov_qword_to_rbp_from_reg(5, -0x118); // mov [rbp-0x118], rbp
         self.emit(&[0x49, 0x89, 0xE5]); // mov r13, rbp — VM spill base
         self.emit(&[0x49, 0x89, 0xE4]); // mov r12, rsp
 
-        self.emit_mov_qword_from_rbp_to_reg(0, -0x110); // mov rax, [rbp-0x110]
-        self.emit(&[0x48, 0x85, 0xC0]); // test rax, rax
-        self.jcc_rel32(0x85, frame_ready_label); // jne frame_ready_label
-
-        self.lea_rip_rel32(0x48, 4, "native_stack_top");
-        self.emit(&[0x48, 0x2D, 0x00, 0x01, 0x00, 0x00]); // sub rax, 0x100
-        self.emit(&[0x48, 0x83, 0xE0, 0xF0]); // and rax, -16
-        self.emit_mov_qword_to_rbp_from_reg(0, -0x110); // mov [rbp-0x110], rax
-
-        self.label(frame_ready_label);
-        // rbp still VM frame: load native locals base without touching rcx.
-        self.emit_mov_qword_from_rbp_to_reg(14, -0x110); // mov r14, [rbp-0x110]
-        self.emit_mov_qword_from_rbp_to_reg(13, -0x118); // mov r13, [rbp-0x118] — VM spill base
-        self.emit(&[0x4C, 0x89, 0xF5]); // mov rbp, r14 — native locals base before spill sync
+        self.emit_mov_qword_from_rip_label(14, "native_frame_ptr"); // mov r14, [rip+native_frame_ptr]
+        self.emit_mov_qword_from_rbp_to_reg(13, -0x118); // mov r13, [rbp-0x118]
+        self.emit(&[0x4C, 0x89, 0xF5]); // mov rbp, r14
         for &(rbp_disp, spill) in &sync_pairs {
             self.emit_mov_dword_from_r13_spill(spill);
             self.emit_mov_dword_to_rbp_disp(rbp_disp);
@@ -989,6 +995,8 @@ impl StubEmitter {
         while self.pos() % 16 != 0 {
             self.emit(&[0xCC]);
         }
+        self.label("native_frame_ptr");
+        self.emit(&[0x00; 8]);
         self.label("native_stack");
         for _ in 0..0x200 {
             self.emit(&[0x00]);
@@ -1061,7 +1069,40 @@ mod tests {
     }
 
     #[test]
-    fn run_native_and_bail_use_distinct_frame_ready_jcc_targets() {
+    fn prologue_init_native_frame_ptr_once() {
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[], &[]);
+        let lea_rax_stack = [0x48u8, 0x8D, 0x05]; // lea rax, [rip+disp]
+        let store_abs = [0x48u8, 0x89, 0x05]; // mov [rip+disp], rax
+        let lea_rax_count = stub.windows(lea_rax_stack.len()).filter(|w| *w == lea_rax_stack).count();
+        assert!(
+            lea_rax_count >= 1,
+            "prologue must lea rax,[native_stack_top] (modrm reg 0, not rsp=4)"
+        );
+        assert!(
+            !stub.windows(3).any(|w| w == [0x48, 0x8D, 0x25]),
+            "must not lea rsp,[rip+disp] for native_stack_top (modrm reg 4 bug)"
+        );
+        let lea_pos = stub
+            .windows(lea_rax_stack.len())
+            .position(|w| w == lea_rax_stack)
+            .expect("lea rax,[rip+disp]");
+        let after = &stub[lea_pos..lea_pos + 32];
+        assert!(
+            after.windows(3).any(|w| w == [0x48, 0x2D, 0x00]),
+            "native frame init must sub rax,0x100 after lea"
+        );
+        assert!(
+            stub.windows(store_abs.len()).any(|w| w == store_abs),
+            "prologue must mov [rip+native_frame_ptr], rax"
+        );
+        assert!(
+            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0xF0, 0xFE, 0xFF, 0xFF]),
+            "must not use spill-adjacent [rbp-0x110] slot for native frame ptr"
+        );
+    }
+
+    #[test]
+    fn run_native_and_bail_share_invoke_without_runtime_alloc() {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
         let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[], &sync);
@@ -1081,34 +1122,15 @@ mod tests {
         let run_site = invoke_sites[0];
         let bail_site = invoke_sites[1];
         assert!(run_site < bail_site);
-
-        let jne = [0x0Fu8, 0x85];
-        let jne_at = |base: usize, limit: usize| -> usize {
-            stub[base..limit]
-                .windows(jne.len())
-                .position(|w| w == jne)
-                .map(|p| base + p)
-                .expect("jne near frame-ready check")
-        };
-        let run_jne = jne_at(run_site, bail_site);
-        let bail_jne = jne_at(bail_site, stub.len());
-
-        let rel32_target = |stub: &[u8], jcc_pos: usize| -> usize {
-            let disp = i32::from_le_bytes(stub[jcc_pos + 2..jcc_pos + 6].try_into().unwrap());
-            jcc_pos + 6 + disp as usize
-        };
-        let run_target = rel32_target(&stub, run_jne);
-        let bail_target = rel32_target(&stub, bail_jne);
-
+        let run_body = &stub[run_site..bail_site];
         assert!(
-            run_target > run_jne && run_target < bail_site,
-            "run_native jne must target rn_frame_ready_run inside h_run_native (got {run_target:#x}, bail at {bail_site:#x})"
+            !run_body.windows(2).any(|w| w == [0x0F, 0x85]),
+            "run_native must not runtime-alloc via jne frame_ready"
         );
         assert!(
-            bail_target > bail_jne,
-            "bail_native jne must target rn_frame_ready_bail inside h_bail_native"
+            run_body.windows(3).any(|w| w == [0x4C, 0x8B, 0x35]),
+            "run_native must load native frame from [rip+native_frame_ptr]"
         );
-        assert_ne!(run_target, bail_target, "duplicate rn_frame_ready label bug");
     }
 
     #[test]
@@ -1124,19 +1146,19 @@ mod tests {
         let prefix = &stub[..call_at];
         assert!(
             prefix.windows(3).any(|w| w == [0x4C, 0x89, 0xF5]),
-            "mov rbp, r14 before sled call (native frame from [vm_rbp-0x110])"
+            "mov rbp, r14 before sled call (native frame from [rip+native_frame_ptr])"
         );
         assert!(
             !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCD]),
             "must not mov rbp, rcx (rcx may hold VM counter)"
         );
         assert!(
-            prefix.windows(7).any(|w| w == [0x4C, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]),
-            "must mov r14, [rbp-0x110] before native rbp switch"
+            prefix.windows(3).any(|w| w == [0x4C, 0x8B, 0x35]),
+            "must mov r14, [rip+native_frame_ptr] before native rbp switch"
         );
         assert!(
-            !prefix.windows(8).any(|w| w == [0x49, 0x8B, 0x8C, 0x25, 0xF0, 0xFE, 0xFF, 0xFF]),
-            "must not load native frame via [r13-0x110]"
+            !prefix.windows(7).any(|w| w == [0x4C, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]),
+            "must not load native frame via spill-adjacent [rbp-0x110]"
         );
         assert!(
             prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
@@ -1233,7 +1255,7 @@ mod tests {
             .expect("call r10 in run_native");
         let before_call = &run_body[..call_at];
         let save_vm_frame = [0x48u8, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]; // mov [rbp-0x118], rbp
-        let load_native = [0x4Cu8, 0x8B, 0xB5, 0xF0, 0xFE, 0xFF, 0xFF]; // mov r14, [rbp-0x110]
+        let load_native = [0x4Cu8, 0x8B, 0x35]; // mov r14, [rip+native_frame_ptr]
         let reload_vm = [0x4Cu8, 0x8B, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]; // mov r13, [rbp-0x118]
         let mov_rbp_r14 = [0x4Cu8, 0x89, 0xF5]; // mov rbp, r14
         let pre_sync_store = [0x89u8, 0x45, 0xFC];
@@ -1244,7 +1266,7 @@ mod tests {
         let native_at = before_call
             .windows(load_native.len())
             .position(|w| w == load_native)
-            .expect("mov r14, [rbp-0x110] at frame_ready");
+            .expect("mov r14, [rip+native_frame_ptr]");
         let vm_at = before_call
             .windows(reload_vm.len())
             .position(|w| w == reload_vm)
