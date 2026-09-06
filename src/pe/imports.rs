@@ -43,12 +43,34 @@ pub fn iat_rva_from_native_call(func_id: u64) -> u32 {
 }
 
 /// Collect every `native_call` func_id embedded in lifted VM bytecode.
+///
+/// Uses the thread-local / canonical opcode table. For L4a-shuffled bytecode pass
+/// the pack's [`OpcodeMap`] via [`native_call_ids_in_bytecode_with_map`].
 pub fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
+    use crate::vm::{active_decode, OpCode};
+    let mut ids = Vec::new();
+    let mut i = 0usize;
+    while i < bytecode.len() {
+        if active_decode(bytecode[i]) == Some(OpCode::NativeCall) && i + 9 <= bytecode.len() {
+            ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
+            i += 9;
+        } else {
+            i += 1;
+        }
+    }
+    ids
+}
+
+/// Like [`native_call_ids_in_bytecode`] but decodes opcodes with the pack's L4a map.
+pub fn native_call_ids_in_bytecode_with_map(
+    bytecode: &[u8],
+    map: &crate::vm::OpcodeMap,
+) -> Vec<u64> {
     use crate::vm::OpCode;
     let mut ids = Vec::new();
     let mut i = 0usize;
     while i < bytecode.len() {
-        if bytecode[i] == OpCode::NativeCall as u8 && i + 9 <= bytecode.len() {
+        if map.decode(bytecode[i]) == Some(OpCode::NativeCall) && i + 9 <= bytecode.len() {
             ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
             i += 9;
         } else {
@@ -61,6 +83,17 @@ pub fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
 /// IAT-tagged native_call ids (`0x100000000 | rva`) present in bytecode.
 pub fn iat_native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
     native_call_ids_in_bytecode(bytecode)
+        .into_iter()
+        .filter(|id| is_iat_native_call(*id))
+        .collect()
+}
+
+/// IAT native_call ids from L4a-shuffled bytecode.
+pub fn iat_native_call_ids_in_bytecode_with_map(
+    bytecode: &[u8],
+    map: &crate::vm::OpcodeMap,
+) -> Vec<u64> {
+    native_call_ids_in_bytecode_with_map(bytecode, map)
         .into_iter()
         .filter(|id| is_iat_native_call(*id))
         .collect()
@@ -354,6 +387,23 @@ mod tests {
         let ptr_id = native_call_iat_ptr_id(0x8260);
         assert!(is_iat_ptr_native_call(ptr_id));
         assert_eq!(iat_rva_from_native_call(ptr_id), 0x8260);
+    }
+
+    #[test]
+    fn native_call_ids_in_shuffled_bytecode_need_opcode_map() {
+        use crate::vm::{OpCode, OpcodeMap};
+        let map = OpcodeMap::from_seed(0x4C344100);
+        let mut bytecode = vec![map.encode(OpCode::NativeCall)];
+        bytecode.extend_from_slice(&3u64.to_le_bytes());
+        assert!(
+            native_call_ids_in_bytecode(&bytecode).is_empty(),
+            "canonical decode must not find native_call in shuffled wire bytes"
+        );
+        assert_eq!(
+            native_call_ids_in_bytecode_with_map(&bytecode, &map),
+            vec![3],
+            "map-aware scan must find nc3 putchar id"
+        );
     }
 
     #[test]

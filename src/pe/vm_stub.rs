@@ -1,3 +1,4 @@
+use crate::vm::opcode_map::{CANONICAL_OPCODES, OpcodeMap};
 use std::collections::HashMap;
 
 // L2 VM interpreter frame map (rbp-relative; disp32 = signed i32 little-endian)
@@ -17,8 +18,8 @@ use std::collections::HashMap;
 //   ret addrs      [rbp + depth*8 - 0x200]       (depth 3 → -0x1E8; must not use for scratch)
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
-pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32) -> (Vec<u8>, usize) {
-    let mut e = StubEmitter::new();
+pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32, map: &OpcodeMap) -> (Vec<u8>, usize) {
+    let mut e = StubEmitter::new(map);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
@@ -33,16 +34,20 @@ struct StubEmitter {
     rel32: Vec<(usize, &'static str)>,
     lea_rip: Vec<(usize, &'static str)>,
     handler_table_start: Option<usize>,
+    exit_cmp_patch_pos: Option<usize>,
+    opcode_map: OpcodeMap,
 }
 
 impl StubEmitter {
-    fn new() -> Self {
+    fn new(map: &OpcodeMap) -> Self {
         Self {
             code: Vec::new(),
             labels: HashMap::new(),
             rel32: Vec::new(),
             lea_rip: Vec::new(),
             handler_table_start: None,
+            exit_cmp_patch_pos: None,
+            opcode_map: map.clone(),
         }
     }
 
@@ -222,7 +227,8 @@ impl StubEmitter {
         self.label("dispatch");
         self.emit(&[0x0F, 0xB6, 0x06]);
         self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x3C, 0xFF]);
+        self.emit(&[0x3C, 0x00]); // cmp al, exit_wire (patched in finalize)
+        self.exit_cmp_patch_pos = Some(self.pos() - 1);
         self.jcc_rel32(0x84, "h_exit");
         self.emit(&[0x48, 0x8D, 0x1D, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "handler_table"));
@@ -232,9 +238,37 @@ impl StubEmitter {
     }
 
     fn emit_handlers(&mut self) {
-        self.label("h_nop");
-        self.jmp_to_dispatch();
+        let order = *self.opcode_map.handler_emit_order();
+        for &idx in &order {
+            match CANONICAL_OPCODES[idx as usize] {
+                crate::vm::OpCode::Nop => self.emit_handler_nop(),
+                crate::vm::OpCode::LoadImm => self.emit_handler_load_imm(),
+                crate::vm::OpCode::Move => self.emit_handler_move(),
+                crate::vm::OpCode::Add => self.emit_handler_add(),
+                crate::vm::OpCode::Sub => self.emit_handler_sub(),
+                crate::vm::OpCode::Mul => self.emit_handler_mul(),
+                crate::vm::OpCode::Cmp => self.emit_handler_cmp(),
+                crate::vm::OpCode::Jmp => self.emit_handler_jmp(),
+                crate::vm::OpCode::JmpIf => self.emit_handler_jmpif(),
+                crate::vm::OpCode::Call => self.emit_handler_call(),
+                crate::vm::OpCode::Ret => self.emit_handler_ret(),
+                crate::vm::OpCode::NativeCall => self.emit_handler_native_call(),
+                crate::vm::OpCode::Push => self.emit_handler_push(),
+                crate::vm::OpCode::Pop => self.emit_handler_pop(),
+                crate::vm::OpCode::LoadByte => self.emit_handler_load_byte(),
+                crate::vm::OpCode::Cmp32 => self.emit_handler_cmp32(),
+                crate::vm::OpCode::And => self.emit_handler_and(),
+                crate::vm::OpCode::Exit => self.emit_handler_exit(),
+                _ => unreachable!("canonical opcode set only"),
+            }
+        }
+    }
 
+    fn emit_handler_nop(&mut self) {
+        self.jmp_to_dispatch();
+    }
+
+    fn emit_handler_load_imm(&mut self) {
         self.label("h_load_imm");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -242,7 +276,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_move(&mut self) {
         self.label("h_move");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -251,7 +287,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_add(&mut self) {
         self.label("h_add");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -263,7 +301,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x03, 0x44, 0xD5, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_sub(&mut self) {
         self.label("h_sub");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -275,7 +315,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x2B, 0x44, 0xD5, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_mul(&mut self) {
         self.label("h_mul");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -287,7 +329,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x0F, 0xAF, 0x44, 0xD5, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_and(&mut self) {
         self.label("h_and");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -299,7 +343,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x23, 0x44, 0xD5, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_cmp(&mut self) {
         self.label("h_cmp");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -312,7 +358,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
         self.emit(&[0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_cmp32(&mut self) {
         self.label("h_cmp32");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -325,7 +373,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
         self.emit(&[0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_jmp(&mut self) {
         self.label("h_jmp");
         self.emit(&[0x48, 0x8B, 0x06]);
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
@@ -333,11 +383,15 @@ impl StubEmitter {
         self.emit(&[0x48, 0x01, 0xF0]);
         self.emit(&[0x48, 0x89, 0xC6]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_jmpif(&mut self) {
         self.label("h_jmpif");
         self.emit_jmpif_handler();
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_call(&mut self) {
         self.label("h_call");
         self.emit(&[0x48, 0x8B, 0x06]);
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
@@ -353,7 +407,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x01, 0xF0]);
         self.emit(&[0x48, 0x89, 0xC6]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_ret(&mut self) {
         self.label("h_ret");
         self.emit(&[0x48, 0x8B, 0x85, 0x38, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xC8]);
@@ -363,11 +419,15 @@ impl StubEmitter {
         self.emit(&[0x48, 0x01, 0xF0]);
         self.emit(&[0x48, 0x89, 0xC6]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_native_call(&mut self) {
         self.label("h_native_call");
         self.emit_native_call_handler();
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_push(&mut self) {
         self.label("h_push");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -377,7 +437,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_pop(&mut self) {
         self.label("h_pop");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -387,7 +449,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_load_byte(&mut self) {
         self.label("h_load_byte");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -399,7 +463,9 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x00]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
+    }
 
+    fn emit_handler_exit(&mut self) {
         self.label("h_exit");
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
@@ -616,26 +682,7 @@ impl StubEmitter {
         let table_base = self
             .handler_table_start
             .expect("handler table placeholder missing");
-        let handlers: [(u8, &str); 18] = [
-            (0x00, "h_nop"),
-            (0x01, "h_load_imm"),
-            (0x04, "h_move"),
-            (0x05, "h_add"),
-            (0x06, "h_sub"),
-            (0x07, "h_mul"),
-            (0x09, "h_cmp"),
-            (0x0A, "h_jmp"),
-            (0x0B, "h_jmpif"),
-            (0x0C, "h_call"),
-            (0x0D, "h_ret"),
-            (0x0E, "h_native_call"),
-            (0x0F, "h_push"),
-            (0x10, "h_pop"),
-            (0x11, "h_load_byte"),
-            (0x13, "h_cmp32"),
-            (0x14, "h_and"),
-            (0xFF, "h_exit"),
-        ];
+        let handlers = self.opcode_map.handler_table_entries();
         let default_off = self.handler_offset("h_nop", table_base);
         for i in 0..256usize {
             let op = i as u8;
@@ -672,11 +719,15 @@ impl StubEmitter {
         while self.pos() % 16 != 0 {
             self.emit(&[0xCC]);
         }
+        self.emit(&self.opcode_map.to_embedded_bytes());
         self.emit(b"VMBC");
         self.label("bytecode");
     }
 
     fn finalize(mut self) -> (Vec<u8>, usize) {
+        if let Some(patch_at) = self.exit_cmp_patch_pos {
+            self.code[patch_at] = self.opcode_map.exit_wire();
+        }
         self.fill_handler_table();
         let rel32 = std::mem::take(&mut self.rel32);
         for (patch_at, target) in rel32 {
@@ -705,7 +756,7 @@ mod tests {
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
     #[test]
     fn peb_module_walk_single_advance_per_iteration() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let init = [0x49u8, 0x8B, 0x0B]; // mov rcx, [r11] — first module
         let done = [0x48u8, 0x8B, 0x59, 0x30]; // name_cmp_done: mov rbx, [rcx+0x30]
         let advance = [0x48u8, 0x8B, 0x09]; // mov rcx, [rcx]
@@ -737,7 +788,7 @@ mod tests {
 
     #[test]
     fn iat_native_call_threshold_uses_full_mov_rcx_imm64() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let pattern = [
             0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rcx, 0x100000000
             0x48, 0x39, 0xC8, // cmp rax, rcx
@@ -755,7 +806,7 @@ mod tests {
 
     #[test]
     fn vm_metadata_uses_l2_slots_with_correct_disp32() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let call_depth_init = [0x48u8, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         let push_depth_init = [0x48u8, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         assert!(
@@ -796,7 +847,7 @@ mod tests {
 
     #[test]
     fn iat_native_call_maps_x64_rcx_from_vm_reg0() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         // nc_iat must load win64 rcx from VM r0 slot [rbp-0x80] (zero-extended via mov ecx)
         let rcx_from_r0 = [0x8Bu8, 0x8D, 0x80, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -910,7 +961,7 @@ mod tests {
     /// Metadata (push/call depth, flags, rsi save) must not use VM r0..r15 frame slots.
     #[test]
     fn vm_stub_metadata_must_not_alias_vm_reg_slots() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let r13_slot = vm_reg_slot_disp32(13); // E8 FF FF FF = [rbp-0x18]
         assert!(
             !stub.windows(4).any(|w| w == r13_slot),
@@ -1146,7 +1197,7 @@ mod tests {
     /// Every SIB used for VM reg [rbp+idx*scale-0x80] in handlers must be scale*8 (CD/FD/D5).
     #[test]
     fn vm_reg_sib_must_be_scale8_in_handlers() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
         let forbidden_sib = [
             (0x8D, "rcx scale*4"),
             (0xBD, "rdi scale*4"),

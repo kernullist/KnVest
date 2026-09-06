@@ -1,4 +1,5 @@
 use super::opcode::OpCode;
+use super::opcode_map::OpcodeMap;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -36,6 +37,7 @@ pub struct VirtualMachine {
     stack: Vec<u64>,
     memory: Vec<u8>,
     bytecode: Vec<u8>,
+    opcode_map: Option<OpcodeMap>,
     native_functions: HashMap<u64, fn(&mut VirtualMachine) -> VMResult<()>>,
     pub exit_code: Option<i32>,
     pub data_section: Vec<u8>,
@@ -51,10 +53,21 @@ impl VirtualMachine {
             stack: Vec::with_capacity(STACK_SIZE),
             memory: vec![0; MEMORY_SIZE],
             bytecode,
+            opcode_map: None,
             native_functions: HashMap::new(),
             exit_code: None,
             data_section: Vec::new(),
         }
+    }
+
+    pub fn with_opcode_map(bytecode: Vec<u8>, opcode_map: OpcodeMap) -> Self {
+        let mut vm = Self::new(bytecode);
+        vm.opcode_map = Some(opcode_map);
+        vm
+    }
+
+    pub fn set_opcode_map(&mut self, opcode_map: OpcodeMap) {
+        self.opcode_map = Some(opcode_map);
     }
 
     pub fn register_native(&mut self, id: u64, func: fn(&mut VirtualMachine) -> VMResult<()>) {
@@ -123,8 +136,12 @@ impl VirtualMachine {
 
     pub fn step(&mut self) -> VMResult<()> {
         let opcode_byte = self.read_u8()?;
-        let opcode = OpCode::from_u8(opcode_byte)
-            .ok_or(VMError::InvalidOpcode(opcode_byte))?;
+        let opcode = if let Some(map) = &self.opcode_map {
+            map.decode(opcode_byte)
+                .ok_or(VMError::InvalidOpcode(opcode_byte))?
+        } else {
+            OpCode::from_u8(opcode_byte).ok_or(VMError::InvalidOpcode(opcode_byte))?
+        };
 
         match opcode {
             OpCode::Nop => {},
