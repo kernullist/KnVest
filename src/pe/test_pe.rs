@@ -462,7 +462,7 @@ pub fn create_pe64_hello_vs_global_ctors() -> Vec<u8> {
     text[o + 1] = 0xC3;
 
     // __do_global_ctors walker at higher .text offset (after main)
-    let ctor_off = 0x7c0usize;
+    let ctor_off = 0x7cfusize;
     let mut c = ctor_off;
     text[c..c + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
     c += 4;
@@ -595,6 +595,87 @@ pub fn create_pe64_fact_helper_before_main() -> Vec<u8> {
     text[o..o + 5].copy_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00]);
     o += 5;
     text[o] = 0xC3;
+
+    pe.extend_from_slice(&text);
+    while pe.len() < 0x1400 {
+        pe.push(0);
+    }
+    pe
+}
+
+/// MinGW gcc 16 layout: user `main` @0x760, `__do_global_ctors` @0x7cf, CRT `__main` @0x847.
+pub fn create_pe64_mingw_main_ctors___main_combined() -> Vec<u8> {
+    let mut pe = Vec::new();
+    pe.extend_from_slice(&create_dos_header(0x80));
+    pe.extend_from_slice(&vec![0u8; 0x80 - 64]);
+    pe.extend_from_slice(b"PE\0\0");
+    pe.extend_from_slice(&create_coff_header(1));
+    pe.extend_from_slice(&create_optional_header_pe32plus());
+    pe.extend_from_slice(&create_section_header(
+        b".text\0\0\0",
+        0x1000,
+        0x1000,
+        0x1000,
+        0x400,
+    ));
+    while pe.len() < 0x400 {
+        pe.push(0);
+    }
+
+    let mut text = vec![0x90u8; 0x1000];
+
+    // hello-style user main at .text+0x760
+    let main_off = 0x760usize;
+    let mut o = main_off;
+    text[o..o + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+    o += 4;
+    text[o..o + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    o += 4;
+    text[o..o + 7].copy_from_slice(&[0x48, 0x8D, 0x0D, 0x10, 0x00, 0x00, 0x00]);
+    o += 7;
+    text[o] = 0xE8;
+    text[o + 1..o + 5].copy_from_slice(&0x20i32.to_le_bytes());
+    o += 5;
+    text[o..o + 5].copy_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00]);
+    o += 5;
+    text[o..o + 4].copy_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+    o += 4;
+    text[o] = 0x5D;
+    text[o + 1] = 0xC3;
+
+    // __do_global_ctors walker at .text+0x7cf (real MinGW offset)
+    let ctor_off = 0x7cfusize;
+    let mut c = ctor_off;
+    text[c..c + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+    c += 4;
+    text[c..c + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    c += 4;
+    text[c] = 0xE8;
+    text[c + 1..c + 5].copy_from_slice(&0x10i32.to_le_bytes());
+    c += 5;
+    text[c..c + 7].copy_from_slice(&[0x48, 0x8B, 0x1D, 0x20, 0x00, 0x00, 0x00]);
+    c += 7;
+    text[c..c + 3].copy_from_slice(&[0x48, 0x85, 0xC0]);
+    c += 3;
+    text[c..c + 2].copy_from_slice(&[0xFF, 0x13]);
+    c += 2;
+    text[c..c + 4].copy_from_slice(&[0x48, 0x83, 0xC3, 0x08]);
+    c += 4;
+    text[c] = 0xC3;
+
+    // CRT __main shim at .text+0x847 calling user main
+    let shim_off = 0x847usize;
+    let call_pos = shim_off + 8;
+    text[shim_off..shim_off + 4].copy_from_slice(&[0x55, 0x48, 0x89, 0xE5]);
+    text[shim_off + 4..shim_off + 8].copy_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    text[call_pos] = 0xE8;
+    let call_end = call_pos + 5;
+    let rel = (main_off as i32) - (call_end as i32);
+    text[call_pos + 1..call_pos + 5].copy_from_slice(&rel.to_le_bytes());
+    text[call_end] = 0x31;
+    text[call_end + 1] = 0xC0;
+    text[call_end + 2] = 0x5D;
+    text[call_end + 3] = 0xC3;
 
     pe.extend_from_slice(&text);
     while pe.len() < 0x1400 {

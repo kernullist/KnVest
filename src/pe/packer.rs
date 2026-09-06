@@ -64,7 +64,10 @@ fn has_near_call_in_window(text_data: &[u8], offset: usize, window: usize) -> bo
     text_data[start..end].contains(&0xE8)
 }
 
-/// Collect targets of `call rel32` (0xE8) within `scan_len` bytes of a function entry.
+/// Max bytes scanned inside a candidate function body (avoids bleed into the next symbol).
+const MAIN_BODY_SCAN_MAX: usize = 0x48;
+
+/// Collect targets of `call rel32` (0xE8) within the first `scan_len` bytes.
 fn near_rel32_call_targets(text_data: &[u8], offset: usize, scan_len: usize) -> Vec<usize> {
     let end = (offset + scan_len).min(text_data.len());
     if offset >= end {
@@ -86,179 +89,119 @@ fn near_rel32_call_targets(text_data: &[u8], offset: usize, scan_len: usize) -> 
     targets
 }
 
-/// True when the function body looks like it performs stdio (printf/puts) I/O.
-fn has_stdio_io_pattern(text_data: &[u8], offset: usize) -> bool {
-    let end = (offset + 0x120).min(text_data.len());
-    if offset >= end {
-        return false;
-    }
-    let w = &text_data[offset..end];
-    for i in 0..w.len().saturating_sub(12) {
-        if w[i] == 0x48 && w.get(i + 1) == Some(&0x8D) {
-            let tail = &w[i..w.len().min(i + 20)];
-            if tail.contains(&0xE8) || tail.windows(2).any(|x| x == [0xFF, 0x15]) {
-                return true;
-            }
+fn candidate_body_len(text_data: &[u8], offset: usize, sorted_offsets: &[usize]) -> usize {
+    let next_off = sorted_offsets.iter().find(|next| **next > offset).copied();
+    let gap_cap = next_off
+        .map(|n| n - offset)
+        .unwrap_or(MAIN_BODY_SCAN_MAX);
+    let cap = gap_cap.min(MAIN_BODY_SCAN_MAX).min(text_data.len() - offset);
+    for i in 12..cap {
+        if text_data[offset + i] == 0xC3 {
+            return i + 1;
         }
     }
-    for i in 0..w.len().saturating_sub(6) {
-        if w[i] == 0xB9 && w.get(i + 5) == Some(&0xE8) {
+    cap
+}
+
+/// MinGW `__do_global_ctors` walker — must never be auto-selected as user `main`.
+fn is_global_ctors_walker(body: &[u8]) -> bool {
+    let has_ptr_walk = body.windows(4).any(|x| {
+        x == [0x48, 0x83, 0xC3, 0x08] || x == [0x48, 0x83, 0xC6, 0x08]
+    });
+    let has_indirect_call = body.windows(2).any(|x| {
+        x == [0xFF, 0x13] || x == [0xFF, 0x10] || x == [0xFF, 0xD0]
+    });
+    let has_ctor_list_load = body.windows(3).any(|x| {
+        x == [0x48, 0x8B, 0x1D] || x == [0x48, 0x8B, 0x35]
+    });
+    (has_ptr_walk && has_indirect_call)
+        || (has_ctor_list_load && has_indirect_call && has_ptr_walk)
+}
+
+/// Stdio I/O inside a bounded function body (printf/puts), not bleed from neighbors.
+fn has_stdio_in_body(body: &[u8]) -> bool {
+    for i in 0..body.len().saturating_sub(14) {
+        if body[i] != 0x48 || body.get(i + 1) != Some(&0x8D) {
+            continue;
+        }
+        let modrm = body.get(i + 2).copied().unwrap_or(0);
+        if !matches!(modrm, 0x05 | 0x0D | 0x15 | 0x1D | 0x35 | 0x3D) {
+            continue;
+        }
+        let tail = &body[i..body.len().min(i + 18)];
+        if tail.contains(&0xE8) || tail.windows(2).any(|x| x == [0xFF, 0x15]) {
             return true;
         }
     }
-    w.windows(2).any(|x| x == [0xFF, 0x15])
+    for i in 0..body.len().saturating_sub(6) {
+        if body[i] == 0xB9 && body.get(i + 5) == Some(&0xE8) {
+            return true;
+        }
+    }
+    false
 }
 
-fn score_user_main(text_data: &[u8], offset: usize) -> i32 {
-    let end = (offset + 0x50).min(text_data.len());
-    if offset >= end {
-        return 0;
+fn has_return_zero_epilogue(body: &[u8]) -> bool {
+    body.windows(2).any(|x| x == [0x31, 0xC0])
+        || body.windows(5).any(|x| x == [0xB8, 0, 0, 0, 0])
+}
+
+fn has_stack_local_init(body: &[u8]) -> bool {
+    body.windows(2).any(|x| x[0] == 0xC7 && x[1] == 0x45)
+}
+
+/// CRT `__main` shim: short body, no stdio, forwards to another in-text candidate.
+fn is_crt___main_shim(body: &[u8], in_text_targets: usize) -> bool {
+    if is_global_ctors_walker(body) || has_stdio_in_body(body) {
+        return false;
     }
-    let w = &text_data[offset..end];
+    body.len() <= 0x34 && in_text_targets >= 1
+}
+
+/// Helper like `factorial`: callee of a stdio-bearing function, no stdio itself.
+fn is_in_text_helper(
+    text_data: &[u8],
+    offset: usize,
+    body_len: usize,
+    sorted_offsets: &[usize],
+    body_len_at: &impl Fn(usize) -> usize,
+) -> bool {
+    let body = &text_data[offset..offset + body_len];
+    if has_stdio_in_body(body) || is_global_ctors_walker(body) {
+        return false;
+    }
+    sorted_offsets.iter().any(|caller_off| {
+        if *caller_off == offset {
+            return false;
+        }
+        let caller_len = body_len_at(*caller_off);
+        let caller_body = &text_data[*caller_off..*caller_off + caller_len];
+        if is_global_ctors_walker(caller_body) || is_crt___main_shim(
+            caller_body,
+            near_rel32_call_targets(text_data, *caller_off, caller_len)
+                .iter()
+                .filter(|t| sorted_offsets.contains(t))
+                .count(),
+        ) {
+            return false;
+        }
+        has_stdio_in_body(caller_body)
+            && near_rel32_call_targets(text_data, *caller_off, caller_len).contains(&offset)
+    })
+}
+
+fn fallback_user_main_score(body: &[u8]) -> i32 {
     let mut score = 0i32;
-    if w.windows(2).any(|x| x[0] == 0xC7 && x[1] == 0x45) {
+    if has_stack_local_init(body) {
         score += 10;
     }
-    for i in 0..w.len().saturating_sub(6) {
-        if w[i] == 0xB9 && w.get(i + 5) == Some(&0xE8) {
-            score += 8;
-        }
+    if has_stdio_in_body(body) {
+        score += 20;
     }
-    for i in 0..w.len().saturating_sub(12) {
-        if w[i] == 0x48 && w.get(i + 1) == Some(&0x8D) {
-            let tail = &w[i..w.len().min(i + 16)];
-            if tail.contains(&0xE8) {
-                score += 8;
-            }
-        }
-    }
-    // Typical `return 0` epilogue in user main.
-    if w.windows(2).any(|x| x == [0x31, 0xC0]) || w.windows(5).any(|x| x == [0xB8, 0, 0, 0, 0]) {
-        score += 4;
+    if has_return_zero_epilogue(body) {
+        score += 6;
     }
     score
-}
-
-/// MinGW `__do_global_ctors` / CRT walker patterns that must not win over user `main`.
-fn score_crt_ctor_penalty(text_data: &[u8], offset: usize) -> i32 {
-    let end = (offset + 0x80).min(text_data.len());
-    if offset >= end {
-        return 0;
-    }
-    let w = &text_data[offset..end];
-    let mut penalty = 0i32;
-    // ctor list pointer walk: add rbx/rsi, 8
-    if w.windows(4).any(|x| x == [0x48, 0x83, 0xC3, 0x08])
-        || w.windows(4).any(|x| x == [0x48, 0x83, 0xC6, 0x08])
-    {
-        penalty += 20;
-    }
-    // indirect call through ctor table slot (call [rbx] / call rax)
-    if w.windows(2).any(|x| x == [0xFF, 0x13])
-        || w.windows(2).any(|x| x == [0xFF, 0xD0])
-        || w.windows(2).any(|x| x == [0xFF, 0x10])
-    {
-        penalty += 15;
-    }
-    // ctor-list termination test before looping back
-    if w.windows(3).any(|x| x == [0x48, 0x85, 0xC0])
-        || w.windows(3).any(|x| x == [0x48, 0x85, 0xDB])
-    {
-        penalty += 8;
-    }
-    // load ctor list head into rbx right after early `call __main`
-    if w.windows(3).any(|x| x == [0x48, 0x8B, 0x1D])
-        || w.windows(3).any(|x| x == [0x48, 0x8B, 0x35])
-    {
-        penalty += 6;
-    }
-    penalty
-}
-
-/// MinGW CRT `__main` shim: near-call to another prologue candidate, no stdio in-body.
-fn score_crt_main_shim_penalty(
-    text_data: &[u8],
-    offset: usize,
-    candidate_offsets: &[usize],
-) -> i32 {
-    if has_stdio_io_pattern(text_data, offset) {
-        return 0;
-    }
-    let targets = near_rel32_call_targets(text_data, offset, 0x80);
-    let calls_candidate = targets.iter().any(|t| candidate_offsets.contains(t));
-    if !calls_candidate {
-        return 0;
-    }
-    let mut penalty = 70;
-    let in_text_calls = targets
-        .iter()
-        .filter(|t| candidate_offsets.contains(t))
-        .count();
-    if in_text_calls == 1 {
-        penalty += 15;
-    }
-    penalty
-}
-
-/// In-text helper (e.g. `factorial`) called from user `main` but without stdio itself.
-fn score_in_text_callee_penalty(
-    text_data: &[u8],
-    offset: usize,
-    candidate_offsets: &[usize],
-) -> i32 {
-    if has_stdio_io_pattern(text_data, offset) {
-        return 0;
-    }
-    let called_from_main_like = candidate_offsets.iter().any(|caller_off| {
-        *caller_off != offset
-            && has_stdio_io_pattern(text_data, *caller_off)
-            && near_rel32_call_targets(text_data, *caller_off, 0x160).contains(&offset)
-    });
-    if called_from_main_like {
-        return 50;
-    }
-    let called_from_any = candidate_offsets.iter().any(|caller_off| {
-        *caller_off != offset
-            && near_rel32_call_targets(text_data, *caller_off, 0x160).contains(&offset)
-    });
-    if called_from_any {
-        return 30;
-    }
-    0
-}
-
-fn boost_called_by_crt_shim(
-    text_data: &[u8],
-    offset: usize,
-    candidate_offsets: &[usize],
-) -> i32 {
-    let boosted = candidate_offsets.iter().any(|shim_off| {
-        *shim_off != offset
-            && score_crt_main_shim_penalty(text_data, *shim_off, candidate_offsets) >= 70
-            && near_rel32_call_targets(text_data, *shim_off, 0x80).contains(&offset)
-    });
-    if boosted {
-        25
-    } else {
-        0
-    }
-}
-
-fn final_main_score(text_data: &[u8], offset: usize, candidate_offsets: &[usize]) -> i32 {
-    let base = net_main_score(text_data, offset);
-    let shim = score_crt_main_shim_penalty(text_data, offset, candidate_offsets);
-    let callee = score_in_text_callee_penalty(text_data, offset, candidate_offsets);
-    let stdio = if has_stdio_io_pattern(text_data, offset) { 18 } else { 0 };
-    let shim_target = boost_called_by_crt_shim(text_data, offset, candidate_offsets);
-    base - shim - callee + stdio + shim_target
-}
-
-fn net_main_score(text_data: &[u8], offset: usize) -> i32 {
-    score_user_main(text_data, offset) - score_crt_ctor_penalty(text_data, offset)
-}
-
-fn looks_like_user_main(text_data: &[u8], offset: usize, candidate_offsets: &[usize]) -> bool {
-    final_main_score(text_data, offset, candidate_offsets) > 0
 }
 
 fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
@@ -287,31 +230,82 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
         }
     }
 
-    let candidate_offsets: Vec<usize> = candidates.iter().map(|(_, off)| *off).collect();
+    let mut sorted_offsets: Vec<usize> = candidates.iter().map(|(_, off)| *off).collect();
+    sorted_offsets.sort_unstable();
 
-    let user_main_candidates: Vec<_> = candidates
-        .iter()
-        .filter(|(_, off)| looks_like_user_main(text_data, *off, &candidate_offsets))
-        .copied()
-        .collect();
-    let pick_from = if user_main_candidates.is_empty() {
-        &candidates
-    } else {
-        &user_main_candidates
+    let body_len_at = |off: usize| candidate_body_len(text_data, off, &sorted_offsets);
+
+    let is_eligible_user_main = |off: usize| -> bool {
+        let len = body_len_at(off);
+        let body = &text_data[off..off + len];
+        !is_global_ctors_walker(body)
+            && !is_crt___main_shim(
+                body,
+                near_rel32_call_targets(text_data, off, len)
+                    .iter()
+                    .filter(|t| sorted_offsets.contains(t))
+                    .count(),
+            )
+            && !is_in_text_helper(text_data, off, len, &sorted_offsets, &body_len_at)
     };
 
-    if let Some(&(rva, offset)) = pick_from
+    // Primary (MinGW): CRT `__main` forwards to user `main` via a single near call.
+    for &(shim_rva, shim_off) in &candidates {
+        let shim_len = body_len_at(shim_off);
+        let shim_body = &text_data[shim_off..shim_off + shim_len];
+        let in_text = near_rel32_call_targets(text_data, shim_off, shim_len)
+            .into_iter()
+            .filter(|t| sorted_offsets.contains(t))
+            .collect::<Vec<_>>();
+        if !is_crt___main_shim(shim_body, in_text.len()) {
+            continue;
+        }
+        for target_off in in_text {
+            if !is_eligible_user_main(target_off) {
+                continue;
+            }
+            let target_rva = text_start_rva + target_off as u32;
+            eprintln!(
+                "Auto-detected main at RVA {:#x} (.text+{:#x}) via CRT __main shim at {:#x}",
+                target_rva,
+                target_off,
+                shim_rva
+            );
+            return Ok(target_rva);
+        }
+    }
+
+    let eligible: Vec<(u32, usize)> = candidates
         .iter()
-        .max_by(|a, b| {
-            final_main_score(text_data, a.1, &candidate_offsets)
-                .cmp(&final_main_score(text_data, b.1, &candidate_offsets))
-                .then_with(|| {
-                    let a_stdio = has_stdio_io_pattern(text_data, a.1) as i32;
-                    let b_stdio = has_stdio_io_pattern(text_data, b.1) as i32;
-                    a_stdio.cmp(&b_stdio)
-                })
-        })
-    {
+        .copied()
+        .filter(|(_, off)| is_eligible_user_main(*off))
+        .collect();
+
+    let pick_from = if eligible.is_empty() {
+        candidates
+            .iter()
+            .copied()
+            .filter(|(_, off)| {
+                let body = &text_data[*off..*off + body_len_at(*off)];
+                !is_global_ctors_walker(body)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        eligible
+    };
+
+    if let Some(&(rva, offset)) = pick_from.iter().max_by(|a, b| {
+        let a_body = &text_data[a.1..a.1 + body_len_at(a.1)];
+        let b_body = &text_data[b.1..b.1 + body_len_at(b.1)];
+        fallback_user_main_score(a_body)
+            .cmp(&fallback_user_main_score(b_body))
+            .then_with(|| {
+                let a_stdio = has_stdio_in_body(a_body) as i32;
+                let b_stdio = has_stdio_in_body(b_body) as i32;
+                a_stdio.cmp(&b_stdio)
+            })
+            .then_with(|| b.1.cmp(&a.1))
+    }) {
         eprintln!("Auto-detected main at RVA {:#x} (.text+{:#x})", rva, offset);
         return Ok(rva);
     }
@@ -1385,6 +1379,19 @@ mod tests {
             rva,
             text.virtual_address + 0x760,
             "must pick lea+call user main, not __do_global_ctors walker"
+        );
+    }
+
+    #[test]
+    fn test_detect_main_mingw_combined_main_ctors___main() {
+        let pe_data = test_pe::create_pe64_mingw_main_ctors___main_combined();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let rva = super::detect_main_rva(&pe).unwrap();
+        assert_eq!(
+            rva,
+            text.virtual_address + 0x760,
+            "must pick user main @0x760, not __do_global_ctors @0x7cf or __main @0x847"
         );
     }
 
