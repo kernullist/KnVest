@@ -1,3 +1,4 @@
+use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 use std::fmt;
@@ -8,7 +9,7 @@ pub struct Instruction {
     pub operands: Vec<Operand>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     Register(u8),
     Immediate(u64),
@@ -35,7 +36,7 @@ impl fmt::Display for Operand {
 }
 
 impl Instruction {
-    pub fn disassemble(bytecode: &[u8], opcode_map: &OpcodeMap) -> Vec<Self> {
+    pub fn disassemble(bytecode: &[u8], opcode_map: &OpcodeMap, dispatch_mode: DispatchMode) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
         let mut consecutive_invalid = 0;
@@ -44,6 +45,9 @@ impl Instruction {
             let start_offset = offset;
             let opcode_byte = bytecode[offset];
             offset += 1;
+            if dispatch_mode == DispatchMode::Threaded {
+                offset += THREAD_TARGET_SIZE;
+            }
 
             let opcode = match opcode_map.decode(opcode_byte) {
                 Some(op) => op,
@@ -237,7 +241,7 @@ mod tests {
         let mut bytecode = vec![map.encode(OpCode::LoadImm), 0];
         bytecode.extend_from_slice(&42u64.to_le_bytes());
         
-        let instructions = Instruction::disassemble(&bytecode, &map);
+        let instructions = Instruction::disassemble(&bytecode, &map, DispatchMode::Table);
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].opcode, OpCode::LoadImm);
         assert_eq!(instructions[0].operands.len(), 2);
@@ -251,7 +255,7 @@ mod tests {
         bytecode.push(map.encode(OpCode::Exit));
         bytecode.push(0);
         
-        let instructions = Instruction::disassemble(&bytecode, &map);
+        let instructions = Instruction::disassemble(&bytecode, &map, DispatchMode::Table);
         let output = Instruction::pretty_print(&instructions);
         assert!(output.contains("load_imm"));
         assert!(output.contains("exit"));
@@ -263,7 +267,7 @@ mod tests {
         let map_b = OpcodeMap::from_seed(2);
         let mut bytecode = vec![map_a.encode(OpCode::LoadImm), 0];
         bytecode.extend_from_slice(&1u64.to_le_bytes());
-        let wrong = Instruction::disassemble(&bytecode, &map_b);
+        let wrong = Instruction::disassemble(&bytecode, &map_b, DispatchMode::Table);
         assert!(wrong.iter().any(|i| !i.operands.is_empty() && matches!(i.operands[0], Operand::Unknown(_))));
     }
 }

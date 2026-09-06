@@ -178,6 +178,45 @@ cargo test -- --nocapture
 # Check which specific assertion failed
 ```
 
+## L4c dispatch modes (table vs threaded)
+
+Default packing uses **table** dispatch (unchanged from L4b/L4d). **Threaded** dispatch is opt-in.
+
+### Table (default) — 8 samples + smoke
+
+Pack and run the usual educational samples with default flags (no `--dispatch`):
+
+```bash
+knvest pack sample/hello.exe -o sample/hello_packed.exe
+sample/hello_packed.exe
+knvest ir sample/hello_packed.exe
+```
+
+**IR header** should include `L4c dispatch=table` and the usual opcode listing.
+
+Repeat for the other default-table samples in `sample/` (fact, loop, IAT, nested, partial_loop, etc.).
+
+### Threaded smoke
+
+```bash
+knvest pack sample/hello.exe -o sample/hello_threaded.exe --dispatch threaded
+knvest ir sample/hello_threaded.exe
+sample/hello_threaded.exe
+```
+
+**Expected**: `L4c dispatch=threaded` in IR header; same logical opcodes as table mode; executable runs with exit code 0.
+
+### Threaded + partial (if feasible)
+
+```bash
+knvest pack sample/partial_loop.exe -o sample/partial_loop_threaded.exe \
+  --partial --dispatch threaded --seed 0x14D02026
+knvest ir sample/partial_loop_threaded.exe
+sample/partial_loop_threaded.exe
+```
+
+**Expected**: partial IR header shows `dispatch=threaded`; `run_native` / `bail_native` sled paths still present; program behavior matches table partial pack.
+
 ## Contact
 
 If verification fails on Windows with this fixed version, provide:

@@ -34,6 +34,13 @@ pub enum Commands {
             help = "Enable L4d partial BB virtualization (default: full VM lift like L4b)"
         )]
         partial: bool,
+        #[arg(
+            long,
+            value_name = "MODE",
+            default_value = "table",
+            help = "VM dispatch mode: table (handler table) or threaded (inline handler targets)"
+        )]
+        dispatch: String,
     },
 }
 

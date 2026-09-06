@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use knvest::OpcodeMap;
+use knvest::DispatchMode;
 
 #[test]
 fn test_pack_and_ir_workflow() {
@@ -13,7 +14,7 @@ fn test_pack_and_ir_workflow() {
 
     let output_path = test_dir.join("test_output.exe");
     
-    let result = knvest::pack_executable(&input_path, &output_path, None, Some(0x1234), false);
+    let result = knvest::pack_executable(&input_path, &output_path, None, Some(0x1234), false, DispatchMode::Table);
     assert!(result.is_ok(), "Packing should succeed");
 
     assert!(output_path.exists(), "Packed file should exist");
@@ -29,7 +30,7 @@ fn test_pack_and_ir_workflow() {
     let bytecode = bytecode_result.unwrap();
     assert!(!bytecode.is_empty(), "Bytecode should not be empty");
 
-    let instructions = knvest::disassemble(&bytecode, &opcode_map);
+    let instructions = knvest::disassemble(&bytecode, &opcode_map, DispatchMode::Table);
     assert!(!instructions.is_empty(), "Should have instructions");
 
     fs::remove_dir_all(&test_dir).ok();
@@ -43,7 +44,7 @@ fn test_ir_display() {
     bytecode.push(map.encode(knvest::OpCode::Exit));
     bytecode.push(0);
 
-    let instructions = knvest::disassemble(&bytecode, &map);
+    let instructions = knvest::disassemble(&bytecode, &map, DispatchMode::Table);
     let output = knvest::pretty_print(&instructions);
     
     assert!(output.contains("load_imm"), "Output should contain load_imm");
@@ -58,11 +59,42 @@ fn test_l4a_different_seeds_different_opcode_streams() {
     let pe_b = knvest::PEFile::from_bytes(minimal_pe.clone()).unwrap();
     let mut pe_a = pe_a;
     let mut pe_b = pe_b;
-    let packed_a = knvest::pe::packer::pack_function(&mut pe_a, None, Some(1), false).unwrap();
-    let packed_b = knvest::pe::packer::pack_function(&mut pe_b, None, Some(2), false).unwrap();
+    let packed_a = knvest::pe::packer::pack_function(&mut pe_a, None, Some(1), false, DispatchMode::Table).unwrap();
+    let packed_b = knvest::pe::packer::pack_function(&mut pe_b, None, Some(2), false, DispatchMode::Table).unwrap();
     assert_ne!(packed_a.bytecode, packed_b.bytecode);
-    let ir_a = knvest::pretty_print(&knvest::disassemble(&packed_a.bytecode, &packed_a.opcode_map));
-    let ir_b = knvest::pretty_print(&knvest::disassemble(&packed_b.bytecode, &packed_b.opcode_map));
+    let ir_a = knvest::pretty_print(&knvest::disassemble(&packed_a.bytecode, &packed_a.opcode_map, packed_a.dispatch_mode));
+    let ir_b = knvest::pretty_print(&knvest::disassemble(&packed_b.bytecode, &packed_b.opcode_map, packed_b.dispatch_mode));
     assert!(ir_a.contains("load_imm"));
     assert!(ir_b.contains("load_imm"));
+}
+
+#[test]
+fn test_l4c_threaded_pack_and_ir() {
+    let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_output_threaded");
+    fs::create_dir_all(&test_dir).unwrap();
+
+    let minimal_pe = knvest::test_pe::create_minimal_pe64();
+    let input_path = test_dir.join("test_input.exe");
+    fs::write(&input_path, &minimal_pe).unwrap();
+
+    let output_path = test_dir.join("test_output.exe");
+    let result = knvest::pack_executable(
+        &input_path,
+        &output_path,
+        None,
+        Some(0x5678),
+        false,
+        DispatchMode::Threaded,
+    );
+    assert!(result.is_ok(), "Threaded packing should succeed");
+
+    let pe = knvest::PEFile::from_file(&output_path).unwrap();
+    let meta = knvest::pe::packer::extract_pack_metadata_from_packed(&pe).unwrap();
+    assert_eq!(meta.dispatch_mode, DispatchMode::Threaded);
+
+    let bytecode = knvest::extract_bytecode(&pe).unwrap();
+    let instructions = knvest::disassemble(&bytecode, &meta.opcode_map, DispatchMode::Threaded);
+    assert!(!instructions.is_empty());
+
+    fs::remove_dir_all(&test_dir).ok();
 }

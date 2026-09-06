@@ -63,6 +63,21 @@ impl OpCode {
         }
     }
 
+    /// Operand bytes following the opcode wire byte (L4a logical layout).
+    pub fn operand_len(self) -> usize {
+        match self {
+            OpCode::Nop | OpCode::Ret => 0,
+            OpCode::LoadImm | OpCode::LoadStr => 1 + 8,
+            OpCode::Move | OpCode::LoadByte | OpCode::LoadMem | OpCode::StoreMem => 2,
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => 3,
+            OpCode::Cmp | OpCode::Cmp32 => 2,
+            OpCode::Jmp | OpCode::Call | OpCode::NativeCall => 8,
+            OpCode::JmpIf => 1 + 8,
+            OpCode::Push | OpCode::Pop | OpCode::Exit => 1,
+            OpCode::RunNative | OpCode::BailNative => 8 + 8,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             OpCode::Nop => "nop",
