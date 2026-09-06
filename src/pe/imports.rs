@@ -475,7 +475,7 @@ mod tests {
         use crate::vm::{BlockMapPlan, DispatchMode, OpCode, OpcodeMap};
 
         let map = OpcodeMap::from_seed(0x4C34_4100);
-        let (stub, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, &[], &BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, &[], &BlockMapPlan::default(), &[], &[]);
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());

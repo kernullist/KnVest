@@ -333,7 +333,7 @@ pub fn build_handler_table_from_plan(
     table
 }
 
-/// Verify every non-zero slot resolves to a stub handler body (not metadata/bytecode).
+/// Verify every slot resolves to a stub handler body (not metadata/bytecode).
 pub fn validate_handler_table_targets(
     stub: &[u8],
     table_base: usize,
@@ -346,7 +346,15 @@ pub fn validate_handler_table_targets(
     for (slot, chunk) in table.chunks_exact(4).enumerate() {
         let off = i32::from_le_bytes(chunk.try_into().map_err(|_| "slot len")?);
         if off == 0 {
-            continue;
+            return Err(format!(
+                "slot {slot:#04x} has zero offset — dispatch add rax,rbx would land in handler_table"
+            ));
+        }
+        if off < HANDLER_REDIRECT_TABLE_SIZE as i32 {
+            return Err(format!(
+                "slot {slot:#04x} rel off {off:#x} < {:#x} — target still inside redirect table",
+                HANDLER_REDIRECT_TABLE_SIZE
+            ));
         }
         let target = table_base as i64 + off as i64;
         if target < handler_lo as i64 {
@@ -408,6 +416,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn validate_handler_table_rejects_zero_slot() {
+        use super::validate_handler_table_targets;
+
+        let mut stub = vec![0u8; 0x2000];
+        let table_base = 0x1000;
+        stub[0x1800..0x1804].copy_from_slice(KNV4_MAGIC);
+        let mut table = [0u8; HANDLER_REDIRECT_TABLE_SIZE];
+        table[0x42 * 4..0x42 * 4 + 4].copy_from_slice(&0x800i32.to_le_bytes());
+        assert!(validate_handler_table_targets(&stub, table_base, &table).is_err());
     }
 
     #[test]
