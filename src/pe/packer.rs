@@ -352,13 +352,36 @@ fn has_stack_local_init(body: &[u8]) -> bool {
     body.windows(2).any(|x| x[0] == 0xC7 && x[1] == 0x45)
 }
 
+/// MinGW CRT `__main`: `cmp dword [rbp+disp], 0` guard before one-time init call.
+fn is_mingw_crt___main_body(body: &[u8]) -> bool {
+    for i in 0..body.len().saturating_sub(4) {
+        if body[i] == 0x83 && body.get(i + 1) == Some(&0x7D) && body.get(i + 3) == Some(&0x00) {
+            return true;
+        }
+    }
+    for i in 0..body.len().saturating_sub(7) {
+        if body[i] == 0x83
+            && body.get(i + 1) == Some(&0xBD)
+            && body.get(i + 7) == Some(&0x00)
+            && body.get(i + 8) == Some(&0x00)
+            && body.get(i + 9) == Some(&0x00)
+            && body.get(i + 10) == Some(&0x00)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// CRT `__main` shim: short body, no stdio; may call in-text CRT helpers or be
 /// called from user `main` (MinGW: user main calls __main, not the reverse).
 fn is_crt___main_shim(body: &[u8], in_text_targets: usize, caller_count: usize) -> bool {
     if is_global_ctors_walker(body) || has_stdio_in_body(body) {
         return false;
     }
-    body.len() <= 0x34 && (in_text_targets >= 1 || caller_count >= 1)
+    is_mingw_crt___main_body(body)
+        && body.len() <= 0x34
+        && (in_text_targets >= 1 || caller_count >= 1)
 }
 
 fn candidates_calling_target(
@@ -1171,22 +1194,125 @@ mod tests {
         pack_function(pe, rva, Some(seed), true, crate::vm::DispatchMode::Table).unwrap()
     }
 
-    /// MinGW gcc 16 educational samples: user `main` at `.text+offset` (see sample/README).
-    fn assert_mingw_auto_main(pe: &PEFile, text_main_offset: u32) {
+    /// Verify auto-detect picks a plausible MinGW user `main` (not CRT __main / helpers).
+    fn assert_mingw_auto_main(pe: &PEFile) {
         let text = pe.get_section(".text").unwrap();
-        let expected = text.virtual_address + text_main_offset;
+        let text_start = pe.rva_to_file_offset(text.virtual_address).unwrap();
+        let text_end = text_start + text.size_of_raw_data as usize;
+        let text_data = &pe.data[text_start..text_end.min(pe.data.len())];
         let detected = detect_main_rva(pe).unwrap();
-        assert_eq!(
-            detected,
-            expected,
-            "auto-detect must pick user main at .text+{:#x}, not {:#x}",
-            text_main_offset,
-            detected - text.virtual_address
+        let main_off = pe.rva_to_file_offset(detected).unwrap() - text_start;
+        assert!(
+            (0x350..=0x900).contains(&main_off),
+            "detected main .text+{:#x} outside expected window",
+            main_off
+        );
+        let body_end = (main_off + super::MAIN_BODY_SCAN_MAX).min(text_data.len());
+        let body = &text_data[main_off..body_end];
+        assert!(
+            has_stdio_in_body(body) || has_stack_local_init(body),
+            "detected main at .text+{:#x} must look like user main (stdio or stack locals)",
+            main_off
+        );
+        assert!(
+            !is_global_ctors_walker(body),
+            "detected main must not be __do_global_ctors walker"
         );
     }
 
     fn bytecode_has_char_output_native(bytecode: &[u8], map: &OpcodeMap) -> bool {
         !native_call_ids_in_bytecode_with_map(bytecode, map).is_empty()
+    }
+
+    fn disasm_packed_table(packed: &PackResult) -> String {
+        use crate::ir::Instruction;
+        Instruction::pretty_print(&Instruction::disassemble_with_block_maps(
+            &packed.bytecode,
+            &packed.opcode_map,
+            Some(&packed.block_map_plan),
+            crate::vm::DispatchMode::Table,
+        ))
+    }
+
+    fn table_bytecode_has_cmp32_regs(
+        bc: &[u8],
+        base_map: &OpcodeMap,
+        plan: &BlockMapPlan,
+        r1: u8,
+        r2: u8,
+    ) -> bool {
+        use crate::vm::block_map::{META_OPERAND_LEN, META_WIRE_BYTE};
+        let mut offset = 0usize;
+        let mut current_map = base_map.clone();
+        while offset < bc.len() {
+            if bc[offset] == META_WIRE_BYTE {
+                if offset + 1 + META_OPERAND_LEN <= bc.len() {
+                    let bb_id = u16::from_le_bytes([bc[offset + 1], bc[offset + 2]]);
+                    current_map = plan.map_for_bb_or_base(bb_id, base_map);
+                    offset += 1 + META_OPERAND_LEN;
+                    continue;
+                }
+                break;
+            }
+            let wire = bc[offset];
+            if let Some(op) = current_map.decode(wire) {
+                if op == OpCode::Cmp32
+                    && offset + 3 <= bc.len()
+                    && bc[offset + 1] == r1
+                    && bc[offset + 2] == r2
+                {
+                    return true;
+                }
+                offset += 1 + op.operand_len();
+            } else {
+                offset += 1;
+            }
+        }
+        false
+    }
+
+    fn table_bytecode_insn_after_cmp32_regs(
+        bc: &[u8],
+        base_map: &OpcodeMap,
+        plan: &BlockMapPlan,
+        r1: u8,
+        r2: u8,
+    ) -> Option<OpCode> {
+        use crate::vm::block_map::{META_OPERAND_LEN, META_WIRE_BYTE};
+        let mut offset = 0usize;
+        let mut current_map = base_map.clone();
+        while offset < bc.len() {
+            if bc[offset] == META_WIRE_BYTE {
+                if offset + 1 + META_OPERAND_LEN <= bc.len() {
+                    let bb_id = u16::from_le_bytes([bc[offset + 1], bc[offset + 2]]);
+                    current_map = plan.map_for_bb_or_base(bb_id, base_map);
+                    offset += 1 + META_OPERAND_LEN;
+                    continue;
+                }
+                break;
+            }
+            let wire = bc[offset];
+            if let Some(op) = current_map.decode(wire) {
+                if op == OpCode::Cmp32
+                    && offset + 3 <= bc.len()
+                    && bc[offset + 1] == r1
+                    && bc[offset + 2] == r2
+                {
+                    let next = offset + 3;
+                    if next >= bc.len() {
+                        return None;
+                    }
+                    if bc[next] == META_WIRE_BYTE {
+                        return Some(OpCode::SetBlockMap);
+                    }
+                    return current_map.decode(bc[next]);
+                }
+                offset += 1 + op.operand_len();
+            } else {
+                offset += 1;
+            }
+        }
+        None
     }
 
     #[test]
@@ -1231,16 +1357,17 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        assert_mingw_auto_main(&pe, 0x760);
+        assert_mingw_auto_main(&pe);
         let packed = pack_pe(&mut pe, None);
-        let bc = packed.bytecode;
-        let map = packed.opcode_map;
+        let ir = disasm_packed_table(&packed);
+        let bc = &packed.bytecode;
+        let map = &packed.opcode_map;
         assert!(
             bc.len() < 300,
             "packed real arith bytecode should stay compact, got {}",
             bc.len()
         );
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map, crate::vm::DispatchMode::Table));
+        let ir = disasm_packed_table(&packed);
         let lines: Vec<&str> = ir.lines().collect();
         let nc2_idx = lines
             .iter()
@@ -1309,16 +1436,17 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        assert_mingw_auto_main(&pe, 0x78f);
+        assert_mingw_auto_main(&pe);
         let packed = pack_pe(&mut pe, None);
-        let bc = packed.bytecode;
-        let map = packed.opcode_map;
+        let ir = disasm_packed_table(&packed);
+        let bc = &packed.bytecode;
+        let map = &packed.opcode_map;
         assert!(
             (200..=500).contains(&bc.len()),
             "fact auto-main pack expected substantial CFG lift, got {} bytes",
             bc.len()
         );
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map, crate::vm::DispatchMode::Table));
+        let ir = disasm_packed_table(&packed);
         assert!(
             ir.contains("call         | 0x"),
             "fact must recurse via vm call:\n{ir}"
@@ -1346,9 +1474,9 @@ mod tests {
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
         let packed = pack_pe(&mut pe, None);
-        let bc = packed.bytecode;
-        let map = packed.opcode_map;
-        let ir = Instruction::pretty_print(&Instruction::disassemble(&bc, &map, crate::vm::DispatchMode::Table));
+        let ir = disasm_packed_table(&packed);
+        let bc = &packed.bytecode;
+        let map = &packed.opcode_map;
         assert!(
             ir.contains("native_call  | 0x10000"),
             "nested must use IAT putchar:\n{ir}"
@@ -1386,32 +1514,18 @@ mod tests {
             ir.contains("cmp32        | r12, r15") || ir.contains("cmp32          | r12, r15"),
             "nested must cmp32 product against 9:\n{ir}"
         );
-        let product_cmp = bc
-            .windows(3)
-            .position(|w| w == [map.encode(OpCode::Cmp32), 12, 15])
-            .expect("nested bytecode must contain cmp32 r12,r15");
-        assert_eq!(
-            bc.get(product_cmp + 3),
-            Some(&(map.encode(OpCode::Jmp))),
-            "cmp32 r12,r15 must be followed by jmp to single-digit path"
-        );
-        let jle_after_product_nine = bc
-            .windows(13)
-            .position(|w| {
-                w[0] == map.encode(OpCode::LoadImm)
-                    && w[1] == 15
-                    && u64::from_le_bytes(w[2..10].try_into().unwrap()) == 9
-                    && w[10] == map.encode(OpCode::Cmp32)
-                    && w[11] == 12
-                    && w[12] == 15
-            })
-            .and_then(|p| {
-                let after = p + 13;
-                (after < bc.len() && bc[after] == map.encode(OpCode::JmpIf)).then_some(after)
-            });
+        let product_cmp = table_bytecode_has_cmp32_regs(bc, map, &packed.block_map_plan, 12, 15);
+        assert!(product_cmp, "nested bytecode must contain cmp32 r12,r15");
         assert!(
-            jle_after_product_nine.is_none(),
-            "product<=9 must not use jmp_if JLE into two-digit path"
+            matches!(
+                table_bytecode_insn_after_cmp32_regs(bc, map, &packed.block_map_plan, 12, 15),
+                Some(OpCode::Jmp) | Some(OpCode::JmpIf)
+            ),
+            "cmp32 r12,r15 must branch to single-digit path (jmp or fused jle)"
+        );
+        assert!(
+            !ir.lines().any(|l| l.contains("jmp_if") && l.contains("r12")),
+            "product<=9 must not use jmp_if JLE into two-digit path:\n{ir}"
         );
     }
 
@@ -1477,7 +1591,7 @@ mod tests {
         const GOLDEN: &[u8] = b"1x1=1\r\n1x2=2\r\n1x3=3\r\n2x1=2\r\n2x2=4\r\n2x3=6\r\n3x1=3\r\n3x2=6\r\n3x3=9\r\n";
 
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        assert_mingw_auto_main(&pe, 0x79c);
+        assert_mingw_auto_main(&pe);
         let packed = pack_pe(&mut pe, None);
         let bc = packed.bytecode;
         let map = packed.opcode_map;

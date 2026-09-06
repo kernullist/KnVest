@@ -89,12 +89,16 @@ pub fn native_call_ids_in_bytecode_with_map_dispatch(
     let mut current_map = map.clone();
     while offset < bytecode.len() {
         if bytecode[offset] == META_WIRE_BYTE {
-            if offset + 1 + META_OPERAND_LEN <= bytecode.len() {
-                let bb_id = u16::from_le_bytes([bytecode[offset + 1], bytecode[offset + 2]]);
+            let mut meta_off = offset + 1;
+            if dispatch_mode == DispatchMode::Threaded {
+                meta_off += THREAD_TARGET_SIZE;
+            }
+            if meta_off + META_OPERAND_LEN <= bytecode.len() {
+                let bb_id = u16::from_le_bytes([bytecode[meta_off], bytecode[meta_off + 1]]);
                 current_map = block_plan
                     .map(|p| p.map_for_bb_or_base(bb_id, map))
                     .unwrap_or_else(|| BlockMapPlan::block_opcode_map(map.seed(), bb_id as usize));
-                offset += 1 + META_OPERAND_LEN;
+                offset = meta_off + META_OPERAND_LEN;
                 continue;
             }
             break;
@@ -103,7 +107,11 @@ pub fn native_call_ids_in_bytecode_with_map_dispatch(
         let op = match current_map.decode(wire) {
             Some(op) => op,
             None => {
-                offset += 1;
+                offset += if dispatch_mode == DispatchMode::Threaded {
+                    1 + THREAD_TARGET_SIZE
+                } else {
+                    1
+                };
                 continue;
             }
         };
@@ -511,6 +519,34 @@ mod tests {
                     None,
                 )[0],
             )
+        );
+    }
+
+    #[test]
+    fn native_call_ids_in_l4e_threaded_puts_hello_sample() {
+        use crate::pe::packer::pack_function;
+        use crate::pe::parser::PEFile;
+        use crate::vm::DispatchMode;
+        use std::path::Path;
+
+        let path = Path::new("sample/puts_hello.exe");
+        if !path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
+        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded)
+            .unwrap();
+        let ids = native_call_ids_in_bytecode_with_map_dispatch(
+            &packed.bytecode,
+            &packed.opcode_map,
+            DispatchMode::Threaded,
+            Some(&packed.block_map_plan),
+        );
+        assert!(
+            ids.iter().any(|id| is_iat_ptr_native_call(*id)),
+            "L4e threaded puts_hello scan got {:?} from {} byte bytecode",
+            ids,
+            packed.bytecode.len()
         );
     }
 

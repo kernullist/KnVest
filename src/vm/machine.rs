@@ -40,6 +40,8 @@ pub struct VirtualMachine {
     bytecode: Vec<u8>,
     opcode_map: Option<OpcodeMap>,
     block_map_plan: Option<BlockMapPlan>,
+    /// Active L4e basic-block id (updated on META set_block_map).
+    current_bb_id: u16,
     native_functions: HashMap<u64, fn(&mut VirtualMachine) -> VMResult<()>>,
     pub exit_code: Option<i32>,
     pub data_section: Vec<u8>,
@@ -57,6 +59,7 @@ impl VirtualMachine {
             bytecode,
             opcode_map: None,
             block_map_plan: None,
+            current_bb_id: 0,
             native_functions: HashMap::new(),
             exit_code: None,
             data_section: Vec::new(),
@@ -172,6 +175,7 @@ impl VirtualMachine {
                 BlockMapPlan::block_opcode_map(base_seed, bb_id as usize)
             };
             self.opcode_map = Some(new_map);
+            self.current_bb_id = bb_id;
             return Ok(());
         }
 
@@ -328,13 +332,33 @@ impl VirtualMachine {
             
             OpCode::Call => {
                 let offset = self.read_u64()? as usize;
-                self.push_stack(self.pc as u64)?;
+                if self.block_map_plan.is_some() {
+                    let ret_pc = self.pc as u64;
+                    let caller_bb = u64::from(self.current_bb_id);
+                    self.push_stack(ret_pc | (caller_bb << 32))?;
+                } else {
+                    self.push_stack(self.pc as u64)?;
+                }
                 self.pc = offset;
             },
             
             OpCode::Ret => {
-                let return_addr = self.pop_stack()? as usize;
-                self.pc = return_addr;
+                if self.block_map_plan.is_some() {
+                    let packed = self.pop_stack()?;
+                    self.pc = (packed & 0xFFFF_FFFF) as usize;
+                    let caller_bb = (packed >> 32) as u16;
+                    if let Some(plan) = &self.block_map_plan {
+                        let base = self
+                            .opcode_map
+                            .as_ref()
+                            .ok_or(VMError::InvalidOpcode(0))?;
+                        self.opcode_map = Some(plan.map_for_bb_or_base(caller_bb, base));
+                        self.current_bb_id = caller_bb;
+                    }
+                } else {
+                    let return_addr = self.pop_stack()? as usize;
+                    self.pc = return_addr;
+                }
             },
             
             OpCode::NativeCall => {
@@ -430,6 +454,49 @@ mod tests {
         let mut vm = VirtualMachine::new(bytecode);
         vm.run().unwrap();
         assert_eq!(vm.get_register(2).unwrap(), 30);
+    }
+
+    #[test]
+    fn test_l4e_call_ret_restores_block_opcode_map() {
+        use crate::vm::block_map::{emit_block_map_refresh, BlockMapPlan, META_WIRE_BYTE};
+        use crate::vm::OpcodeMap;
+
+        let seed = 0x4C34_4100u64;
+        let base = OpcodeMap::from_seed(seed);
+        let mut plan = BlockMapPlan {
+            decode_key: BlockMapPlan::global_decode_key(seed),
+            entries: vec![],
+            ..Default::default()
+        };
+        plan.record_block(seed, 0);
+        plan.record_block(seed, 1);
+
+        let mut bytecode = Vec::new();
+        emit_block_map_refresh(&mut bytecode, 0);
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::LoadImm));
+        bytecode.push(0);
+        bytecode.extend_from_slice(&1u64.to_le_bytes());
+        let call_pos = bytecode.len();
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::Call));
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
+        emit_block_map_refresh(&mut bytecode, 0);
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::LoadImm));
+        bytecode.push(1);
+        bytecode.extend_from_slice(&3u64.to_le_bytes());
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::Exit));
+        bytecode.push(0);
+        let callee_off = bytecode.len();
+        bytecode[call_pos + 1..call_pos + 9].copy_from_slice(&(callee_off as u64).to_le_bytes());
+        emit_block_map_refresh(&mut bytecode, 1);
+        bytecode.push(plan.map_for_bb_or_base(1, &base).encode(OpCode::LoadImm));
+        bytecode.push(0);
+        bytecode.extend_from_slice(&2u64.to_le_bytes());
+        bytecode.push(plan.map_for_bb_or_base(1, &base).encode(OpCode::Ret));
+
+        let mut vm = VirtualMachine::with_block_maps(bytecode, base, plan);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 2);
+        assert_eq!(vm.get_register(1).unwrap(), 3);
     }
 
     #[test]
