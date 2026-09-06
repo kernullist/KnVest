@@ -18,13 +18,19 @@ use std::collections::HashMap;
 //   ret addrs      [rbp + depth*8 - 0x200]       (depth 3 → -0x1E8; must not use for scratch)
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
-pub fn create_vm_interpreter_stub(_image_base: u64, _section_rva: u32, map: &OpcodeMap) -> (Vec<u8>, usize) {
+pub fn create_vm_interpreter_stub(
+    _image_base: u64,
+    _section_rva: u32,
+    map: &OpcodeMap,
+    knv5: &[u8],
+    native_sleds: &[u8],
+) -> (Vec<u8>, usize) {
     let mut e = StubEmitter::new(map);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
     e.emit_handlers();
-    e.emit_strings_and_marker();
+    e.emit_strings_and_marker(knv5, native_sleds);
     e.finalize()
 }
 
@@ -258,6 +264,8 @@ impl StubEmitter {
                 crate::vm::OpCode::LoadByte => self.emit_handler_load_byte(),
                 crate::vm::OpCode::Cmp32 => self.emit_handler_cmp32(),
                 crate::vm::OpCode::And => self.emit_handler_and(),
+                crate::vm::OpCode::RunNative => self.emit_handler_run_native(),
+                crate::vm::OpCode::BailNative => self.emit_handler_bail_native(),
                 crate::vm::OpCode::Exit => self.emit_handler_exit(),
                 _ => unreachable!("canonical opcode set only"),
             }
@@ -378,6 +386,36 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
         self.emit(&[0x48, 0x23, 0x44, 0xD5, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+        self.jmp_to_dispatch();
+    }
+
+    fn emit_handler_run_native(&mut self) {
+        self.label("h_run_native");
+        self.emit_native_sled_invoke();
+    }
+
+    fn emit_handler_bail_native(&mut self) {
+        self.label("h_bail_native");
+        self.emit_native_sled_invoke();
+    }
+
+    /// L4d: read sled offset + orig rva, sync VM regs, call native sled, resume dispatch.
+    fn emit_native_sled_invoke(&mut self) {
+        self.emit(&[0x48, 0x8B, 0x06]); // mov rax, [rsi] sled offset
+        self.emit(&[0x48, 0x83, 0xC6, 0x08]); // add rsi, 8 (skip orig rva)
+        self.emit(&[0x48, 0x89, 0x85, 0x68, 0xFF, 0xFF, 0xFF]); // save rsi
+        self.lea_rip_rel32(0x4C, 2, "native_sleds"); // lea r10, [native_sleds]
+        self.emit(&[0x49, 0x01, 0xC2]); // add r10, rax
+        // sync VM r0..r3 into rcx, rdx, r8, r9 for native snippets
+        self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80]
+        self.emit(&[0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // mov edx, [rbp-0x78]
+        self.emit(&[0x44, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // mov r8d, [rbp-0x70]
+        self.emit(&[0x44, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // mov r9d, [rbp-0x68]
+        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // shadow space
+        self.emit(&[0x41, 0xFF, 0xD2]); // call r10
+        self.emit(&[0x48, 0x83, 0xC4, 0x28]);
+        self.emit(&[0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x80], rax
+        self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // restore rsi
         self.jmp_to_dispatch();
     }
 
@@ -719,7 +757,7 @@ impl StubEmitter {
             .handler_table_start
             .expect("handler table placeholder missing");
         let handlers = self.opcode_map.handler_table_entries();
-        let default_off = self.handler_offset("h_nop", table_base);
+        let default_off = self.handler_offset("h_bail_native", table_base);
         for i in 0..256usize {
             let op = i as u8;
             let off = handlers
@@ -737,7 +775,7 @@ impl StubEmitter {
         (handler as i64 - table_base as i64) as i32
     }
 
-    fn emit_strings_and_marker(&mut self) {
+    fn emit_strings_and_marker(&mut self, knv5: &[u8], native_sleds: &[u8]) {
         self.label("k32_str");
         self.emit(&[
             0x6B, 0x00, 0x65, 0x00, 0x72, 0x00, 0x6E, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x33, 0x00,
@@ -756,6 +794,15 @@ impl StubEmitter {
             self.emit(&[0xCC]);
         }
         self.emit(&self.opcode_map.to_embedded_bytes());
+        self.emit(knv5);
+        while self.pos() % 16 != 0 {
+            self.emit(&[0xCC]);
+        }
+        self.label("native_sleds");
+        self.emit(native_sleds);
+        while self.pos() % 16 != 0 {
+            self.emit(&[0xCC]);
+        }
         self.emit(b"VMBC");
         self.label("bytecode");
     }
@@ -792,7 +839,7 @@ mod tests {
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
     #[test]
     fn peb_module_walk_single_advance_per_iteration() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let init = [0x49u8, 0x8B, 0x0B]; // mov rcx, [r11] — first module
         let done = [0x48u8, 0x8B, 0x59, 0x30]; // name_cmp_done: mov rbx, [rcx+0x30]
         let advance = [0x48u8, 0x8B, 0x09]; // mov rcx, [rcx]
@@ -824,7 +871,7 @@ mod tests {
 
     #[test]
     fn iat_native_call_threshold_uses_full_mov_rcx_imm64() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let pattern = [
             0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rcx, 0x100000000
             0x48, 0x39, 0xC8, // cmp rax, rcx
@@ -842,7 +889,7 @@ mod tests {
 
     #[test]
     fn vm_metadata_uses_l2_slots_with_correct_disp32() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let call_depth_init = [0x48u8, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         let push_depth_init = [0x48u8, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
         assert!(
@@ -883,7 +930,7 @@ mod tests {
 
     #[test]
     fn iat_native_call_maps_x64_rcx_from_vm_reg0() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         // nc_iat must load win64 rcx from VM r0 slot [rbp-0x80] (zero-extended via mov ecx)
         let rcx_from_r0 = [0x8Bu8, 0x8D, 0x80, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -997,7 +1044,7 @@ mod tests {
     /// Metadata (push/call depth, flags, rsi save) must not use VM r0..r15 frame slots.
     #[test]
     fn vm_stub_metadata_must_not_alias_vm_reg_slots() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let r13_slot = vm_reg_slot_disp32(13); // E8 FF FF FF = [rbp-0x18]
         assert!(
             !stub.windows(4).any(|w| w == r13_slot),
@@ -1234,7 +1281,7 @@ mod tests {
     /// Every SIB used for VM reg [rbp+idx*scale-0x80] in handlers must be scale*8 (CD/FD/D5).
     #[test]
     fn vm_reg_sib_must_be_scale8_in_handlers() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let forbidden_sib = [
             (0x8D, "rcx scale*4"),
             (0xBD, "rdi scale*4"),
@@ -1352,8 +1399,8 @@ mod tests {
         let seed_v1 = seed_for_add_variant(1);
         let map_v0 = crate::vm::OpcodeMap::from_seed(seed_v0);
         let map_v1 = crate::vm::OpcodeMap::from_seed(seed_v1);
-        let (stub_v0, _) = create_vm_interpreter_stub(0, 0, &map_v0);
-        let (stub_v1, _) = create_vm_interpreter_stub(0, 0, &map_v1);
+        let (stub_v0, _) = create_vm_interpreter_stub(0, 0, &map_v0, &[], &[]);
+        let (stub_v1, _) = create_vm_interpreter_stub(0, 0, &map_v1, &[], &[]);
 
         let h0 = add_handler_offset(&stub_v0, &map_v0);
         let h1 = add_handler_offset(&stub_v1, &map_v1);
@@ -1379,7 +1426,7 @@ mod tests {
         if ADD_HANDLER_VARIANT_COUNT >= 3 {
             let seed_v2 = seed_for_add_variant(2);
             let map_v2 = crate::vm::OpcodeMap::from_seed(seed_v2);
-            let (stub_v2, _) = create_vm_interpreter_stub(0, 0, &map_v2);
+            let (stub_v2, _) = create_vm_interpreter_stub(0, 0, &map_v2, &[], &[]);
             let h2 = add_handler_offset(&stub_v2, &map_v2);
             let body_v2 = &stub_v2[h2..h2 + 48];
             assert_ne!(body_v0, body_v2);
@@ -1397,8 +1444,8 @@ mod tests {
     fn add_handler_polymorphism_same_seed_is_stable() {
         let seed = seed_for_add_variant(1);
         let map = crate::vm::OpcodeMap::from_seed(seed);
-        let (a, _) = create_vm_interpreter_stub(0, 0, &map);
-        let (b, _) = create_vm_interpreter_stub(0, 0, &map);
+        let (a, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
+        let (b, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
         let ha = add_handler_offset(&a, &map);
         let hb = add_handler_offset(&b, &map);
         assert_eq!(&a[ha..ha + 48], &b[hb..hb + 48]);

@@ -155,6 +155,151 @@ pub fn disassemble_cfg_function(code: &[u8], entry_file_offset: usize) -> Vec<X6
     instructions
 }
 
+/// One basic block in a lifted function window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasicBlock {
+    pub id: usize,
+    pub start: usize,
+    pub end: usize,
+    pub leader_idx: usize,
+    pub tail_idx: usize,
+    pub has_back_edge: bool,
+    pub native_eligible: bool,
+}
+
+/// Split a linear instruction list into basic blocks from `entry` until the first `ret`.
+pub fn build_basic_blocks(instrs: &[X64Instruction], entry: usize) -> Vec<BasicBlock> {
+    if instrs.is_empty() {
+        return Vec::new();
+    }
+
+    let main_indices: Vec<usize> = instrs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.offset >= entry)
+        .map(|(idx, _)| idx)
+        .collect();
+    if main_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut leaders = HashSet::new();
+    leaders.insert(main_indices[0]);
+
+    for &idx in &main_indices {
+        let instr = &instrs[idx];
+        if let Some(target) = branch_target_offset(instr) {
+            let abs = (instr.offset as i64 + instr.bytes.len() as i64 + target as i64) as usize;
+            if instrs.iter().any(|i| i.offset == abs) {
+                leaders.insert(idx_for_offset(instrs, abs));
+            }
+        }
+        if is_block_end(&instr.kind) {
+            if idx + 1 < instrs.len() && instrs[idx + 1].offset >= entry {
+                leaders.insert(idx + 1);
+            }
+        }
+    }
+
+    let mut leader_list: Vec<usize> = leaders.into_iter().collect();
+    leader_list.sort_unstable_by_key(|&idx| instrs[idx].offset);
+
+    let mut blocks = Vec::new();
+    for (id, &leader_idx) in leader_list.iter().enumerate() {
+        let start = instrs[leader_idx].offset;
+        let next_leader = leader_list
+            .iter()
+            .copied()
+            .find(|&idx| instrs[idx].offset > start)
+            .unwrap_or(main_indices[main_indices.len() - 1] + 1);
+        let tail_idx = if next_leader > 0 {
+            next_leader - 1
+        } else {
+            leader_idx
+        };
+        let end = instrs[tail_idx].offset + instrs[tail_idx].bytes.len();
+        let has_back_edge = (leader_idx..=tail_idx).any(|idx| {
+            branch_target_offset(&instrs[idx]).map_or(false, |rel| {
+                let target = (instrs[idx].offset as i64
+                    + instrs[idx].bytes.len() as i64
+                    + rel as i64) as usize;
+                target <= start
+            })
+        });
+        let native_eligible = is_native_eligible(instrs, leader_idx, tail_idx);
+        blocks.push(BasicBlock {
+            id,
+            start,
+            end,
+            leader_idx,
+            tail_idx,
+            has_back_edge,
+            native_eligible,
+        });
+    }
+
+    blocks
+}
+
+fn idx_for_offset(instrs: &[X64Instruction], offset: usize) -> usize {
+    instrs
+        .iter()
+        .enumerate()
+        .find(|(_, i)| i.offset == offset)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+fn branch_target_offset(instr: &X64Instruction) -> Option<i32> {
+    match &instr.kind {
+        X64InstrKind::Jmp { target_offset }
+        | X64InstrKind::Je { target_offset }
+        | X64InstrKind::Jne { target_offset }
+        | X64InstrKind::Jl { target_offset }
+        | X64InstrKind::Jle { target_offset }
+        | X64InstrKind::Jg { target_offset }
+        | X64InstrKind::Jge { target_offset }
+        | X64InstrKind::Call { target_offset } => Some(*target_offset),
+        _ => None,
+    }
+}
+
+fn is_block_end(kind: &X64InstrKind) -> bool {
+    matches!(
+        kind,
+        X64InstrKind::Jmp { .. }
+            | X64InstrKind::Je { .. }
+            | X64InstrKind::Jne { .. }
+            | X64InstrKind::Jl { .. }
+            | X64InstrKind::Jle { .. }
+            | X64InstrKind::Jg { .. }
+            | X64InstrKind::Jge { .. }
+            | X64InstrKind::Ret
+            | X64InstrKind::Call { .. }
+            | X64InstrKind::CallIndRip { .. }
+    )
+}
+
+fn is_native_eligible(instrs: &[X64Instruction], leader_idx: usize, tail_idx: usize) -> bool {
+    for idx in leader_idx..tail_idx {
+        if branch_target_offset(&instrs[idx]).is_some() {
+            return false;
+        }
+    }
+    match &instrs[tail_idx].kind {
+        X64InstrKind::Ret => true,
+        X64InstrKind::Call { .. } | X64InstrKind::CallIndRip { .. } => false,
+        X64InstrKind::Jmp { .. }
+        | X64InstrKind::Je { .. }
+        | X64InstrKind::Jne { .. }
+        | X64InstrKind::Jl { .. }
+        | X64InstrKind::Jle { .. }
+        | X64InstrKind::Jg { .. }
+        | X64InstrKind::Jge { .. } => false,
+        _ => tail_idx == leader_idx || true,
+    }
+}
+
 /// Disassemble main only until the first `ret` (L2 main window).
 pub fn disassemble_main_window(
     pe_data: &[u8],

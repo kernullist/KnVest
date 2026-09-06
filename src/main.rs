@@ -47,7 +47,12 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     let pe = PEFile::from_file(&input)?;
     
     let opcode_map = packer::extract_opcode_map_from_packed(&pe)?;
+    let partial_plan = packer::extract_partial_plan_from_packed(&pe).ok();
     let bytecode = packer::extract_bytecode_from_packed(&pe)?;
+    
+    if let Some(plan) = partial_plan {
+        print!("{}", plan.format_ir_header(&opcode_map));
+    }
     
     let instructions = ir::Instruction::disassemble(&bytecode, &opcode_map);
     let output = ir::Instruction::pretty_print(&instructions);

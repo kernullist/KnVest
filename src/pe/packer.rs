@@ -1,7 +1,8 @@
 use super::parser::{PEFile, PEResult, PEError};
 use super::lifter::lift_to_vm_bytecode_for_main;
 use super::vm_stub::create_vm_interpreter_stub;
-use super::cfg::{collect_cfg_entries, disassemble_cfg_function};
+use super::cfg::{collect_cfg_entries, disassemble_cfg_function, build_basic_blocks};
+use super::partial::{NativeSledBuilder, PartialVirtPlan, KNV5_MAGIC};
 use crate::vm::{OpcodeMap, random_seed, set_active_map, clear_active_map};
 use crate::vm::opcode_map::KNV4_MAGIC;
 
@@ -12,6 +13,8 @@ pub struct PackResult {
     pub bytecode: Vec<u8>,
     pub opcode_map: OpcodeMap,
     pub seed: u64,
+    pub partial_plan: PartialVirtPlan,
+    pub native_sleds: Vec<u8>,
 }
 
 pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u64>) -> PEResult<PackResult> {
@@ -26,14 +29,30 @@ pub fn pack_function(pe: &mut PEFile, function_rva: Option<u32>, seed: Option<u6
     let pack_seed = seed.unwrap_or_else(random_seed);
     let opcode_map = OpcodeMap::from_seed(pack_seed);
 
-    let bytecode = translate_to_vm_bytecode(pe, target_rva, original_entry_rva, explicit_rva, &opcode_map)?;
-    
-    add_vm_section(pe, &[], &bytecode, &opcode_map)?;
-    
+    let translated = translate_to_vm_bytecode(
+        pe,
+        target_rva,
+        original_entry_rva,
+        explicit_rva,
+        &opcode_map,
+        pack_seed,
+    )?;
+
+    add_vm_section(
+        pe,
+        &[],
+        &translated.bytecode,
+        &opcode_map,
+        &translated.partial_plan,
+        &translated.native_sleds,
+    )?;
+
     Ok(PackResult {
-        bytecode,
+        bytecode: translated.bytecode,
         opcode_map,
         seed: pack_seed,
+        partial_plan: translated.partial_plan,
+        native_sleds: translated.native_sleds,
     })
 }
 
@@ -370,13 +389,20 @@ fn detect_main_rva(pe: &PEFile) -> PEResult<u32> {
     Ok(pe.entry_point_rva)
 }
 
+struct TranslateResult {
+    bytecode: Vec<u8>,
+    partial_plan: PartialVirtPlan,
+    native_sleds: Vec<u8>,
+}
+
 fn translate_to_vm_bytecode(
     pe: &PEFile,
     target_rva: u32,
     _original_entry: u32,
     explicit_rva: bool,
     opcode_map: &OpcodeMap,
-) -> PEResult<Vec<u8>> {
+    pack_seed: u64,
+) -> PEResult<TranslateResult> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
     if file_offset + 16 > pe.data.len() {
@@ -419,6 +445,11 @@ fn translate_to_vm_bytecode(
     }
 
     let string_literal = find_string_literal_in_pe(pe);
+
+    let main_blocks = build_basic_blocks(&all_instrs, file_offset);
+    let partial_plan = PartialVirtPlan::from_seed(pack_seed, &main_blocks, file_offset, pe)?;
+    let mut sled_builder = NativeSledBuilder::new();
+
     set_active_map(opcode_map);
     let bytecode = lift_to_vm_bytecode_for_main(
         &all_instrs,
@@ -428,10 +459,17 @@ fn translate_to_vm_bytecode(
         string_literal.as_deref(),
         &imports,
         opcode_map,
+        Some(&partial_plan),
+        &mut sled_builder,
     );
     clear_active_map();
 
-    Ok(bytecode)
+    let native_sleds = sled_builder.blob();
+    Ok(TranslateResult {
+        bytecode,
+        partial_plan,
+        native_sleds,
+    })
 }
 
 fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
@@ -459,7 +497,14 @@ fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
     None
 }
 
-fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8], opcode_map: &OpcodeMap) -> PEResult<()> {
+fn add_vm_section(
+    pe: &mut PEFile,
+    _vm_stub_template: &[u8],
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    partial_plan: &PartialVirtPlan,
+    native_sleds: &[u8],
+) -> PEResult<()> {
     let _original_entry_rva = pe.entry_point_rva;
     
     let last_section = get_last_section(pe)?;
@@ -482,7 +527,14 @@ fn add_vm_section(pe: &mut PEFile, _vm_stub_template: &[u8], bytecode: &[u8], op
     };
     
     let image_base = 0x140000000u64;
-    let (vm_stub, _) = create_vm_interpreter_stub(image_base, new_virtual_address, opcode_map);
+    let knv5 = partial_plan.to_embedded_bytes();
+    let (vm_stub, _) = create_vm_interpreter_stub(
+        image_base,
+        new_virtual_address,
+        opcode_map,
+        &knv5,
+        native_sleds,
+    );
     
     let mut section_data = Vec::new();
     section_data.extend_from_slice(&vm_stub);
@@ -641,6 +693,26 @@ pub fn extract_opcode_map_from_packed(pe: &PEFile) -> PEResult<OpcodeMap> {
     }
     Err(PEError::InvalidPE(
         "Packed image missing KNV4 opcode map (L4a); raw bytecode cannot be decoded".to_string(),
+    ))
+}
+
+pub fn extract_partial_plan_from_packed(pe: &PEFile) -> PEResult<PartialVirtPlan> {
+    let section = pe.get_section(".knvest")?;
+    let section_start = section.pointer_to_raw_data as usize;
+    let section_end = section_start + section.size_of_raw_data as usize;
+    if section_end > pe.data.len() {
+        return Err(PEError::InvalidPE("Section data out of bounds".to_string()));
+    }
+    let section_data = &pe.data[section_start..section_end];
+    for i in 0..section_data.len().saturating_sub(KNV5_MAGIC.len()) {
+        if &section_data[i..i + KNV5_MAGIC.len()] == KNV5_MAGIC {
+            if let Some(plan) = PartialVirtPlan::from_embedded(&section_data[i..]) {
+                return Ok(plan);
+            }
+        }
+    }
+    Err(PEError::InvalidPE(
+        "Packed image missing KNV5 partial-virt metadata (L4d)".to_string(),
     ))
 }
 
@@ -1261,7 +1333,7 @@ mod tests {
     
     #[test]
     fn test_stub_encoding_correctness() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         
         let mut i = 0;
         while i < stub.len() {
@@ -1296,7 +1368,7 @@ mod tests {
 
     #[test]
     fn test_stub_does_not_clobber_writefile_slot() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
         let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1313,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_loadbyte_uses_rip_rel_bytecode_base() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
@@ -1349,7 +1421,7 @@ mod tests {
 
     #[test]
     fn test_prologue_uses_near_jb_ja_not_jl_jg() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let cmp_a = [0x83u8, 0xF8, 0x41];
         let mut found_jb = false;
         for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
@@ -1375,7 +1447,7 @@ mod tests {
     #[test]
     fn test_handler_table_resolves_handlers() {
         let map = OpcodeMap::from_seed(0);
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &map);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
         let dispatch_lea = [0x48u8, 0x8D, 0x1D];
         let mut table_base = None;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1401,7 +1473,7 @@ mod tests {
 
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1495,7 +1567,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let ne_cond = [0x83u8, 0xF9, 0x02];
         let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
@@ -1527,7 +1599,7 @@ mod tests {
 
     #[test]
     fn test_h_cmp_preserves_zf_in_flag_mask() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
         assert!(
             stub.windows(mask.len()).any(|w| w == mask),
@@ -1537,7 +1609,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_taken_uses_add_rsi_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let taken_add = [0x48u8, 0x01, 0xDE];
         assert!(
             stub.windows(taken_add.len()).any(|w| w == taken_add),
@@ -1547,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_three_digit_printer_uses_rcx_buffer() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
         let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -1617,7 +1689,7 @@ mod tests {
 
     #[test]
     fn test_module_next_advances_rcx_not_rbx() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let advance_rcx = [0x48u8, 0x8B, 0x09];
         let advance_rbx = [0x48u8, 0x8B, 0x1B];
         assert!(
@@ -1632,7 +1704,7 @@ mod tests {
 
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
-        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0));
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), &[], &[]);
         let pat = [0x48u8, 0x8D, 0x1D];
         let mut table_base = 0usize;
         for i in 0..stub.len().saturating_sub(7) {
@@ -1732,8 +1804,8 @@ mod tests {
         let packed_a = pack_pe_seed(&mut pe_a, None, seed_a);
         let packed_b = pack_pe_seed(&mut pe_b, None, seed_b);
 
-        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map);
-        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map);
+        let (stub_a, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, &[], &[]);
+        let (stub_b, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, &[], &[]);
         assert_ne!(stub_a, stub_b, "different Add variants must change stub bytes");
 
         let ir_a = Instruction::pretty_print(
@@ -1768,6 +1840,97 @@ mod tests {
             bc.len() < 400,
             "forward CRT must not be lifted into bytecode, got {} bytes",
             bc.len()
+        );
+    }
+
+    #[test]
+    fn test_l4d_partial_virt_emits_run_native_for_native_bb() {
+        use crate::ir::Instruction;
+        use crate::vm::OpCode;
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_seed(&mut pe, Some(main_rva), 0x14D0_2026);
+        assert!(
+            !packed.partial_plan.full_virt,
+            "countdown loop fixture should use partial virt"
+        );
+        let run_wire = packed.opcode_map.encode(OpCode::RunNative);
+        assert!(
+            packed.bytecode.contains(&run_wire),
+            "partial pack must emit run_native, got plan {:?}",
+            packed.partial_plan.blocks
+        );
+        let ir = Instruction::pretty_print(&Instruction::disassemble(
+            &packed.bytecode,
+            &packed.opcode_map,
+        ));
+        assert!(ir.contains("run_native"), "IR must show run_native:\n{ir}");
+        let plan = extract_partial_plan_from_packed(&pe).unwrap();
+        assert_eq!(plan.decode_key, packed.partial_plan.decode_key);
+    }
+
+    #[test]
+    fn test_l4d_unknown_emits_bail_native_in_partial_mode() {
+        use crate::vm::OpCode;
+        use super::super::lifter::{X64Instruction, X64InstrKind, lift_to_vm_bytecode_for_main};
+        use super::super::partial::{NativeSledBuilder, PartialVirtPlan};
+        use super::super::cfg::{build_basic_blocks, disassemble_main_window};
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_off = pe.rva_to_file_offset(text.virtual_address).unwrap() + 0x20;
+        let text_end = pe.rva_to_file_offset(text.virtual_address).unwrap()
+            + text.size_of_raw_data as usize;
+        let mut instrs = disassemble_main_window(&pe.data, main_off, text_end);
+        let loop_idx = instrs
+            .iter()
+            .position(|i| matches!(i.kind, X64InstrKind::Jmp { .. }))
+            .unwrap_or(0);
+        instrs.insert(
+            loop_idx,
+            X64Instruction {
+                offset: instrs[loop_idx].offset,
+                bytes: vec![0x0F, 0x0B],
+                kind: X64InstrKind::Unknown,
+            },
+        );
+        let blocks = build_basic_blocks(&instrs, main_off);
+        let plan = PartialVirtPlan::from_seed(0xBA11_0001, &blocks, main_off, &pe).unwrap();
+        let map = OpcodeMap::from_seed(0xBA11_0001);
+        let mut sled = NativeSledBuilder::new();
+        set_active_map(&map);
+        let bc = lift_to_vm_bytecode_for_main(
+            &instrs,
+            text.virtual_address + 0x20,
+            main_off,
+            &pe,
+            None,
+            &pe.parse_imports().unwrap(),
+            &map,
+            Some(&plan),
+            &mut sled,
+        );
+        clear_active_map();
+        let bail_wire = map.encode(OpCode::BailNative);
+        assert!(
+            bc.contains(&bail_wire),
+            "Unknown in VM BB must emit bail_native in partial mode"
+        );
+        assert!(!sled.sleds.is_empty(), "bail_native needs a native sled");
+    }
+
+    #[test]
+    fn test_l4d_stub_has_native_sled_handlers() {
+        let map = OpcodeMap::from_seed(0xDEAD_BEEF);
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &[]);
+        let call_r10 = [0x41u8, 0xFF, 0xD2];
+        assert!(
+            stub.windows(call_r10.len()).any(|w| w == call_r10),
+            "L4d native sled invoke must call r10 (not rax) to avoid IAT clash"
         );
     }
 }
