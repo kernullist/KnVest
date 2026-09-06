@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         Commands::Ir { input } => {
             handle_ir_command(input)?;
         }
-        Commands::Pack { input, output, rva, seed, partial, dispatch } => {
+        Commands::Pack { input, output, rva, seed, partial, dispatch, mba } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
                 Some(u32::from_str_radix(rva_str, 16)?)
@@ -30,7 +30,7 @@ fn main() -> Result<()> {
             let dispatch_mode = dispatch
                 .parse::<crate::vm::DispatchMode>()
                 .map_err(|e| anyhow::anyhow!(e))?;
-            handle_pack_command(input, output, rva_value, seed_value, partial, dispatch_mode)?;
+            handle_pack_command(input, output, rva_value, seed_value, partial, dispatch_mode, mba)?;
         }
     }
 
@@ -69,6 +69,10 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     if let Some(ref plan) = block_plan {
         print!("{}", plan.format_ir_header(&opcode_map, dispatch_mode));
     }
+
+    if pack_meta.mba_enabled {
+        print!("{}", crate::pe::mba::format_ir_header(true));
+    }
     
     let instructions = ir::Instruction::disassemble_with_block_maps(
         &bytecode,
@@ -76,7 +80,7 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
         block_plan.as_ref(),
         dispatch_mode,
     );
-    let output = ir::Instruction::pretty_print(&instructions);
+    let output = ir::Instruction::pretty_print_with_mba(&instructions, pack_meta.mba_enabled);
     
     println!("{}", output);
     
@@ -90,8 +94,9 @@ fn handle_pack_command(
     seed: Option<u64>,
     partial: bool,
     dispatch_mode: crate::vm::DispatchMode,
+    mba: bool,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode)?;
+    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode, mba)?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }
