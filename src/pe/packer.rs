@@ -1961,8 +1961,8 @@ mod tests {
         );
         let (stub, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, &[], &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
-        // Handler contract (Windows): r13=VM frame, r12=VM rsp, rcx=native frame,
-        // mov rbp/rsp=rcx, sub rsp 0x28, call r10 sled, restore rbp/rsp from r13/r12.
+        // Handler contract (Windows): r13=VM frame, r12=VM rsp, rcx=native locals base,
+        // lea rsp,[rcx+0x80] + shadow, call r10 sled, dword spill sync, restore rbp/rsp.
     }
 
     fn collect_run_native_sleds(
@@ -2003,8 +2003,12 @@ mod tests {
             "run_native must set native rbp before sled call"
         );
         assert!(
-            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
-            "run_native must switch rsp to native frame before sled call"
+            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "run_native must use lea rsp,[rcx+0x80] call stack above locals"
+        );
+        assert!(
+            !prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
+            "run_native must not mov rsp,rcx (shadow overlaps rbp locals)"
         );
     }
 

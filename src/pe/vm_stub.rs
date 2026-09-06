@@ -459,6 +459,44 @@ impl StubEmitter {
         }
     }
 
+    fn emit_mov_dword_from_r13_spill(&mut self, spill_reg: u8) {
+        let disp = (spill_reg as i32) * 8 - 0x80;
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x41, 0x8B, 0x45, disp as u8]); // mov eax, dword [r13+disp8]
+        } else {
+            self.emit(&[0x41, 0x8B, 0x84, 0x25]); // mov eax, dword [r13+disp32]
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_dword_to_r13_spill(&mut self, spill_reg: u8) {
+        let disp = (spill_reg as i32) * 8 - 0x80;
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x41, 0x89, 0x45, disp as u8]); // mov dword [r13+disp8], eax
+        } else {
+            self.emit(&[0x41, 0x89, 0x84, 0x25]); // mov dword [r13+disp32], eax
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_dword_to_rcx_disp(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x89, 0x41, disp as u8]); // mov dword [rcx+disp8], eax
+        } else {
+            self.emit(&[0x89, 0x81]); // mov dword [rcx+disp32], eax
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_mov_dword_from_rcx_disp(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x8B, 0x41, disp as u8]); // mov eax, dword [rcx+disp8]
+        } else {
+            self.emit(&[0x8B, 0x81]); // mov eax, dword [rcx+disp32]
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
     fn emit_handler_run_native(&mut self) {
         self.label("h_run_native");
         self.emit_native_sled_invoke("rn_frame_ready_run");
@@ -493,27 +531,25 @@ impl StubEmitter {
 
         self.label(frame_ready_label);
         for &(rbp_disp, spill) in &sync_pairs {
-            self.emit_mov_from_r13_spill(spill);
-            self.emit_mov_to_rcx_disp(rbp_disp);
+            self.emit_mov_dword_from_r13_spill(spill);
+            self.emit_mov_dword_to_rcx_disp(rbp_disp);
         }
 
-        self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — sled uses native frame
-        self.emit(&[0x48, 0x89, 0xCC]); // mov rsp, rcx — call must not push onto VM stack
+        self.emit(&[0x48, 0x89, 0xCD]); // mov rbp, rcx — sled uses native rbp locals
+        // Dedicated call stack above locals within native_stack (avoid rsp=rbp shadow overlap).
+        self.emit(&[0x48, 0x8D, 0x61, 0x80]); // lea rsp, [rcx+0x80]
+        self.emit(&[0x48, 0x83, 0xE4, 0xF0]); // and rsp, -16
         self.lea_rip_rel32(0x4C, 2, "native_sleds");
         self.emit(&[0x4D, 0x01, 0xDA]); // add r10, r11
         self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 shadow (rsp%16==8 before call)
         self.emit(&[0x41, 0xFF, 0xD2]); // call r10
         self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-        self.emit(&[0x49, 0x89, 0xC6]); // mov r14, rax — preserve return value
 
         self.emit_mov_from_r13_slot(-0x110); // rcx = native frame (call clobbers rcx)
         for &(rbp_disp, spill) in &sync_pairs {
-            self.emit_mov_from_rcx_disp(rbp_disp);
-            self.emit_mov_to_r13_spill(spill);
+            self.emit_mov_dword_from_rcx_disp(rbp_disp);
+            self.emit_mov_dword_to_r13_spill(spill);
         }
-
-        self.emit(&[0x4C, 0x89, 0xF0]); // mov rax, r14
-        self.emit_mov_to_r13_spill(0); // sync return value into VM r0
 
         self.emit(&[0x49, 0x89, 0xED]); // mov rbp, r13
         self.emit(&[0x49, 0x89, 0xE4]); // mov rsp, r12
@@ -1043,8 +1079,12 @@ mod tests {
             "mov rbp, rcx before sled call"
         );
         assert!(
-            prefix.windows(3).any(|w| w == [0x48, 0x89, 0xCC]),
-            "mov rsp, rcx before sled call"
+            prefix.windows(4).any(|w| w == [0x48, 0x8D, 0x61, 0x80]),
+            "lea rsp, [rcx+0x80] — call stack above native locals"
+        );
+        assert!(
+            prefix.windows(4).any(|w| w == [0x48, 0x83, 0xE4, 0xF0]),
+            "and rsp, -16 before sled call"
         );
         assert!(
             prefix.windows(4).any(|w| w == [0x48, 0x83, 0xEC, 0x28]),
@@ -1053,6 +1093,130 @@ mod tests {
         assert!(
             prefix.windows(3).any(|w| w == [0x4D, 0x01, 0xDA]),
             "lea/add native_sleds offset into r10"
+        );
+    }
+
+    #[test]
+    fn run_native_uses_dword_spill_sync_and_preserves_vm_r0() {
+        let sync = vec![(-4i32, 10u8)];
+        let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
+        let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
+        let (stub, _) = create_vm_interpreter_stub(0, 0, &map, &[], &sled, &sync);
+        let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
+        let run_site = stub
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .expect("h_run_native invoke prologue");
+        let bail_site = stub[run_site + 1..]
+            .windows(invoke_prologue.len())
+            .position(|w| w == invoke_prologue)
+            .map(|p| run_site + 1 + p)
+            .expect("h_bail_native invoke prologue");
+        let run_body = &stub[run_site..bail_site];
+        let call_at = run_body
+            .windows(3)
+            .position(|w| w == [0x41, 0xFF, 0xD2])
+            .expect("call r10 in run_native");
+        let before_call = &run_body[..call_at];
+        let after_call = &run_body[call_at + 3..];
+        assert!(
+            before_call.windows(3).any(|w| w == [0x41, 0x8B, 0x45]),
+            "pre-sync must use dword load from VM spill"
+        );
+        assert!(
+            before_call.windows(2).any(|w| w == [0x89, 0x41]),
+            "pre-sync must use dword store to native [rcx+disp]"
+        );
+        assert!(
+            after_call.windows(3).any(|w| w == [0x41, 0x89, 0x45]),
+            "post-sync must use dword store to VM spill"
+        );
+        // spill reg 0 → [r13-0x80]; must not write rax back into VM r0 after sled.
+        assert!(
+            !after_call.windows(4).any(|w| w == [0x41, 0x89, 0x45, 0x80]),
+            "run_native must not clobber VM r0 via spill slot 0"
+        );
+    }
+
+    /// Linux-only: gcc harness proves lea rsp,[rbp+0x80] + sub [rbp-4] sled layout works.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_native_layout_linux_gcc_harness() {
+        use std::io::Write;
+        use std::process::Command;
+
+        let src = r#"
+#include <stdio.h>
+#include <stdint.h>
+
+extern void invoke_sled(char *frame);
+
+int main(void) {
+    _Alignas(16) uint8_t arena[0x200];
+    for (int i = 0; i < 0x200; i++) arena[i] = 0;
+    char *frame = (char *)(arena + 0x100);
+    *(int32_t *)(frame - 4) = 3;
+    invoke_sled(frame);
+    if (*(int32_t *)(frame - 4) != 2) {
+        fprintf(stderr, "expected 2 got %d\n", *(int32_t *)(frame - 4));
+        return 1;
+    }
+    return 0;
+}
+"#;
+        let asm_src = r#"
+.globl sled_dec
+.globl invoke_sled
+sled_dec:
+    subl $1, -4(%rbp)
+    ret
+invoke_sled:
+    mov %rsp, %r12
+    mov %rbp, %r13
+    mov %rdi, %rbp
+    lea 0x80(%rbp), %rsp
+    and $-16, %rsp
+    sub $0x28, %rsp
+    call sled_dec
+    add $0x28, %rsp
+    mov %r13, %rbp
+    mov %r12, %rsp
+    ret
+"#;
+        let dir = std::env::temp_dir().join("knvest_run_native_harness");
+        let _ = std::fs::create_dir_all(&dir);
+        let c_path = dir.join("layout.c");
+        let s_path = dir.join("layout.S");
+        let exe_path = dir.join("layout");
+        {
+            let mut f = std::fs::File::create(&c_path).expect("write harness.c");
+            f.write_all(src.as_bytes()).expect("write harness source");
+            let mut f = std::fs::File::create(&s_path).expect("write harness.S");
+            f.write_all(asm_src.as_bytes()).expect("write harness asm");
+        }
+        let gcc = Command::new("gcc")
+            .args([
+                "-O0",
+                "-fno-stack-protector",
+                "-fcf-protection=none",
+                "-no-pie",
+                c_path.to_str().unwrap(),
+                s_path.to_str().unwrap(),
+                "-o",
+                exe_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("spawn gcc");
+        assert!(
+            gcc.status.success(),
+            "gcc harness build failed: {}",
+            String::from_utf8_lossy(&gcc.stderr)
+        );
+        let run = Command::new(&exe_path).output().expect("run harness");
+        assert!(
+            run.status.success(),
+            "run_native layout harness failed: {}",
+            String::from_utf8_lossy(&run.stderr)
         );
     }
 
