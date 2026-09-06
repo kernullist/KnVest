@@ -688,8 +688,8 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::pe::imports::{
-        iat_native_call_ids_in_bytecode, is_iat_native_call, is_iat_ptr_native_call,
-        is_putchar_import, native_call_iat_id, native_call_iat_ptr_id, native_call_ids_in_bytecode,
+        iat_native_call_ids_in_bytecode_with_map, is_iat_native_call, is_iat_ptr_native_call,
+        native_call_iat_ptr_id, native_call_ids_in_bytecode_with_map,
     };
     use crate::pe::test_pe;
     use crate::vm::{OpCode, OpcodeMap};
@@ -718,18 +718,8 @@ mod tests {
         );
     }
 
-    fn bytecode_has_putchar_native(bytecode: &[u8], pe: &PEFile) -> bool {
-        let imports = pe.parse_imports().unwrap();
-        let putchar_ids: Vec<u64> = imports
-            .entries()
-            .iter()
-            .filter(|e| is_putchar_import(&e.name))
-            .map(|e| native_call_iat_id(e.iat_rva))
-            .collect();
-        let iat_ids = iat_native_call_ids_in_bytecode(bytecode);
-        iat_ids.iter().any(|id| putchar_ids.contains(id))
-            || iat_ids.iter().any(|id| !is_iat_ptr_native_call(*id))
-            || native_call_ids_in_bytecode(bytecode).contains(&3)
+    fn bytecode_has_char_output_native(bytecode: &[u8], map: &OpcodeMap) -> bool {
+        !native_call_ids_in_bytecode_with_map(bytecode, map).is_empty()
     }
 
     #[test]
@@ -960,9 +950,10 @@ mod tests {
     fn register_packed_putchar_natives(
         vm: &mut crate::vm::VirtualMachine,
         bytecode: &[u8],
+        map: &OpcodeMap,
         putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
     ) {
-        for id in iat_native_call_ids_in_bytecode(bytecode) {
+        for id in iat_native_call_ids_in_bytecode_with_map(bytecode, map) {
             if !is_iat_ptr_native_call(id) {
                 vm.register_native(id, putchar);
             }
@@ -973,10 +964,11 @@ mod tests {
     fn register_packed_stdio_natives(
         vm: &mut crate::vm::VirtualMachine,
         bytecode: &[u8],
+        map: &OpcodeMap,
         putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
         printf: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
     ) {
-        for id in native_call_ids_in_bytecode(bytecode) {
+        for id in native_call_ids_in_bytecode_with_map(bytecode, map) {
             if is_iat_ptr_native_call(id) {
                 vm.register_native(id, printf);
             } else if is_iat_native_call(id) {
@@ -1026,12 +1018,12 @@ mod tests {
         }
 
         assert!(
-            bytecode_has_putchar_native(&bc, &pe),
-            "nested bytecode must contain putchar native_call (IAT or nc3), got {:?}",
-            iat_native_call_ids_in_bytecode(&bc)
+            bytecode_has_char_output_native(&bc, &map),
+            "packed nested must emit at least one native_call for char output, got {:?}",
+            native_call_ids_in_bytecode_with_map(&bc, &map)
         );
         let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
-        register_packed_putchar_natives(&mut vm, &bc, putchar_native);
+        register_packed_putchar_natives(&mut vm, &bc, &map, putchar_native);
         vm.run().expect("nested VM run");
 
         let out = NESTED_OUT.with(|buf| buf.borrow().clone());
@@ -1089,7 +1081,7 @@ mod tests {
         }
 
         let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
-        register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
+        register_packed_stdio_natives(&mut vm, &bc, &map, putchar_native, printf_native);
         vm.run().expect("loop VM run");
 
         let out = LOOP_OUT.with(|buf| buf.borrow().clone());
@@ -1137,7 +1129,7 @@ mod tests {
         }
 
         let mut vm = VirtualMachine::with_opcode_map(bc.clone(), map.clone());
-        register_packed_stdio_natives(&mut vm, &bc, putchar_native, printf_native);
+        register_packed_stdio_natives(&mut vm, &bc, &map, putchar_native, printf_native);
         vm.run().expect("fact VM run");
 
         let out = FACT_OUT.with(|buf| buf.borrow().clone());
@@ -1687,8 +1679,7 @@ mod tests {
         let packed = pack_pe(&mut pe, Some(text.virtual_address + 0x20));
         let bc = packed.bytecode;
         let map = packed.opcode_map;
-        crate::vm::set_active_map(&map);
-        let ids = native_call_ids_in_bytecode(&bc);
+        let ids = native_call_ids_in_bytecode_with_map(&bc, &map);
         assert!(
             ids.iter().any(|id| *id == native_call_iat_ptr_id(puts.iat_rva)),
             "expected IAT puts native_call with ptr flag, got {:?}",
