@@ -1632,6 +1632,78 @@ mod tests {
     }
 
     #[test]
+    fn test_l4c_threaded_hello_preserves_string_pool() {
+        use crate::ir::Instruction;
+        use crate::pe::threaded::threaded_load_imm_target;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/hello.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let packed = pack_function(
+            &mut pe,
+            None,
+            Some(0x4C34_4100),
+            false,
+            crate::vm::DispatchMode::Threaded,
+        )
+        .unwrap();
+        let msg = b"Hello, World!\n";
+        assert!(
+            packed.bytecode.windows(msg.len()).any(|w| w == msg),
+            "threaded hello must retain embedded Hello string in bytecode"
+        );
+        let ptr = threaded_load_imm_target(&packed.bytecode, &packed.opcode_map, msg)
+            .expect("load_imm must point at Hello string");
+        assert_eq!(&packed.bytecode[ptr..ptr + msg.len()], msg);
+        let ir = Instruction::pretty_print(&Instruction::disassemble(
+            &packed.bytecode,
+            &packed.opcode_map,
+            packed.dispatch_mode,
+        ));
+        assert!(
+            ir.contains("native_call  | 0x1"),
+            "threaded hello must still use nc1 WriteFile path:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn test_l4c_threaded_puts_hello_preserves_string_pool() {
+        use crate::pe::threaded::threaded_load_imm_target;
+        use std::path::Path;
+
+        let pe_path = Path::new("sample/puts_hello.exe");
+        if !pe_path.exists() {
+            return;
+        }
+        let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+        let packed = pack_function(
+            &mut pe,
+            None,
+            Some(0x4C34_4100),
+            false,
+            crate::vm::DispatchMode::Threaded,
+        )
+        .unwrap();
+        let msg = b"IAT puts hello";
+        assert!(
+            packed.bytecode.windows(msg.len()).any(|w| w == msg),
+            "threaded puts_hello must retain embedded string in bytecode"
+        );
+        let ptr = threaded_load_imm_target(&packed.bytecode, &packed.opcode_map, msg)
+            .expect("load_imm must point at IAT puts string");
+        assert_eq!(&packed.bytecode[ptr..ptr + msg.len()], msg);
+        let ids = native_call_ids_in_bytecode_with_map(&packed.bytecode, &packed.opcode_map);
+        assert!(
+            ids.iter().any(|id| is_iat_ptr_native_call(*id)),
+            "threaded puts_hello must keep IAT ptr native_call, got {:?}",
+            ids
+        );
+    }
+
+    #[test]
     fn test_native_call_saves_and_restores_rsi() {
         let (stub, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, &[], &[], &[]);
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];

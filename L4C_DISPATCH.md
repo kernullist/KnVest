@@ -35,6 +35,8 @@ Handlers are unchanged; only the dispatch prologue and bytecode layout differ. L
 
 Without this fixup, threaded `hello` and other control-flow samples jump into rel32 slots and fault or exit early.
 
+**String pool:** trailing padding + embedded literals (hello `Hello, World!`, str `knvest`, IAT puts) live after the last VM instruction. `embed_thread_targets` must append `bytecode[code_end..]` after threading the insn stream; dropping that tail breaks stdio/IAT samples with empty stdout.
+
 ## Metadata
 
 - KNV4 header **version 2** adds a dispatch wire byte after the version field.
