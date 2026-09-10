@@ -3431,16 +3431,29 @@ mod tests {
             body.map(|b| b.windows(sig.len()).any(|w| w == sig)).unwrap_or(false),
             "BB2 call redirect must land on h_call"
         );
-        let bb2_tx_bytes = bb2.tx_id.to_le_bytes();
+        use crate::ir::Operand;
+        let insns = disasm_packed(&packed);
+        let call_after_bb2_map = insns.iter().enumerate().any(|(idx, ins)| {
+            if ins.opcode != OpCode::Call {
+                return false;
+            }
+            insns[..idx]
+                .iter()
+                .rev()
+                .find(|prev| prev.opcode == OpCode::SetBlockMap)
+                .map(|refresh| {
+                    refresh.operands.first() == Some(&Operand::Immediate(u64::from(bb2.tx_id)))
+                        && refresh.operands.get(1)
+                            == Some(&Operand::Immediate(u64::from(bb2.bb_id)))
+                })
+                .unwrap_or(false)
+        });
         assert!(
-            packed.bytecode.contains(&META_WIRE_BYTE)
-                && packed
-                    .bytecode
-                    .windows(3)
-                    .any(|w| w[0] == META_WIRE_BYTE && w[1..3] == bb2_tx_bytes),
-            "hello must emit set_block_map tx={} (bb{}) before cross-BB call",
+            call_after_bb2_map,
+            "hello must emit set_block_map tx={}, bb={}, pred={:#x} before cross-BB call",
             bb2.tx_id,
-            bb2.bb_id
+            bb2.bb_id,
+            bb2.pred_bb_id
         );
     }
 
