@@ -2,6 +2,7 @@ use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
+use crate::vm::virt_isa::VIRT_ISA_SPLIT_TEMP;
 use crate::pe::mba::{MBA_TEMP_NEG, MBA_TEMP_ZERO};
 use std::fmt;
 
@@ -234,10 +235,18 @@ impl Instruction {
     }
 
     pub fn pretty_print(instructions: &[Self]) -> String {
-        Self::pretty_print_with_mba(instructions, false)
+        Self::pretty_print_annotated(instructions, false, true)
     }
 
     pub fn pretty_print_with_mba(instructions: &[Self], annotate_mba: bool) -> String {
+        Self::pretty_print_annotated(instructions, annotate_mba, true)
+    }
+
+    pub fn pretty_print_annotated(
+        instructions: &[Self],
+        annotate_mba: bool,
+        annotate_virt_isa: bool,
+    ) -> String {
         let mut output = String::new();
         output.push_str("Address  | Opcode       | Operands\n");
         output.push_str("---------+--------------+---------\n");
@@ -247,10 +256,18 @@ impl Instruction {
         } else {
             std::collections::HashMap::new()
         };
+        let virt_isa_notes = if annotate_virt_isa {
+            find_virt_isa_annotations(instructions)
+        } else {
+            std::collections::HashMap::new()
+        };
 
         for (idx, instr) in instructions.iter().enumerate() {
             if let Some(note) = mba_starts.get(&idx) {
                 output.push_str(&format!("         | ; MBA       | {note}\n"));
+            }
+            if let Some(note) = virt_isa_notes.get(&idx) {
+                output.push_str(&format!("         | ; virt-isa  | {note}\n"));
             }
             output.push_str(&format!(
                 "{:08x} | {:<12} | ",
@@ -320,6 +337,86 @@ fn find_mba_substitution_starts(instructions: &[Instruction]) -> std::collection
             continue;
         }
         out.insert(i, mba_note_for(a, b, final_dst));
+    }
+    out
+}
+
+/// Detect L5a merge: `test r,r` lifts as load_imm r15,0 ; cmp r,r15.
+fn find_virt_isa_annotations(
+    instructions: &[Instruction],
+) -> std::collections::HashMap<usize, String> {
+    let mut out = std::collections::HashMap::new();
+    if instructions.len() < 2 {
+        return out;
+    }
+    for i in 0..instructions.len().saturating_sub(1) {
+        let z = &instructions[i];
+        let c = &instructions[i + 1];
+        if z.opcode == OpCode::Move
+            && reg_at(&z.operands, 0) == Some(VIRT_ISA_SPLIT_TEMP)
+            && c.opcode == OpCode::Sub
+        {
+            let Some(temp) = reg_at(&c.operands, 1) else {
+                continue;
+            };
+            if temp != VIRT_ISA_SPLIT_TEMP {
+                continue;
+            }
+            let Some(dst) = reg_at(&c.operands, 0) else {
+                continue;
+            };
+            let Some(src) = reg_at(&c.operands, 2) else {
+                continue;
+            };
+            let Some(lhs) = reg_at(&z.operands, 1) else {
+                continue;
+            };
+            out.insert(
+                i,
+                format!(
+                    "split | x86 sub → move r{temp},r{lhs} ; sub r{dst},r{temp},r{src}"
+                ),
+            );
+            continue;
+        }
+        if z.opcode == OpCode::LoadImm
+            && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
+            && c.opcode == OpCode::Cmp
+        {
+            let Some(holder) = reg_at(&z.operands, 0) else {
+                continue;
+            };
+            let Some(cmp_a) = reg_at(&c.operands, 0) else {
+                continue;
+            };
+            let Some(cmp_b) = reg_at(&c.operands, 1) else {
+                continue;
+            };
+            if cmp_b == holder {
+                if holder == 0 && cmp_a == 0 {
+                    out.insert(
+                        i,
+                        "merge | x86 xor eax,eax → load_imm r0,0".to_string(),
+                    );
+                } else {
+                    out.insert(
+                        i,
+                        format!("merge | x86 test r{cmp_a},r{cmp_a} → load_imm r{holder},0 ; cmp r{cmp_a},r{holder}"),
+                    );
+                }
+            }
+            continue;
+        }
+        if z.opcode == OpCode::LoadImm
+            && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
+            && reg_at(&z.operands, 0) == Some(0)
+            && (c.opcode != OpCode::Cmp || reg_at(&c.operands, 1) != Some(0))
+        {
+            out.insert(
+                i,
+                "merge | x86 xor eax,eax → load_imm r0,0".to_string(),
+            );
+        }
     }
     out
 }

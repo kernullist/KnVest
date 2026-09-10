@@ -9,7 +9,9 @@ pub const META_OPERAND_LEN: usize = 2;
 pub const KNV6_MAGIC: &[u8; 4] = b"KNV6";
 pub const KNV6_VERSION: u8 = 1;
 pub const KNV6_HEADER_SIZE: usize = 4 + 1 + 4 + 2;
-pub const KNV6_ENTRY_SIZE: usize = 2 + 4 + 1 + 1 + CANONICAL_OPCODE_COUNT + 256 * 4;
+/// Byte offset of the 256×dword redirect table inside each KNV6 entry (after bb_id/key/wire).
+pub const KNV6_ENTRY_HANDLER_TABLE_OFF: usize = 2 + 4 + 1 + 1 + CANONICAL_OPCODE_COUNT;
+pub const KNV6_ENTRY_SIZE: usize = KNV6_ENTRY_HANDLER_TABLE_OFF + 256 * 4;
 
 const BLOCK_KEY_SALT: u64 = 0x424C_4B45; // "BLKE"
 const KEY_SALT: u64 = 0x4445_434B; // "DECK"

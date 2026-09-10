@@ -185,7 +185,7 @@ fn validate_call_redirect_wires_in_bytecode(
     opcode_map: &OpcodeMap,
 ) {
     use crate::ir::Instruction;
-    use crate::vm::block_map::{collect_handler_redirect_plan, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+    use crate::vm::block_map::{collect_handler_redirect_plan, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
     use crate::vm::opcode_map::CANONICAL_OPCODES;
     use crate::vm::OpCode;
 
@@ -228,7 +228,7 @@ fn validate_call_redirect_wires_in_bytecode(
             "Call at bc[{:#x}] under bb={active_bb}: wire {w:#x} != entry {expected:#x}",
             ins.offset
         );
-        let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + 0x1C;
+        let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
         let slot_off = i32::from_le_bytes(
             stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
                 .try_into()
@@ -1018,7 +1018,7 @@ pub(crate) fn validate_knv6_embedded_handler_tables(
     knv6_offset: usize,
     block_map_plan: &BlockMapPlan,
 ) {
-    use crate::vm::block_map::{HANDLER_REDIRECT_TABLE_SIZE, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+    use crate::vm::block_map::{HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
 
     let blob = block_map_plan.to_embedded_bytes();
     if stub[knv6_offset..knv6_offset + blob.len()] != blob[..] {
@@ -1026,7 +1026,7 @@ pub(crate) fn validate_knv6_embedded_handler_tables(
     }
     for (idx, entry) in block_map_plan.entries.iter().enumerate() {
         let entry_off = knv6_offset + KNV6_HEADER_SIZE + idx * KNV6_ENTRY_SIZE;
-        let table_off = entry_off + 0x1C;
+        let table_off = entry_off + KNV6_ENTRY_HANDLER_TABLE_OFF;
         let embedded = &stub[table_off..table_off + HANDLER_REDIRECT_TABLE_SIZE];
         if embedded != entry.handler_table.as_slice() {
             panic!(
@@ -1162,7 +1162,7 @@ mod tests {
         native_call_ids_in_bytecode_with_map_dispatch,
     };
     use crate::pe::test_pe;
-    use crate::vm::block_map::{block_wire_for_bb, bytecode_contains_semantic, BlockMapPlan, META_WIRE_BYTE};
+    use crate::vm::block_map::{block_wire_for_bb, bytecode_contains_semantic, BlockMapPlan, KNV6_ENTRY_HANDLER_TABLE_OFF, META_WIRE_BYTE};
     use crate::vm::opcode_map::CANONICAL_OPCODES;
     use crate::vm::{DispatchMode, OpCode, OpcodeMap};
 
@@ -2562,6 +2562,127 @@ mod tests {
     }
 
     #[test]
+    fn test_l5a_sub_split_lift_expands_bytecode_with_ir_proof() {
+        use crate::vm::virt_isa::{seed_for_sub_split, sub_lift_split_enabled};
+        use crate::vm::VIRT_ISA_SPLIT_TEMP;
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let direct_seed = seed_for_sub_split(false);
+        let split_seed = seed_for_sub_split(true);
+        assert!(!sub_lift_split_enabled(direct_seed));
+        assert!(sub_lift_split_enabled(split_seed));
+
+        let mut pe_direct = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_split = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe_direct.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed_direct = pack_pe_seed(&mut pe_direct, Some(main_rva), direct_seed);
+        let packed_split = pack_pe_seed(&mut pe_split, Some(main_rva), split_seed);
+
+        let subs_direct = packed_direct
+            .bytecode
+            .windows(4)
+            .filter(|w| {
+                w[0] == packed_direct.opcode_map.encode(OpCode::Sub)
+                    && w[1] == w[2]
+            })
+            .count();
+        let subs_split = packed_split
+            .bytecode
+            .windows(4)
+            .filter(|w| {
+                w[0] == packed_split.opcode_map.encode(OpCode::Sub)
+                    && w[2] == VIRT_ISA_SPLIT_TEMP
+            })
+            .count();
+        assert!(
+            subs_split >= subs_direct,
+            "split lift should not reduce sub-with-temp patterns"
+        );
+
+        let ir_split = ir_pretty(&packed_split);
+        assert!(
+            ir_split.contains("; virt-isa  | split"),
+            "split lift must annotate IR: {ir_split}"
+        );
+    }
+
+    #[test]
+    fn test_l5a_alu_handler_polymorphism_sub_xor_and() {
+        use crate::pe::vm_stub::create_vm_interpreter_stub;
+        use crate::vm::virt_isa::seed_for_handler_variant;
+
+        let pe_data = test_pe::create_minimal_pe64();
+        for &op in &[OpCode::Sub, OpCode::Xor, OpCode::And] {
+            let seed_a = seed_for_handler_variant(op, 0);
+            let seed_b = seed_for_handler_variant(op, 1);
+            let map_a = OpcodeMap::from_seed(seed_a);
+            let map_b = OpcodeMap::from_seed(seed_b);
+            let (stub_a, _, _, _) = create_vm_interpreter_stub(
+                0,
+                0,
+                &map_a,
+                crate::vm::DispatchMode::Table,
+                false,
+                &[],
+                &crate::vm::BlockMapPlan::default(),
+                &[],
+                &[],
+            );
+            let (stub_b, _, _, _) = create_vm_interpreter_stub(
+                0,
+                0,
+                &map_b,
+                crate::vm::DispatchMode::Table,
+                false,
+                &[],
+                &crate::vm::BlockMapPlan::default(),
+                &[],
+                &[],
+            );
+            assert_ne!(
+                stub_a, stub_b,
+                "{} handler variants 0 vs 1 must change stub bytes",
+                op.name()
+            );
+        }
+
+        let mut pe_a = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_b = PEFile::from_bytes(pe_data).unwrap();
+        let seed_sub_a = seed_for_handler_variant(OpCode::Sub, 0);
+        let seed_sub_b = seed_for_handler_variant(OpCode::Sub, 1);
+        let packed_a = pack_pe_seed(&mut pe_a, None, seed_sub_a);
+        let packed_b = pack_pe_seed(&mut pe_b, None, seed_sub_b);
+        let ir_a = ir_pretty(&packed_a);
+        let ir_b = ir_pretty(&packed_b);
+        assert_eq!(
+            ir_a, ir_b,
+            "logical IR must match across Sub handler variants"
+        );
+    }
+
+    #[test]
+    fn test_l5a_virt_isa_ir_header_lists_decode_keys() {
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_pe_seed(&mut pe, None, 0x15A5_2026);
+        let hdr = crate::vm::virt_isa::format_ir_header(&packed.opcode_map, crate::vm::DispatchMode::Table);
+        assert!(hdr.contains("L5a virtual ISA"));
+        assert!(hdr.contains("wire="));
+        assert!(hdr.contains("sub_lift="));
+        assert!(hdr.contains("add"));
+        assert!(hdr.contains("sub"));
+        assert!(hdr.contains("xor"));
+        assert!(hdr.contains("and"));
+
+        let ir = ir_pretty(&packed);
+        assert!(
+            ir.contains("; virt-isa  | merge"),
+            "minimal PE must show xor merge annotation: {ir}"
+        );
+    }
+
+    #[test]
     fn test_l4a_embedded_map_roundtrip_in_section() {
         let pe_data = test_pe::create_minimal_pe64();
         let mut pe = PEFile::from_bytes(pe_data).unwrap();
@@ -2668,7 +2789,7 @@ mod tests {
             })
             .map(|(i, _)| i)
             .find(|&off| {
-                let entry0_table = off + KNV6_HEADER_SIZE + 0x1C;
+                let entry0_table = off + KNV6_HEADER_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
                 let slot = i32::from_le_bytes(
                     stub[entry0_table + load_imm_wire * 4..entry0_table + load_imm_wire * 4 + 4]
                         .try_into()
@@ -2678,7 +2799,7 @@ mod tests {
             })
             .expect("nonzero KNV6 BB0 handler_table at labeled blob");
 
-        let knv6_src_table = knv6_offset + KNV6_HEADER_SIZE + 0x1C;
+        let knv6_src_table = knv6_offset + KNV6_HEADER_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
         let src_off = i32::from_le_bytes(
             stub[knv6_src_table + load_imm_wire * 4..knv6_src_table + load_imm_wire * 4 + 4]
                 .try_into()
@@ -2698,7 +2819,7 @@ mod tests {
             "pre-install live slot must match KNV6 BB0 image"
         );
 
-        // Simulate h_set_block_map rep movsq from [r15+0x1C] for BB0 entry.
+        // Simulate h_set_block_map rep movsq from KNV6 entry redirect table for BB0 entry.
         let mut sim = stub.to_vec();
         let mut embedded_table = [0u8; HANDLER_REDIRECT_TABLE_SIZE];
         embedded_table.copy_from_slice(
@@ -2899,7 +3020,7 @@ mod tests {
                         "{name} seed={seed:?} Call at bc[{:#x}] under bb={active_bb}: wire {w:#x} != entry {expected:#x}",
                         ins.offset
                     );
-                    let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + 0x1C;
+                    let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
                     let slot_off = i32::from_le_bytes(
                         stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
                             .try_into()
@@ -2941,7 +3062,7 @@ mod tests {
             .position(|w| w == crate::vm::block_map::KNV6_MAGIC)
             .expect("KNV6 blob");
         let bb2_entry = knv6 + KNV6_HEADER_SIZE + 2 * KNV6_ENTRY_SIZE;
-        let bb2_redirect = bb2_entry + 0x1C;
+        let bb2_redirect = bb2_entry + KNV6_ENTRY_HANDLER_TABLE_OFF;
         let call_wire = packed.block_map_plan.entries[2]
             .wire[crate::vm::opcode_map::CANONICAL_OPCODES
                 .iter()
