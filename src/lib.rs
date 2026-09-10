@@ -4,7 +4,7 @@ pub mod pe;
 pub mod pack;
 
 pub use pe::test_pe;
-pub use vm::{OpCode, OpcodeMap, DispatchMode, IsaMode, PackMetadata};
+pub use vm::{NestedVmPlan, OpCode, OpcodeMap, DispatchMode, IsaMode, PackMetadata};
 pub use pe::{PEFile, packer};
 pub use pe::partial::{PartialVirtPlan, KNV5_MAGIC};
 pub use vm::{BlockMapPlan, BytecodeLayout, KNV6_MAGIC, KNV7_MAGIC, META_WIRE_BYTE};
@@ -19,8 +19,19 @@ pub fn pack_executable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
     dispatch_mode: DispatchMode,
     mba_level: u8,
     isa_mode: IsaMode,
+    nested_vm: bool,
 ) -> anyhow::Result<OpcodeMap> {
-    pack::pack_executable(input, output, rva, seed, partial, dispatch_mode, mba_level, isa_mode)
+    pack::pack_executable(
+        input,
+        output,
+        rva,
+        seed,
+        partial,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+    )
 }
 
 pub fn extract_opcode_map(pe: &PEFile) -> Result<OpcodeMap, pe::PEError> {

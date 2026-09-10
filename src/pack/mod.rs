@@ -12,6 +12,7 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
     dispatch_mode: DispatchMode,
     mba_level: u8,
     isa_mode: IsaMode,
+    nested_vm: bool,
 ) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
@@ -24,16 +25,18 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
         dispatch_mode,
         mba_level,
         isa_mode,
+        nested_vm,
     )
         .context("Failed to pack function")?;
 
     eprintln!(
-        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={})",
+        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={}, nested={})",
         pack_result.bytecode.len(),
         pack_result.seed,
         pack_result.dispatch_mode,
         mba_level,
-        isa_mode
+        isa_mode,
+        nested_vm
     );
 
     pe.write_to_file(&output_path)

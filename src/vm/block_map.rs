@@ -11,11 +11,35 @@ pub const META_OPERAND_LEN: usize = 2;
 
 pub const KNV6_MAGIC: &[u8; 4] = b"KNV6";
 pub const KNV6_VERSION: u8 = 2;
+/// L5f nested: per-transition outer_decode[256] precedes handler redirect table.
+pub const KNV6_VERSION_V3: u8 = 3;
 pub const KNV6_HEADER_SIZE: usize = 4 + 1 + 4 + 2;
-/// Byte offset of the 256×dword redirect table inside each KNV6 v2 entry.
-pub const KNV6_ENTRY_HANDLER_TABLE_OFF: usize =
+/// Byte offset of per-transition outer→inner wire table (KNV6 v3 / L5f).
+pub const KNV6_ENTRY_OUTER_DECODE_OFF: usize =
     2 + 2 + 2 + 4 + 1 + 1 + CANONICAL_OPCODE_COUNT;
+/// Byte offset of the 256×dword redirect table inside each KNV6 v2 entry.
+pub const KNV6_ENTRY_HANDLER_TABLE_OFF: usize = KNV6_ENTRY_OUTER_DECODE_OFF;
+/// Handler redirect table offset when a v3 outer_decode prefix is present.
+pub const KNV6_ENTRY_HANDLER_TABLE_OFF_V3: usize =
+    KNV6_ENTRY_OUTER_DECODE_OFF + 256;
 pub const KNV6_ENTRY_SIZE: usize = KNV6_ENTRY_HANDLER_TABLE_OFF + 256 * 4;
+pub const KNV6_ENTRY_SIZE_V3: usize = KNV6_ENTRY_HANDLER_TABLE_OFF_V3 + 256 * 4;
+
+pub fn knv6_entry_size(version: u8) -> usize {
+    if version == KNV6_VERSION_V3 {
+        KNV6_ENTRY_SIZE_V3
+    } else {
+        KNV6_ENTRY_SIZE
+    }
+}
+
+pub fn knv6_handler_table_off(version: u8) -> usize {
+    if version == KNV6_VERSION_V3 {
+        KNV6_ENTRY_HANDLER_TABLE_OFF_V3
+    } else {
+        KNV6_ENTRY_HANDLER_TABLE_OFF
+    }
+}
 
 const BLOCK_KEY_SALT: u64 = 0x424C_4B45; // "BLKE"
 const KEY_SALT: u64 = 0x4445_434B; // "DECK"
@@ -32,6 +56,8 @@ pub struct BlockMapEntry {
     pub decode_key: u32,
     pub exit_wire: u8,
     pub wire: [u8; CANONICAL_OPCODE_COUNT],
+    /// L5f: per-transition outer→inner wire decode (KNV6 v3 only).
+    pub outer_decode: [u8; 256],
     /// Runtime handler-table image: 256 dwords indexed by wire byte.
     pub handler_table: [u8; 256 * 4],
 }
@@ -81,6 +107,7 @@ impl BlockMapPlan {
             decode_key,
             exit_wire: map.exit_wire(),
             wire: *map.wire_table(),
+            outer_decode: [0u8; 256],
             handler_table: [0u8; 256 * 4],
         });
         (tx_id, map)
@@ -166,6 +193,20 @@ impl BlockMapPlan {
         }
     }
 
+    /// L5f: per-transition outer_decode + handler tables keyed on inner wires.
+    pub fn fill_nested_handler_tables(
+        &mut self,
+        plan: &HandlerRedirectPlan,
+        inner_map: &OpcodeMap,
+    ) {
+        for entry in &mut self.entries {
+            entry.outer_decode =
+                super::nested_vm::build_outer_decode_for_transition(inner_map, &entry.wire);
+            entry.handler_table =
+                plan.build_nested_handler_table(&entry.wire, &entry.outer_decode);
+        }
+    }
+
     pub fn fill_handler_tables_with<F>(&mut self, mut handler_off: F, set_map_off: i32)
     where
         F: FnMut(OpCode) -> i32,
@@ -177,9 +218,15 @@ impl BlockMapPlan {
     }
 
     pub fn to_embedded_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(KNV6_HEADER_SIZE + self.entries.len() * KNV6_ENTRY_SIZE);
+        self.to_embedded_bytes_nested(false)
+    }
+
+    pub fn to_embedded_bytes_nested(&self, nested: bool) -> Vec<u8> {
+        let version = if nested { KNV6_VERSION_V3 } else { KNV6_VERSION };
+        let entry_size = knv6_entry_size(version);
+        let mut out = Vec::with_capacity(KNV6_HEADER_SIZE + self.entries.len() * entry_size);
         out.extend_from_slice(KNV6_MAGIC);
-        out.push(KNV6_VERSION);
+        out.push(version);
         out.extend_from_slice(&self.decode_key.to_le_bytes());
         out.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
         for entry in &self.entries {
@@ -190,6 +237,9 @@ impl BlockMapPlan {
             out.push(entry.exit_wire);
             out.push(0);
             out.extend_from_slice(&entry.wire);
+            if nested {
+                out.extend_from_slice(&entry.outer_decode);
+            }
             out.extend_from_slice(&entry.handler_table);
         }
         out
@@ -200,7 +250,7 @@ impl BlockMapPlan {
             return None;
         }
         let version = data[4];
-        if version != KNV6_VERSION && version != 1 {
+        if version != KNV6_VERSION && version != KNV6_VERSION_V3 && version != 1 {
             return None;
         }
         let decode_key = u32::from_le_bytes(data[5..9].try_into().ok()?);
@@ -211,7 +261,7 @@ impl BlockMapPlan {
             let entry_size = if version == 1 {
                 2 + 4 + 1 + 1 + CANONICAL_OPCODE_COUNT + 256 * 4
             } else {
-                KNV6_ENTRY_SIZE
+                knv6_entry_size(version)
             };
             if offset + entry_size > data.len() {
                 return None;
@@ -244,8 +294,16 @@ impl BlockMapPlan {
                 };
             let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
             wire.copy_from_slice(&data[wire_off..wire_off + CANONICAL_OPCODE_COUNT]);
+            let mut outer_decode = [0u8; 256];
+            let handler_off = if version == KNV6_VERSION_V3 {
+                let od_off = offset + KNV6_ENTRY_OUTER_DECODE_OFF;
+                outer_decode.copy_from_slice(&data[od_off..od_off + 256]);
+                offset + knv6_handler_table_off(version)
+            } else {
+                table_off
+            };
             let mut handler_table = [0u8; 256 * 4];
-            handler_table.copy_from_slice(&data[table_off..table_off + 256 * 4]);
+            handler_table.copy_from_slice(&data[handler_off..handler_off + 256 * 4]);
             offset += entry_size;
             entries.push(BlockMapEntry {
                 tx_id,
@@ -254,6 +312,7 @@ impl BlockMapPlan {
                 decode_key: block_key,
                 exit_wire,
                 wire,
+                outer_decode,
                 handler_table,
             });
         }
@@ -404,6 +463,26 @@ impl HandlerRedirectPlan {
     ) -> [u8; HANDLER_REDIRECT_TABLE_SIZE] {
         build_handler_table_from_plan(wire, self)
     }
+
+    pub fn build_nested_handler_table(
+        &self,
+        outer_wire: &[u8; CANONICAL_OPCODE_COUNT],
+        outer_decode: &[u8; 256],
+    ) -> [u8; HANDLER_REDIRECT_TABLE_SIZE] {
+        let inner_wire = inner_wires_from_outer(outer_wire, outer_decode);
+        build_handler_table_from_plan(&inner_wire, self)
+    }
+}
+
+fn inner_wires_from_outer(
+    outer_wire: &[u8; CANONICAL_OPCODE_COUNT],
+    outer_decode: &[u8; 256],
+) -> [u8; CANONICAL_OPCODE_COUNT] {
+    let mut inner = [0u8; CANONICAL_OPCODE_COUNT];
+    for (idx, &ow) in outer_wire.iter().enumerate() {
+        inner[idx] = outer_decode[ow as usize];
+    }
+    inner
 }
 
 /// First byte after handler bodies (PackMetadata / string pool); dispatch must stay below this.
