@@ -1,5 +1,6 @@
 use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
+use crate::vm::layout::BytecodeLayout;
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 use crate::vm::virt_isa::VIRT_ISA_SPLIT_TEMP;
@@ -49,6 +50,22 @@ impl Instruction {
         block_plan: Option<&BlockMapPlan>,
         dispatch_mode: DispatchMode,
     ) -> Vec<Self> {
+        Self::disassemble_with_layout(
+            bytecode,
+            base_map,
+            block_plan,
+            dispatch_mode,
+            &BytecodeLayout::identity(),
+        )
+    }
+
+    pub fn disassemble_with_layout(
+        bytecode: &[u8],
+        base_map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
+        dispatch_mode: DispatchMode,
+        layout: &BytecodeLayout,
+    ) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
         let mut consecutive_invalid = 0;
@@ -64,6 +81,7 @@ impl Instruction {
 
             if opcode_byte == META_WIRE_BYTE {
                 consecutive_invalid = 0;
+                offset += layout.meta_post_wire_pad as usize;
                 if offset + META_OPERAND_LEN <= bytecode.len() {
                     let bb_id = u16::from_le_bytes([bytecode[offset], bytecode[offset + 1]]);
                     offset += META_OPERAND_LEN;
@@ -96,6 +114,7 @@ impl Instruction {
             };
             
             consecutive_invalid = 0;
+            offset += layout.post_wire_pad_for(opcode) as usize;
 
             let mut operands = Vec::new();
 

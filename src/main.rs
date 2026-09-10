@@ -81,6 +81,9 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
         print!("{}", plan.format_ir_header(&opcode_map, dispatch_mode));
     }
 
+    let layout_plan = packer::extract_layout_from_packed(&pe)?;
+    print!("{}", layout_plan.format_ir_header());
+
     if mba_level >= 1 {
         print!(
             "{}",
@@ -96,11 +99,12 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
         crate::vm::virt_isa::format_ir_header(&opcode_map, dispatch_mode)
     );
     
-    let instructions = ir::Instruction::disassemble_with_block_maps(
+    let instructions = ir::Instruction::disassemble_with_layout(
         &bytecode,
         &opcode_map,
         block_plan.as_ref(),
         dispatch_mode,
+        &layout_plan,
     );
     let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
     
