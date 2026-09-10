@@ -608,14 +608,12 @@ impl StubEmitter {
         self.emit_alu_store_and_dispatch();
     }
 
-    /// Sub v1: subtract via rcx scratch (`mov rcx,rax; sub rcx,rbx; mov rax,rcx`).
+    /// Sub v1: subtract via rbx scratch (`mov rax,[src1]; mov rbx,[src2]; sub rax,rbx`).
     fn emit_handler_sub_v1(&mut self) {
         self.emit_alu_operand_reads();
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
-        self.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax
-        self.emit(&[0x48, 0x29, 0xD9]); // sub rcx, rbx
-        self.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+        self.emit(&[0x48, 0x29, 0xD8]); // sub rax, rbx
         self.emit_alu_store_and_dispatch();
     }
 
@@ -3135,6 +3133,55 @@ invoke_once:
             }
         }
         panic!("no seed yields Add handler variant {target}");
+    }
+
+    fn seed_for_sub_variant(target: u8) -> u64 {
+        for seed in 0..512u64 {
+            if crate::vm::OpcodeMap::from_seed(seed).handler_variant(crate::vm::OpCode::Sub) == target {
+                return seed;
+            }
+        }
+        panic!("no seed yields Sub handler variant {target}");
+    }
+
+    fn sub_handler_offset(stub: &[u8], map: &crate::vm::OpcodeMap) -> usize {
+        let table_base = handler_table_base(stub);
+        let wire = map.encode(crate::vm::OpCode::Sub) as usize;
+        let off = i32::from_le_bytes([
+            stub[table_base + wire * 4],
+            stub[table_base + wire * 4 + 1],
+            stub[table_base + wire * 4 + 2],
+            stub[table_base + wire * 4 + 3],
+        ]);
+        table_base + off as usize
+    }
+
+    /// Sub v1 must not clobber dst index in rcx before store (MBA neg-add uses dst!=src1).
+    #[test]
+    fn sub_handler_v1_preserves_dst_index_for_store() {
+        let seed = seed_for_sub_variant(1);
+        let map = crate::vm::OpcodeMap::from_seed(seed);
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let h = sub_handler_offset(&stub, &map);
+        let body = &stub[h..h + 48];
+        assert!(
+            body.windows(3).any(|w| w == [0x48, 0x29, 0xD8]),
+            "Sub v1 must end in sub rax, rbx"
+        );
+        assert!(
+            !body.windows(3).any(|w| w == [0x48, 0x89, 0xC1]),
+            "Sub v1 must not mov rcx, rax (clobbers dst index)"
+        );
     }
 
     /// L4b: pack-time seed picks one of several semantically equivalent Add handler bodies.

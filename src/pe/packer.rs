@@ -1457,6 +1457,61 @@ mod tests {
     }
 
     #[test]
+    fn test_pack_real_mingw_arith_mba_vm_runs_to_exit() {
+        use crate::vm::VirtualMachine;
+        use std::cell::Cell;
+        use std::path::Path;
+
+        thread_local! {
+            static NC2_R2: Cell<Option<u64>> = const { Cell::new(None) };
+        }
+
+        fn nc2_capture(vm: &mut VirtualMachine) -> crate::vm::VMResult<()> {
+            let v = vm.get_register(2)?;
+            NC2_R2.with(|c| c.set(Some(v)));
+            Ok(())
+        }
+
+        let pe_path = Path::new("sample/arith.exe");
+        if !pe_path.exists() {
+            eprintln!("skip test_pack_real_mingw_arith_mba_vm_runs_to_exit: sample/arith.exe missing");
+            return;
+        }
+
+        for (seed, level) in [(0xAAAA_u64, 1u8), (0xBBBB, 1), (0xAAAA, 2), (0xBBBB, 2)] {
+            let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
+            let packed = pack_function(
+                &mut pe,
+                None,
+                Some(seed),
+                false,
+                crate::vm::DispatchMode::Table,
+                level,
+            )
+            .unwrap();
+            NC2_R2.with(|c| c.set(None));
+            let mut vm = VirtualMachine::with_block_maps(
+                packed.bytecode.clone(),
+                packed.opcode_map.clone(),
+                packed.block_map_plan.clone(),
+            );
+            vm.register_native(2, nc2_capture);
+            vm.run()
+                .unwrap_or_else(|e| panic!("mba{level} seed={seed:#x} VM run: {e}"));
+            assert_eq!(
+                vm.exit_code,
+                Some(0),
+                "mba{level} seed={seed:#x} exit code"
+            );
+            assert_eq!(
+                NC2_R2.with(|c| c.get()),
+                Some(35),
+                "mba{level} seed={seed:#x} nc2 r2"
+            );
+        }
+    }
+
+    #[test]
     fn test_pack_real_mingw_hello_uses_nc1() {
         use crate::ir::Instruction;
         use std::path::Path;

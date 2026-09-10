@@ -9,7 +9,7 @@ pub const MBA_TEMP_T1: u8 = 11;
 const ALL_ONES: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const MBA_CATALOG_SALT: u64 = 0x4D4241_4C35; // "MBAL5"
 const MBA_NEST_MAX_DEPTH: u32 = 2;
-const MBA_POOL: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
+const MBA_POOL: [u8; 3] = [8, 9, 14];
 
 std::thread_local! {
     static MBA_LEVEL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -225,40 +225,6 @@ fn raw_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
     bytecode.push(src2);
 }
 
-fn raw_push(bytecode: &mut Vec<u8>, reg: u8) {
-    bytecode.push(active_encode(OpCode::Push));
-    bytecode.push(reg);
-}
-
-fn raw_pop(bytecode: &mut Vec<u8>, reg: u8) {
-    bytecode.push(active_encode(OpCode::Pop));
-    bytecode.push(reg);
-}
-
-/// Save MBA scratch pool (r8–r15) except `preserve`, run `body`, then restore.
-/// Lifter maps stack locals into this pool; MBA expansions must not clobber them.
-fn scratch_regs_to_save(preserve: &[u8]) -> Vec<u8> {
-    MBA_POOL
-        .iter()
-        .copied()
-        .filter(|r| !preserve.contains(r))
-        .collect()
-}
-
-fn push_saved_scratch_regs(bytecode: &mut Vec<u8>, preserve: &[u8]) -> Vec<u8> {
-    let saved = scratch_regs_to_save(preserve);
-    for &reg in &saved {
-        raw_push(bytecode, reg);
-    }
-    saved
-}
-
-fn pop_saved_scratch_regs(bytecode: &mut Vec<u8>, saved: &[u8]) {
-    for &reg in saved.iter().rev() {
-        raw_pop(bytecode, reg);
-    }
-}
-
 fn temps_excluding(count: usize, exclude: &[u8]) -> Vec<u8> {
     MBA_POOL
         .iter()
@@ -269,60 +235,87 @@ fn temps_excluding(count: usize, exclude: &[u8]) -> Vec<u8> {
 }
 
 /// Copy operands into scratch that does not overlap `dst` or each other.
-fn materialize_pair(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) -> (u8, u8) {
+/// Uses only dedicated MBA temps (r8/r9/r14), never lifter spill slots r10–r15.
+fn materialize_pair(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) -> Option<(u8, u8)> {
     let exclude = [dst, src1, src2];
     let t = temps_excluding(2, &exclude);
-    assert!(
-        t.len() >= 2,
-        "MBA temp allocation failed for dst={dst} src1={src1} src2={src2}"
-    );
+    if t.len() < 2 {
+        return None;
+    }
     raw_move(bytecode, t[0], src1);
     raw_move(bytecode, t[1], src2);
-    (t[0], t[1])
+    Some((t[0], t[1]))
 }
 
-fn emit_neg_into(bytecode: &mut Vec<u8>, dst: u8, src: u8, exclude: &[u8]) {
+fn emit_neg_into(bytecode: &mut Vec<u8>, dst: u8, src: u8, exclude: &[u8]) -> bool {
     let t = temps_excluding(2, exclude);
+    if t.len() < 2 {
+        return false;
+    }
     raw_load_imm(bytecode, t[0], 0);
     raw_sub(bytecode, t[1], t[0], src);
     if dst != t[1] {
         raw_move(bytecode, dst, t[1]);
     }
+    true
 }
 
-fn expand_add_via_neg(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+fn expand_add_via_neg(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) -> bool {
     let exclude = [dst, src1, src2];
     let t = temps_excluding(2, &exclude);
+    if t.len() < 2 {
+        return false;
+    }
     raw_load_imm(bytecode, t[0], 0);
     raw_sub(bytecode, t[1], t[0], src2);
     raw_sub(bytecode, dst, src1, t[1]);
+    true
 }
 
-fn expand_add_via_xor_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
-    let (ta, tb) = materialize_pair(bytecode, dst, src1, src2);
+fn expand_add_via_xor_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) -> bool {
+    let Some((ta, tb)) = materialize_pair(bytecode, dst, src1, src2) else {
+        return false;
+    };
     let exclude = [dst, ta, tb];
-    let t = temps_excluding(2, &exclude);
-    raw_xor(bytecode, t[0], ta, tb);
-    raw_and(bytecode, t[1], ta, tb);
-    raw_add(bytecode, t[1], t[1], t[1]);
-    if should_rewrite(depth + 1) {
-        emit_add_three_depth(bytecode, dst, t[0], t[1], depth + 1);
-    } else {
-        raw_add(bytecode, dst, t[0], t[1]);
+    let t = temps_excluding(1, &exclude);
+    if t.is_empty() {
+        return false;
     }
+    let xor_sum = t[0];
+    raw_xor(bytecode, xor_sum, ta, tb);
+    raw_and(bytecode, ta, ta, tb);
+    raw_add(bytecode, ta, ta, ta);
+    if should_rewrite(depth + 1) {
+        emit_add_three_depth(bytecode, dst, xor_sum, ta, depth + 1);
+    } else {
+        raw_add(bytecode, dst, xor_sum, ta);
+    }
+    true
 }
 
-fn expand_sub_via_neg(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+fn expand_sub_via_neg(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) -> bool {
     let exclude = [dst, src1, src2];
-    let neg = temps_excluding(1, &exclude)[0];
-    emit_neg_into(bytecode, neg, src2, &exclude);
+    let t = temps_excluding(1, &exclude);
+    if t.is_empty() {
+        return false;
+    }
+    let neg = t[0];
+    if !emit_neg_into(bytecode, neg, src2, &exclude) {
+        return false;
+    }
     raw_add(bytecode, dst, src1, neg);
+    true
 }
 
-fn expand_sub_via_xor_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
-    let (ta, tb) = materialize_pair(bytecode, dst, src1, src2);
+fn expand_sub_via_xor_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) -> bool {
+    let Some((ta, tb)) = materialize_pair(bytecode, dst, src1, src2) else {
+        return false;
+    };
     let exclude = [dst, ta, tb];
     let t = temps_excluding(3, &exclude);
+    if t.len() < 3 {
+        return false;
+    }
     raw_load_imm(bytecode, t[0], ALL_ONES);
     raw_xor(bytecode, t[1], ta, t[0]);
     if should_rewrite(depth + 1) {
@@ -337,12 +330,18 @@ fn expand_sub_via_xor_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, d
         raw_xor(bytecode, t[1], ta, tb);
     }
     raw_sub(bytecode, dst, t[1], t[2]);
+    true
 }
 
-fn expand_xor_via_add_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
-    let (ta, tb) = materialize_pair(bytecode, dst, src1, src2);
+fn expand_xor_via_add_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) -> bool {
+    let Some((ta, tb)) = materialize_pair(bytecode, dst, src1, src2) else {
+        return false;
+    };
     let exclude = [dst, ta, tb];
     let t = temps_excluding(2, &exclude);
+    if t.len() < 2 {
+        return false;
+    }
     if should_rewrite(depth + 1) {
         emit_and_three_depth(bytecode, t[0], ta, tb, depth + 1);
     } else {
@@ -355,12 +354,18 @@ fn expand_xor_via_add_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, d
         raw_add(bytecode, t[1], ta, tb);
     }
     raw_sub(bytecode, dst, t[1], t[0]);
+    true
 }
 
-fn expand_and_via_or_xor(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
-    let (ta, tb) = materialize_pair(bytecode, dst, src1, src2);
+fn expand_and_via_or_xor(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) -> bool {
+    let Some((ta, tb)) = materialize_pair(bytecode, dst, src1, src2) else {
+        return false;
+    };
     let exclude = [dst, ta, tb];
     let t = temps_excluding(2, &exclude);
+    if t.len() < 2 {
+        return false;
+    }
     if should_rewrite(depth + 1) {
         emit_and_three_depth(bytecode, t[0], ta, tb, depth + 1);
     } else {
@@ -378,6 +383,7 @@ fn expand_and_via_or_xor(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, de
         raw_xor(bytecode, t[0], ta, tb);
     }
     raw_sub(bytecode, dst, t[1], t[0]);
+    true
 }
 
 /// Emit `dst = src1 + src2`, optionally via catalog MBA rewrite.
@@ -387,19 +393,13 @@ pub fn emit_add_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 
 fn emit_add_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
     if should_rewrite(depth) {
-        let identity = pick_identity(MbaFamily::Add);
-        let saved = if depth == 0 {
-            Some(push_saved_scratch_regs(bytecode, &[dst]))
-        } else {
-            None
-        };
-        match identity {
+        let ok = match pick_identity(MbaFamily::Add) {
             MbaIdentity::AddViaNeg => expand_add_via_neg(bytecode, dst, src1, src2),
             MbaIdentity::AddViaXorAnd => expand_add_via_xor_and(bytecode, dst, src1, src2, depth),
-            _ => raw_add(bytecode, dst, src1, src2),
-        }
-        if let Some(saved) = saved {
-            pop_saved_scratch_regs(bytecode, &saved);
+            _ => false,
+        };
+        if !ok {
+            raw_add(bytecode, dst, src1, src2);
         }
     } else {
         raw_add(bytecode, dst, src1, src2);
@@ -424,19 +424,13 @@ pub fn emit_sub_three(bytecode: &mut Vec<u8>, dst: u8, lhs: u8, rhs: u8) {
 
 fn emit_sub_three_depth(bytecode: &mut Vec<u8>, dst: u8, lhs: u8, rhs: u8, depth: u32) {
     if should_rewrite(depth) {
-        let identity = pick_identity(MbaFamily::Sub);
-        let saved = if depth == 0 {
-            Some(push_saved_scratch_regs(bytecode, &[dst]))
-        } else {
-            None
-        };
-        match identity {
+        let ok = match pick_identity(MbaFamily::Sub) {
             MbaIdentity::SubViaNeg => expand_sub_via_neg(bytecode, dst, lhs, rhs),
             MbaIdentity::SubViaXorAnd => expand_sub_via_xor_and(bytecode, dst, lhs, rhs, depth),
-            _ => raw_sub(bytecode, dst, lhs, rhs),
-        }
-        if let Some(saved) = saved {
-            pop_saved_scratch_regs(bytecode, &saved);
+            _ => false,
+        };
+        if !ok {
+            raw_sub(bytecode, dst, lhs, rhs);
         }
     } else {
         raw_sub(bytecode, dst, lhs, rhs);
@@ -454,18 +448,12 @@ pub fn emit_xor_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 
 fn emit_xor_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
     if should_rewrite(depth) {
-        let identity = pick_identity(MbaFamily::Xor);
-        let saved = if depth == 0 {
-            Some(push_saved_scratch_regs(bytecode, &[dst]))
-        } else {
-            None
-        };
-        match identity {
+        let ok = match pick_identity(MbaFamily::Xor) {
             MbaIdentity::XorViaAddAnd => expand_xor_via_add_and(bytecode, dst, src1, src2, depth),
-            _ => raw_xor(bytecode, dst, src1, src2),
-        }
-        if let Some(saved) = saved {
-            pop_saved_scratch_regs(bytecode, &saved);
+            _ => false,
+        };
+        if !ok {
+            raw_xor(bytecode, dst, src1, src2);
         }
     } else {
         raw_xor(bytecode, dst, src1, src2);
@@ -479,18 +467,12 @@ pub fn emit_and_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 
 fn emit_and_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
     if should_rewrite(depth) {
-        let identity = pick_identity(MbaFamily::And);
-        let saved = if depth == 0 {
-            Some(push_saved_scratch_regs(bytecode, &[dst]))
-        } else {
-            None
-        };
-        match identity {
+        let ok = match pick_identity(MbaFamily::And) {
             MbaIdentity::AndViaOrXor => expand_and_via_or_xor(bytecode, dst, src1, src2, depth),
-            _ => raw_and(bytecode, dst, src1, src2),
-        }
-        if let Some(saved) = saved {
-            pop_saved_scratch_regs(bytecode, &saved);
+            _ => false,
+        };
+        if !ok {
+            raw_and(bytecode, dst, src1, src2);
         }
     } else {
         raw_and(bytecode, dst, src1, src2);
@@ -792,14 +774,18 @@ mod tests {
     }
 
     #[test]
-    fn mba_depth0_rewrite_emits_scratch_push_pop() {
+    fn mba_add_rewrite_avoids_push_spill_wrapper() {
         let seed = seed_picking(MbaFamily::Add, MbaIdentity::AddViaXorAnd);
         with_mba(1, seed, || {
             let map = OpcodeMap::from_seed(seed);
             let mut bc = Vec::new();
-            emit_add_three(&mut bc, 3, 1, 2);
-            assert!(bc.contains(&map.encode(OpCode::Push)));
-            assert!(bc.contains(&map.encode(OpCode::Pop)));
+            raw_load_imm(&mut bc, 10, 3);
+            raw_load_imm(&mut bc, 11, 4);
+            emit_add_three(&mut bc, 2, 10, 11);
+            assert!(
+                !bc.contains(&map.encode(OpCode::Push)),
+                "MBA add must not wrap in push/pop spill save"
+            );
         });
     }
 }
