@@ -174,7 +174,7 @@ fn build_section_bytecode(
         nested_plan,
     );
     if nested_plan.enabled {
-        block_map_plan.fill_nested_handler_tables(&handler_plan, &nested_plan.outer_decode);
+        block_map_plan.fill_nested_handler_tables(&handler_plan, &nested_plan.inner_map);
     } else {
         block_map_plan.fill_handler_tables(&handler_plan);
     }
@@ -193,7 +193,7 @@ fn build_section_bytecode(
         native_sync,
         nested_plan,
     );
-    patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan);
+    patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan, nested_plan.enabled);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     validate_live_handler_table_image(&vm_stub, block_map_plan);
     set_isa_mode(isa_mode);
@@ -1120,8 +1120,9 @@ pub(crate) fn patch_knv6_in_stub(
     stub: &mut [u8],
     knv6_offset: usize,
     block_map_plan: &BlockMapPlan,
+    nested: bool,
 ) {
-    let bytes = block_map_plan.to_embedded_bytes();
+    let bytes = block_map_plan.to_embedded_bytes_nested(nested);
     if knv6_offset + bytes.len() > stub.len() {
         panic!(
             "KNV6 patch overflow: blob at {knv6_offset:#x} needs {} bytes, stub has {}",
@@ -1135,7 +1136,7 @@ pub(crate) fn patch_knv6_in_stub(
         );
     }
     stub[knv6_offset..knv6_offset + bytes.len()].copy_from_slice(&bytes);
-    validate_knv6_embedded_handler_tables(stub, knv6_offset, block_map_plan);
+    validate_knv6_embedded_handler_tables(stub, knv6_offset, block_map_plan, nested);
 }
 
 /// Runtime `h_set_block_map` stores KNV6 redirect ptr in `[rbp-0x130]` — verify PE blob is populated.
@@ -1143,16 +1144,37 @@ pub(crate) fn validate_knv6_embedded_handler_tables(
     stub: &[u8],
     knv6_offset: usize,
     block_map_plan: &BlockMapPlan,
+    nested: bool,
 ) {
-    use crate::vm::block_map::{HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+    use crate::vm::block_map::{
+        HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_OUTER_DECODE_OFF, KNV6_HEADER_SIZE,
+        knv6_entry_size, knv6_handler_table_off,
+    };
 
-    let blob = block_map_plan.to_embedded_bytes();
+    let blob = block_map_plan.to_embedded_bytes_nested(nested);
     if stub[knv6_offset..knv6_offset + blob.len()] != blob[..] {
         panic!("KNV6 labeled patch did not stick at {knv6_offset:#x}");
     }
+    let version = if nested {
+        crate::vm::block_map::KNV6_VERSION_V3
+    } else {
+        crate::vm::block_map::KNV6_VERSION
+    };
+    let entry_stride = knv6_entry_size(version);
+    let handler_off = knv6_handler_table_off(version);
     for (idx, entry) in block_map_plan.entries.iter().enumerate() {
-        let entry_off = knv6_offset + KNV6_HEADER_SIZE + idx * KNV6_ENTRY_SIZE;
-        let table_off = entry_off + KNV6_ENTRY_HANDLER_TABLE_OFF;
+        let entry_off = knv6_offset + KNV6_HEADER_SIZE + idx * entry_stride;
+        let table_off = entry_off + handler_off;
+        if nested {
+            let od_off = entry_off + KNV6_ENTRY_OUTER_DECODE_OFF;
+            let embedded_od = &stub[od_off..od_off + 256];
+            if embedded_od != entry.outer_decode.as_slice() {
+                panic!(
+                    "KNV6 entry {} outer_decode mismatch at stub[{od_off:#x}]",
+                    entry.bb_id
+                );
+            }
+        }
         let embedded = &stub[table_off..table_off + HANDLER_REDIRECT_TABLE_SIZE];
         if embedded != entry.handler_table.as_slice() {
             panic!(
@@ -4330,9 +4352,14 @@ mod tests {
             stub.windows(4).any(|w| w == b"KNV4"),
             "nested stub must embed KNV4"
         );
-        assert!(
-            nested.outer_decode.iter().any(|&b| b != 0),
-            "outer decode table must be populated"
+        let knv6_blob = &stub[stub
+            .windows(KNV6_MAGIC.len())
+            .position(|w| w == KNV6_MAGIC)
+            .expect("KNV6")..];
+        assert_eq!(
+            knv6_blob[4],
+            crate::vm::block_map::KNV6_VERSION_V3,
+            "nested pack must emit KNV6 v3"
         );
         // Nested stub is larger than single-VM (outer decode table + dispatch_inner).
         let (stub_flat, _, _, _) = create_vm_interpreter_stub(

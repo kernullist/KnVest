@@ -1,6 +1,6 @@
 use super::block_map::META_WIRE_BYTE;
 use super::opcode::OpCode;
-use super::opcode_map::{CANONICAL_OPCODES, OpcodeMap};
+use super::opcode_map::{CANONICAL_OPCODE_COUNT, CANONICAL_OPCODES, OpcodeMap};
 
 /// Seed salt for the inner (execute-layer) opcode map (L5f).
 pub const NESTED_INNER_SALT: u64 = 0x4E45_5354; // "NEST"
@@ -53,7 +53,7 @@ impl NestedVmPlan {
             self.inner_map.seed(),
             NESTED_INNER_SALT
         ));
-        out.push_str("  layers: outer reads bytecode wire → outer_decode_table → inner indexes handler redirect table\n");
+        out.push_str("  layers: outer reads bytecode wire → per-transition outer_decode (KNV6 v3) → inner indexes handler redirect table\n");
         out.push_str("  note: two dispatch hops per instruction (educational; slower than single-VM)\n");
         // Show a few canonical op mappings where outer ≠ inner.
         out.push_str("  sample outer→inner wires (canonical ops):\n");
@@ -78,7 +78,23 @@ impl NestedVmPlan {
     }
 }
 
-/// Build the 256-byte outer→inner decode table for all outer maps used in the image.
+/// Per-transition outer→inner decode for one L5d wire table (canonical-indexed wires).
+pub fn build_outer_decode_for_transition(
+    inner_map: &OpcodeMap,
+    outer_wire: &[u8; CANONICAL_OPCODE_COUNT],
+) -> [u8; OUTER_DECODE_TABLE_SIZE] {
+    let nop_inner = inner_map.encode(OpCode::Nop);
+    let mut table = [nop_inner; OUTER_DECODE_TABLE_SIZE];
+    for (idx, &op) in CANONICAL_OPCODES.iter().enumerate() {
+        let outer = outer_wire[idx];
+        let inner = inner_map.encode(op);
+        table[outer as usize] = inner;
+    }
+    table[META_WIRE_BYTE as usize] = META_WIRE_BYTE;
+    table
+}
+
+/// Build a merged table across transitions (IR display only — not used at runtime).
 pub fn build_outer_decode_table(
     inner_map: &OpcodeMap,
     outer_maps: &[OpcodeMap],
@@ -92,7 +108,6 @@ pub fn build_outer_decode_table(
             table[outer as usize] = inner;
         }
     }
-    // META opcode passes through unchanged (handler table slot 0xFD).
     table[META_WIRE_BYTE as usize] = META_WIRE_BYTE;
     table
 }
@@ -123,12 +138,35 @@ mod tests {
     fn outer_decode_maps_canonical_ops() {
         let seed = 42u64;
         let outer = OpcodeMap::from_seed(seed);
-        let plan = NestedVmPlan::from_seed(seed, &[outer.clone()]);
+        let table = build_outer_decode_for_transition(
+            &OpcodeMap::from_seed(seed ^ NESTED_INNER_SALT),
+            outer.wire_table(),
+        );
+        let inner = OpcodeMap::from_seed(seed ^ NESTED_INNER_SALT);
         for &op in &CANONICAL_OPCODES {
             let outer_wire = outer.encode(op);
-            let inner_wire = plan.decode_outer(outer_wire);
-            assert_eq!(inner_wire, plan.inner_map.encode(op));
+            assert_eq!(table[outer_wire as usize], inner.encode(op));
         }
+    }
+
+    #[test]
+    fn per_transition_outer_decode_differs_when_wires_collide() {
+        let seed = 0x1234u64;
+        let inner = OpcodeMap::from_seed(seed ^ NESTED_INNER_SALT);
+        let mut plan = BlockMapPlan::default();
+        let (_, map_a) = plan.record_transition(seed, 0, super::super::block_map::ENTRY_PRED_BB);
+        let (_, map_b) = plan.record_transition(seed, 1, 0);
+        let ta = build_outer_decode_for_transition(&inner, map_a.wire_table());
+        let tb = build_outer_decode_for_transition(&inner, map_b.wire_table());
+        for &op in &CANONICAL_OPCODES {
+            let wa = map_a.encode(op);
+            let wb = map_b.encode(op);
+            if wa == wb && map_a.encode(op) != map_b.encode(op) {
+                // impossible: same wire can't mean different ops in one map
+            }
+        }
+        // Different transitions almost always differ at some outer slot.
+        assert_ne!(ta, tb, "per-transition outer_decode must not be globally merged");
     }
 
     #[test]

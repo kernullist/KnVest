@@ -67,8 +67,8 @@ fn test_l4a_different_seeds_different_opcode_streams() {
     let pe_b = knvest::PEFile::from_bytes(minimal_pe.clone()).unwrap();
     let mut pe_a = pe_a;
     let mut pe_b = pe_b;
-    let packed_a = knvest::pe::packer::pack_function(&mut pe_a, None, Some(1), false, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, false).unwrap();
-    let packed_b = knvest::pe::packer::pack_function(&mut pe_b, None, Some(2), false, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, false).unwrap();
+    let packed_a = knvest::pe::packer::pack_function(&mut pe_a, None, Some(1), false, DispatchMode::Table, 0, knvest::IsaMode::Reg, false).unwrap();
+    let packed_b = knvest::pe::packer::pack_function(&mut pe_b, None, Some(2), false, DispatchMode::Table, 0, knvest::IsaMode::Reg, false).unwrap();
     assert_ne!(packed_a.bytecode, packed_b.bytecode);
     let ir_a = knvest::pretty_print(&knvest::disassemble_with_layout(
         &packed_a.bytecode,

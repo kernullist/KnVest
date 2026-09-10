@@ -2,7 +2,8 @@ use crate::vm::dispatch::DispatchMode;
 use crate::vm::IsaMode;
 use crate::vm::block_map::{
     BlockMapPlan, HandlerRedirectPlan, HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_HANDLER_TABLE_OFF,
-    KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE,
+    KNV6_ENTRY_OUTER_DECODE_OFF, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE,
+    knv6_entry_size, knv6_handler_table_off,
 };
 use crate::vm::layout::BytecodeLayout;
 use crate::vm::nested_vm::NestedVmPlan;
@@ -10,7 +11,10 @@ use crate::vm::opcode_map::{CANONICAL_HANDLER_LABELS, CANONICAL_OPCODES, OpcodeM
 use crate::vm::OpCode;
 use std::collections::HashMap;
 const REDIRECT_FRAME_BUF_OFF: i32 = -0x930;
+const OUTER_DECODE_FRAME_OFF: i32 = -0x530; // [rbp-0x930]+1024
+const ACTIVE_OUTER_DECODE_PTR_OFF: i32 = -0x138;
 const REDIRECT_FRAME_QWORDS: u32 = HANDLER_REDIRECT_TABLE_SIZE as u32 / 8;
+const OUTER_DECODE_FRAME_QWORDS: u32 = 256 / 8;
 
 // L2 VM interpreter frame map (rbp-relative; disp32 = signed i32 little-endian)
 //   VM r0..r15     [rbp-0x80]..[rbp-0x08]   reg n → [rbp + n*8 - 0x80]
@@ -52,9 +56,6 @@ pub fn create_vm_interpreter_stub(
     let mut e = StubEmitter::new(map, dispatch_mode, mba_level, isa_mode, layout_plan, native_sync, block_map_plan, nested_plan);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
-    if nested_plan.enabled {
-        e.emit_outer_decode_table_placeholder();
-    }
     e.emit_handler_table_placeholder();
     e.emit_handlers();
     e.emit_strings_and_marker(knv5, block_map_plan, native_sleds);
@@ -77,7 +78,6 @@ struct StubEmitter {
     block_map_plan: BlockMapPlan,
     knv6_offset: Option<usize>,
     nested_plan: NestedVmPlan,
-    outer_decode_table_start: Option<usize>,
 }
 
 impl StubEmitter {
@@ -107,8 +107,25 @@ impl StubEmitter {
             block_map_plan: block_map_plan.clone(),
             knv6_offset: None,
             nested_plan: nested_plan.clone(),
-            outer_decode_table_start: None,
         }
+    }
+
+    fn knv6_entry_stride(&self) -> u32 {
+        let version = if self.nested_plan.enabled {
+            crate::vm::block_map::KNV6_VERSION_V3
+        } else {
+            crate::vm::block_map::KNV6_VERSION
+        };
+        knv6_entry_size(version) as u32
+    }
+
+    fn knv6_handler_table_disp(&self) -> i32 {
+        let version = if self.nested_plan.enabled {
+            crate::vm::block_map::KNV6_VERSION_V3
+        } else {
+            crate::vm::block_map::KNV6_VERSION
+        };
+        knv6_handler_table_off(version) as i32
     }
 
     fn emit_skip_wire_pad(&mut self, op: OpCode) {
@@ -353,6 +370,9 @@ impl StubEmitter {
         self.emit_init_native_frame_ptr();
         if self.dispatch_mode == DispatchMode::Table {
             self.emit_init_active_redirect_ptr_to_handler_table();
+            if self.nested_plan.enabled {
+                self.emit_init_nested_bb0_outer_decode();
+            }
         }
         self.lea_rip_rel32(0x48, 6, "bytecode");
         self.emit(&[0x48, 0x89, 0xF6]);
@@ -383,7 +403,7 @@ impl StubEmitter {
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
         self.jcc_rel32(0x84, "h_exit");
         self.emit(&[0x89, 0xC1]); // mov ecx, eax — save outer wire
-        self.lea_rip_rel32(0x48, 2, "outer_decode_table"); // lea rdx, [rip+outer_decode_table]
+        self.emit_mov_qword_from_rbp_to_reg(2, ACTIVE_OUTER_DECODE_PTR_OFF); // rdx = active outer_decode
         self.emit(&[0x0F, 0xB6, 0x04, 0x0A]); // movzx eax, byte [rdx+rcx] — inner wire
         self.jmp_rel32("dispatch_inner");
 
@@ -393,14 +413,6 @@ impl StubEmitter {
         self.emit(&[0x48, 0x63, 0x04, 0x83]); // movsxd rax, [rbx+rax*4]
         self.emit(&[0x4C, 0x01, 0xD0]); // add rax, r10
         self.emit(&[0xFF, 0xE0]); // jmp rax
-    }
-
-    fn emit_outer_decode_table_placeholder(&mut self) {
-        self.label("outer_decode_table");
-        self.outer_decode_table_start = Some(self.pos());
-        for _ in 0..256 {
-            self.emit(&[0x00]);
-        }
     }
 
     /// L4 default: opcode-indexed handler offset table + central dispatch.
@@ -503,7 +515,7 @@ impl StubEmitter {
         self.emit_block_map_resolve_r15();
         self.label("h_set_block_map_found");
         // Reject bogus KNV6 images: handler_table must start with dword >= 1024.
-        self.emit_cmp_dword_r15_disp(KNV6_ENTRY_HANDLER_TABLE_OFF as i32, 1024);
+        self.emit_cmp_dword_r15_disp(self.knv6_handler_table_disp(), 1024);
         self.jcc_rel32_short(0x72, "h_set_block_map_fail");
         self.emit_block_map_apply_and_dispatch();
         self.label("h_set_block_map_fail");
@@ -532,7 +544,7 @@ impl StubEmitter {
         // cmp word [r15], r8w — match transition id at KNV6 entry head
         self.emit(&[0x66, 0x45, 0x39, 0x07]);
         self.jcc_rel32_short(0x74, "h_set_block_map_found");
-        let stride = KNV6_ENTRY_SIZE as u32;
+        let stride = self.knv6_entry_stride();
         self.emit(&[
             0x49,
             0x81,
@@ -541,7 +553,7 @@ impl StubEmitter {
             ((stride >> 8) & 0xFF) as u8,
             ((stride >> 16) & 0xFF) as u8,
             ((stride >> 24) & 0xFF) as u8,
-        ]); // add r15, KNV6_ENTRY_SIZE
+        ]); // add r15, knv6 entry stride
         self.emit(&[0xFF, 0xC9]); // dec ecx
         self.jcc_rel32_short(0x75, "h_set_block_map_search");
         self.jmp_rel32("h_set_block_map_fail");
@@ -559,7 +571,7 @@ impl StubEmitter {
         // Frame is exactly sub rsp,0x930 — push/pop rsi would spill below rsp and corrupt
         // the saved PC on table-mode ret → set_block_map refresh (call/nested/fact).
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
-        self.emit_lea_rsi_from_r15(KNV6_ENTRY_HANDLER_TABLE_OFF as i32);
+        self.emit_lea_rsi_from_r15(self.knv6_handler_table_disp());
         // lea rdi, [rbp+REDIRECT_FRAME_BUF_OFF]
         self.emit_lea_from_rbp(7, REDIRECT_FRAME_BUF_OFF);
         // mov ecx, REDIRECT_FRAME_QWORDS
@@ -567,10 +579,43 @@ impl StubEmitter {
         self.emit(&REDIRECT_FRAME_QWORDS.to_le_bytes());
         self.emit(&[0xFC]); // cld
         self.emit(&[0xF3, 0x48, 0xA5]); // rep movsq
+        if self.nested_plan.enabled {
+            self.emit_lea_rsi_from_r15(KNV6_ENTRY_OUTER_DECODE_OFF as i32);
+            self.emit_lea_from_rbp(7, OUTER_DECODE_FRAME_OFF);
+            self.emit(&[0x48, 0xC7, 0xC1]);
+            self.emit(&OUTER_DECODE_FRAME_QWORDS.to_le_bytes());
+            self.emit(&[0xFC]);
+            self.emit(&[0xF3, 0x48, 0xA5]); // copy outer_decode → [rbp-0x530]
+            self.emit_lea_from_rbp(0, OUTER_DECODE_FRAME_OFF);
+            self.emit_mov_qword_to_rbp_from_reg(0, ACTIVE_OUTER_DECODE_PTR_OFF);
+        }
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov rsi, [rbp-0x98]
         // lea rax, [rbp+REDIRECT_FRAME_BUF_OFF]; mov [rbp-0x130], rax
         self.emit_lea_from_rbp(0, REDIRECT_FRAME_BUF_OFF);
         self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
+    }
+
+    /// L5f: install BB0 per-transition outer_decode before the first dispatch.
+    fn emit_init_nested_bb0_outer_decode(&mut self) {
+        self.lea_rip_rel32(0x4C, 7, "knv6_block_maps");
+        let header = KNV6_HEADER_SIZE as u32;
+        self.emit(&[
+            0x49,
+            0x81,
+            0xC7,
+            (header & 0xFF) as u8,
+            ((header >> 8) & 0xFF) as u8,
+            ((header >> 16) & 0xFF) as u8,
+            ((header >> 24) & 0xFF) as u8,
+        ]); // add r15, KNV6_HEADER_SIZE → first entry
+        self.emit_lea_rsi_from_r15(KNV6_ENTRY_OUTER_DECODE_OFF as i32);
+        self.emit_lea_from_rbp(7, OUTER_DECODE_FRAME_OFF);
+        self.emit(&[0x48, 0xC7, 0xC1]);
+        self.emit(&OUTER_DECODE_FRAME_QWORDS.to_le_bytes());
+        self.emit(&[0xFC]);
+        self.emit(&[0xF3, 0x48, 0xA5]);
+        self.emit_lea_from_rbp(0, OUTER_DECODE_FRAME_OFF);
+        self.emit_mov_qword_to_rbp_from_reg(0, ACTIVE_OUTER_DECODE_PTR_OFF);
     }
 
     fn emit_block_map_apply_and_dispatch(&mut self) {
@@ -1524,7 +1569,7 @@ impl StubEmitter {
         self.label("knv6_block_maps");
         self.knv6_offset = Some(self.pos());
         let knv6_pos = self.pos();
-        self.emit(&block_map_plan.to_embedded_bytes());
+        self.emit(&block_map_plan.to_embedded_bytes_nested(self.nested_plan.enabled));
         self.labels.insert("knv6_count", knv6_pos + 9);
         while self.pos() % 16 != 0 {
             self.emit(&[0xCC]);
@@ -1562,13 +1607,6 @@ impl StubEmitter {
             }
         }
         let handler_plan = self.fill_handler_table();
-        if self.nested_plan.enabled {
-            if let Some(base) = self.outer_decode_table_start {
-                for (i, &b) in self.nested_plan.outer_decode.iter().enumerate() {
-                    self.code[base + i] = b;
-                }
-            }
-        }
         let rel32 = std::mem::take(&mut self.rel32);
         for (patch_at, target) in rel32 {
             let tgt = *self.labels.get(target).unwrap_or(&0);
@@ -2272,7 +2310,7 @@ mod tests {
             &[],
         &crate::vm::NestedVmPlan::disabled(),
     );
-        crate::pe::packer::patch_knv6_in_stub(&mut stub, knv6_offset, &plan);
+        crate::pe::packer::patch_knv6_in_stub(&mut stub, knv6_offset, &plan, false);
         crate::pe::packer::patch_runtime_handler_table(&mut stub, &plan);
 
         let parsed = BlockMapPlan::from_embedded(
