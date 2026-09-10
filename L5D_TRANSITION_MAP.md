@@ -49,9 +49,16 @@ table-mode `ret` restore.
 | per entry: handler_table | 1024 |
 
 Multi-predecessor blocks use **edge landing pads** (`set_block_map` + a
-transition-reencoded copy of the linear path from the succ body through the
-back-edge jmp) so each incoming path executes with its own wire map. Fallthrough
-entry keeps the original lifted bytecode; jmp edges target the pad.
+transition-reencoded duplicate) so each incoming path executes with its own wire
+map:
+
+- **Forward jmp/call** (operand before succ body in linear bytecode): duplicate
+  only the succ semantic block, then jmp to the shared linear continuation.
+- **Back-edge loop** (succ header through tail jmp): duplicate that full path.
+- **Backward jmp** to an earlier succ block: duplicate succ body only (fallback).
+
+Fallthrough entry keeps the original lifted bytecode; jmp/call edges target pads.
+Internal `call` edges are included in CFG transition planning.
 
 ### IR (`knvest ir`)
 

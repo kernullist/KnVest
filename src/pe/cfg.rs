@@ -414,6 +414,15 @@ pub fn collect_cfg_edges(blocks: &[BasicBlock], instrs: &[X64Instruction]) -> Ve
             .map(|b| b.id as u16);
 
         match &tail.kind {
+            X64InstrKind::Call { target_offset } => {
+                let target = branch_target_abs(tail, *target_offset);
+                if let Some(&succ) = block_by_start.get(&target) {
+                    edges.push((bb.id as u16, succ as u16));
+                }
+                if let Some(succ) = next_bb {
+                    edges.push((bb.id as u16, succ));
+                }
+            }
             X64InstrKind::Jmp { target_offset } => {
                 let target = branch_target_abs(tail, *target_offset);
                 if let Some(&succ) = block_by_start.get(&target) {

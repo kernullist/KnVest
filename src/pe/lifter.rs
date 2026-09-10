@@ -1712,7 +1712,7 @@ fn reencode_path_for_edge(
     base_map: &OpcodeMap,
     entry_from_map: OpcodeMap,
     entry_to_map: OpcodeMap,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(slice.len());
     let mut from_map = entry_from_map;
     let mut to_map = entry_to_map;
@@ -1720,6 +1720,9 @@ fn reencode_path_for_edge(
     while i < slice.len() {
         let wire = slice[i];
         if wire == META_WIRE_BYTE {
+            if i + 3 > slice.len() {
+                return None;
+            }
             out.push(wire);
             let tx_id = u16::from_le_bytes([slice[i + 1], slice[i + 2]]);
             out.extend_from_slice(&slice[i + 1..i + 3]);
@@ -1729,15 +1732,34 @@ fn reencode_path_for_edge(
             i += 1 + 2;
             continue;
         }
-        let op = from_map
-            .decode(wire)
-            .expect("edge path slice must decode under active transition map");
+        let op = from_map.decode(wire)?;
         out.push(to_map.encode(op));
         let operand_len = op.operand_len();
+        if i + 1 + operand_len > slice.len() {
+            return None;
+        }
         out.extend_from_slice(&slice[i + 1..i + 1 + operand_len]);
         i += 1 + operand_len;
     }
-    out
+    Some(out)
+}
+
+fn emit_forward_edge_pad_body(
+    bytecode: &mut Vec<u8>,
+    block_plan: &BlockMapPlan,
+    base_map: &OpcodeMap,
+    body_start: usize,
+    succ_body_end: usize,
+    from_map: OpcodeMap,
+    to_map: OpcodeMap,
+) {
+    let body_slice = bytecode[body_start..succ_body_end].to_vec();
+    let mut duplicate =
+        reencode_path_for_edge(&body_slice, block_plan, base_map, from_map, to_map.clone())
+            .expect("succ BB body must re-encode for edge landing pad");
+    duplicate.push(to_map.encode(OpCode::Jmp));
+    duplicate.extend_from_slice(&(succ_body_end as u64).to_le_bytes());
+    bytecode.extend(duplicate);
 }
 
 fn edge_pad_for_target(
@@ -1746,6 +1768,7 @@ fn edge_pad_for_target(
     base_map: &OpcodeMap,
     edge_pads: &mut std::collections::HashMap<(u16, u16), usize>,
     bb_body_starts: &std::collections::HashMap<usize, usize>,
+    bb_body_ends: &std::collections::HashMap<usize, usize>,
     bb_fallthrough_tx: &std::collections::HashMap<usize, u16>,
     incoming: &std::collections::HashMap<u16, usize>,
     pred_bb_id: u16,
@@ -1771,9 +1794,8 @@ fn edge_pad_for_target(
     let tx_id = block_plan
         .transition_for_edge(pred_bb_id, succ_bb_id)
         .expect("edge pad requires CFG transition");
-    // Include the full linear path from the succ body through this back-edge jmp.
     // `jmp_placeholder` points at the 8-byte operand slot (see pending_jumps).
-    let body_end = jmp_placeholder + 8;
+    let jmp_end = jmp_placeholder + 8;
     let fallthrough_tx = bb_fallthrough_tx
         .get(&(succ_bb_id as usize))
         .copied()
@@ -1787,25 +1809,54 @@ fn edge_pad_for_target(
         .expect("multi-pred BB must record fallthrough transition id");
     let from_map = block_plan.map_for_tx_or_base(fallthrough_tx, base_map);
     let to_map = block_plan.map_for_tx_or_base(tx_id, base_map);
+    let succ_body_end = bb_body_ends
+        .get(&(succ_bb_id as usize))
+        .copied()
+        .expect("multi-pred BB must record body end");
     let pad = bytecode.len();
     emit_transition_refresh(bytecode, block_plan, base_map, pred_bb_id, succ_bb_id);
-    let body_slice = bytecode[body_start..body_end].to_vec();
-    let mut duplicate = reencode_path_for_edge(
-        &body_slice,
+
+    if body_start >= jmp_end {
+        // Forward edge (jmp/call appears before succ body in linear bytecode).
+        emit_forward_edge_pad_body(
+            bytecode,
+            block_plan,
+            base_map,
+            body_start,
+            succ_body_end,
+            from_map.clone(),
+            to_map.clone(),
+        );
+    } else if let Some(mut duplicate) = reencode_path_for_edge(
+        &bytecode[body_start..jmp_end],
         block_plan,
         base_map,
-        from_map,
+        from_map.clone(),
         to_map.clone(),
-    );
-    retarget_jmp_operands_to_pad(
-        &mut duplicate,
-        block_plan,
-        base_map,
-        to_map,
-        body_start,
-        pad,
-    );
-    bytecode.extend(duplicate);
+    ) {
+        // Back-edge loop: duplicate succ header through this jmp operand.
+        retarget_jmp_operands_to_pad(
+            &mut duplicate,
+            block_plan,
+            base_map,
+            to_map,
+            body_start,
+            pad,
+        );
+        bytecode.extend(duplicate);
+    } else {
+        // Backward jmp to an earlier succ block: duplicate succ body only.
+        emit_forward_edge_pad_body(
+            bytecode,
+            block_plan,
+            base_map,
+            body_start,
+            succ_body_end,
+            from_map.clone(),
+            to_map,
+        );
+    }
+
     edge_pads.insert((pred_bb_id, succ_bb_id), pad);
     pad
 }
@@ -2893,7 +2944,9 @@ fn lift_to_vm_bytecode_internal_with_main(
                 bb_for_offset(&main_blocks, source_x64_offset).map(|b| b.id as u16),
                 bb_for_offset(&main_blocks, resolved_x64).map(|b| b.id as u16),
             ) {
-                if incoming.get(&succ_bb).copied().unwrap_or(1) > 1 {
+                if incoming.get(&succ_bb).copied().unwrap_or(1) > 1
+                    && bb_body_starts.contains_key(&(succ_bb as usize))
+                {
                     edge_jump_sites.push((placeholder_pos, pred_bb, succ_bb));
                     target_vm_offset = bb_body_starts
                         .get(&(succ_bb as usize))
@@ -2913,6 +2966,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             opcode_map,
             &mut edge_pads,
             &bb_body_starts,
+            &bb_body_ends,
             &bb_fallthrough_tx,
             &incoming,
             pred_bb,

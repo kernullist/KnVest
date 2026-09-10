@@ -766,6 +766,69 @@ pub fn create_pe64_with_countdown_loop() -> Vec<u8> {
     pe
 }
 
+/// PE64 with a forward jmp into a multi-predecessor loop header (while-style).
+pub fn create_pe64_with_forward_jmp_loop() -> Vec<u8> {
+    let mut pe = create_minimal_pe64();
+    let main_off = 0x400 + 0x20;
+
+    // prologue + init [rbp-4]=0; jmp test; body: inc [rbp-4]; jmp test;
+    // test: cmp [rbp-4],5; jle exit; jmp body; exit: xor eax,eax; epilogue; ret
+    let mut code = vec![0x90u8; 0x70];
+    let mut p = 0usize;
+    code[p] = 0x55;
+    p += 1;
+    code[p..p + 3].copy_from_slice(&[0x48, 0x89, 0xE5]);
+    p += 3;
+    code[p..p + 4].copy_from_slice(&[0x48, 0x83, 0xEC, 0x20]);
+    p += 4;
+    code[p..p + 7].copy_from_slice(&[0xC7, 0x45, 0xFC, 0x00, 0x00, 0x00, 0x00]);
+    p += 7;
+    code[p] = 0xE9;
+    p += 1;
+    let fwd_to_test = p;
+    p += 4;
+    let body_start = p;
+    code[p..p + 4].copy_from_slice(&[0x83, 0x45, 0xFC, 0x01]); // add dword [rbp-4], 1
+    p += 3;
+    code[p] = 0xE9;
+    p += 1;
+    let fwd_body_to_test = p;
+    p += 4;
+    let test_start = p;
+    code[p..p + 4].copy_from_slice(&[0x83, 0x7D, 0xFC, 0x05]); // cmp dword [rbp-4],5
+    p += 4;
+    code[p..p + 2].copy_from_slice(&[0x0F, 0x8E]); // jle exit
+    p += 2;
+    let jle_pos = p;
+    p += 4;
+    code[p] = 0xE9;
+    p += 1;
+    let back_to_body = p;
+    p += 4;
+    let exit_start = p;
+    code[p..p + 2].copy_from_slice(&[0x31, 0xC0]);
+    p += 2;
+    code[p..p + 4].copy_from_slice(&[0x48, 0x83, 0xC4, 0x20]);
+    p += 4;
+    code[p] = 0x5D;
+    p += 1;
+    code[p] = 0xC3;
+
+    for (pos, target) in [
+        (fwd_to_test, test_start),
+        (fwd_body_to_test, test_start),
+        (back_to_body, body_start),
+        (jle_pos, exit_start),
+    ] {
+        let from = pos + 4;
+        let rel = (target as i32) - (from as i32);
+        code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+
+    pe.splice(main_off..main_off + code.len(), code);
+    pe
+}
+
 /// Minimal L4d fixture: VM-lifted internal call, then native decrement BB in a loop.
 pub fn create_pe64_call_then_native_dec() -> Vec<u8> {
     let mut pe = create_minimal_pe64();

@@ -2998,6 +2998,25 @@ mod tests {
     }
 
     #[test]
+    fn test_l5d_forward_jmp_loop_head_pack_smoke() {
+        let pe_data = test_pe::create_pe64_with_forward_jmp_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_seed(&mut pe, Some(main_rva), 0x15D0_2026);
+        use crate::vm::VirtualMachine;
+        let mut vm = VirtualMachine::with_block_maps_and_layout(
+            packed.bytecode.clone(),
+            packed.opcode_map.clone(),
+            packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
+        );
+        vm.run()
+            .unwrap_or_else(|e| panic!("forward-jmp loop VM run failed: {e}"));
+        assert_eq!(vm.exit_code, Some(0), "forward-jmp loop must exit 0");
+    }
+
+    #[test]
     fn test_l5d_same_bb_distinct_transition_map_hashes() {
         use std::collections::HashMap;
 
@@ -3412,10 +3431,16 @@ mod tests {
             body.map(|b| b.windows(sig.len()).any(|w| w == sig)).unwrap_or(false),
             "BB2 call redirect must land on h_call"
         );
+        let bb2_tx_bytes = bb2.tx_id.to_le_bytes();
         assert!(
             packed.bytecode.contains(&META_WIRE_BYTE)
-                && packed.bytecode.windows(2).any(|w| w == [0x02, 0x00]),
-            "hello must emit set_block_map | 2 before cross-BB call"
+                && packed
+                    .bytecode
+                    .windows(3)
+                    .any(|w| w[0] == META_WIRE_BYTE && w[1..3] == bb2_tx_bytes),
+            "hello must emit set_block_map tx={} (bb{}) before cross-BB call",
+            bb2.tx_id,
+            bb2.bb_id
         );
     }
 
