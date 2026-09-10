@@ -9,7 +9,8 @@ pub mod virt_isa;
 pub use opcode::OpCode;
 pub use dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 pub use block_map::{
-    BlockMapEntry, BlockMapPlan, HandlerRedirectPlan, KNV6_MAGIC, META_OPERAND_LEN, META_WIRE_BYTE,
+    BlockMapEntry, BlockMapPlan, ENTRY_PRED_BB, HandlerRedirectPlan, KNV6_MAGIC, META_OPERAND_LEN,
+    META_WIRE_BYTE,
     collect_handler_redirect_plan, emit_block_map_refresh, meta_instruction_len,
 };
 pub use opcode_map::{

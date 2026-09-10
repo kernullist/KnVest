@@ -191,6 +191,11 @@ impl VirtualMachine {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn program_counter(&self) -> usize {
+        self.pc
+    }
+
     pub fn step(&mut self) -> VMResult<()> {
         let opcode_byte = self.read_u8()?;
 
@@ -201,14 +206,14 @@ impl VirtualMachine {
                 .ok_or(VMError::InvalidOpcode(opcode_byte))?
                 .seed();
             self.skip_layout_pad_meta()?;
-            let bb_id = self.read_u16()?;
+            let tx_id = self.read_u16()?;
             let new_map = if let Some(plan) = &self.block_map_plan {
-                plan.map_for_bb_or_base(bb_id, self.opcode_map.as_ref().unwrap())
+                plan.map_for_tx_or_base(tx_id, self.opcode_map.as_ref().unwrap())
             } else {
-                BlockMapPlan::block_opcode_map(base_seed, bb_id as usize)
+                BlockMapPlan::block_opcode_map(base_seed, tx_id as usize)
             };
             self.opcode_map = Some(new_map);
-            self.current_bb_id = bb_id;
+            self.current_bb_id = tx_id;
             return Ok(());
         }
 
@@ -387,7 +392,7 @@ impl VirtualMachine {
                             .opcode_map
                             .as_ref()
                             .ok_or(VMError::InvalidOpcode(0))?;
-                        self.opcode_map = Some(plan.map_for_bb_or_base(caller_bb, base));
+                        self.opcode_map = Some(plan.map_for_tx_or_base(caller_bb, base));
                         self.current_bb_id = caller_bb;
                     }
                 } else {

@@ -444,11 +444,11 @@ impl StubEmitter {
         self.jmp_to_dispatch();
     }
 
-    /// L4e: refresh opcode wire -> handler table from KNV6 entry for bb_id operand.
+    /// L5d: refresh opcode wire -> handler table from KNV6 entry for transition-id operand.
     fn emit_handler_set_block_map(&mut self) {
         self.label("h_set_block_map");
         self.emit_skip_wire_pad(OpCode::SetBlockMap);
-        // movzx r8d, word [rsi] — REX.R for r8 dest only (0x44); 0x45 wrongly sets REX.B → [r14]
+        // movzx r8d, word [rsi] — transition id (tx_id)
         self.emit(&[0x44, 0x0F, 0xB7, 0x06]);
         // add rsi, 2
         self.emit(&[0x48, 0x83, 0xC6, 0x02]);
@@ -462,7 +462,7 @@ impl StubEmitter {
         self.jmp_rel32("module_fail");
     }
 
-    /// r8 = bb_id operand; rsi = bytecode PC. Sets r15 → matching KNV6 entry header.
+    /// r8 = tx_id operand; rsi = bytecode PC. Sets r15 → matching KNV6 entry header.
     fn emit_block_map_resolve_r15(&mut self) {
         self.label("h_set_block_map_resolve");
         // movzx ecx, word [rip + knv6_count]
@@ -481,7 +481,7 @@ impl StubEmitter {
             ((header >> 24) & 0xFF) as u8,
         ]);
         self.label("h_set_block_map_search");
-        // cmp word [r15], r8w — 66 45 (no REX.W); 4D would be qword cmp and never match bb_id
+        // cmp word [r15], r8w — match transition id at KNV6 entry head
         self.emit(&[0x66, 0x45, 0x39, 0x07]);
         self.jcc_rel32_short(0x74, "h_set_block_map_found");
         let stride = KNV6_ENTRY_SIZE as u32;
@@ -526,10 +526,10 @@ impl StubEmitter {
     }
 
     fn emit_block_map_apply_and_dispatch(&mut self) {
-        // mov [rbp-0x120], r8w — track active bb for table-mode ret restore
+        // mov [rbp-0x120], r8w — track active transition for table-mode ret restore
         self.emit_mov_word_to_rbp_from_r8(-0x120);
-        // mov al, [r15+6] exit_wire
-        self.emit(&[0x41, 0x8A, 0x47, 0x06]);
+        // mov al, [r15+10] exit_wire (KNV6 v2 layout)
+        self.emit(&[0x41, 0x8A, 0x47, 0x0A]);
         // mov [rip+exit_wire_cmp_slot], al
         self.emit(&[0x88, 0x05, 0, 0, 0, 0]);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));

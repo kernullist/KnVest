@@ -395,6 +395,81 @@ fn resolve_callee_entry(
     target
 }
 
+/// Control-transfer edge `(pred_bb_id, succ_bb_id)` within one lifted function window.
+pub fn collect_cfg_edges(blocks: &[BasicBlock], instrs: &[X64Instruction]) -> Vec<(u16, u16)> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut edges = Vec::new();
+    let mut block_by_start = std::collections::HashMap::new();
+    for bb in blocks {
+        block_by_start.insert(bb.start, bb.id);
+    }
+
+    for bb in blocks {
+        let tail = &instrs[bb.tail_idx];
+        let next_bb = blocks
+            .iter()
+            .find(|b| b.start >= bb.end)
+            .map(|b| b.id as u16);
+
+        match &tail.kind {
+            X64InstrKind::Call { target_offset } => {
+                let target = branch_target_abs(tail, *target_offset);
+                if let Some(&succ) = block_by_start.get(&target) {
+                    edges.push((bb.id as u16, succ as u16));
+                }
+                if let Some(succ) = next_bb {
+                    edges.push((bb.id as u16, succ));
+                }
+            }
+            X64InstrKind::Jmp { target_offset } => {
+                let target = branch_target_abs(tail, *target_offset);
+                if let Some(&succ) = block_by_start.get(&target) {
+                    edges.push((bb.id as u16, succ as u16));
+                }
+            }
+            X64InstrKind::Je { target_offset }
+            | X64InstrKind::Jne { target_offset }
+            | X64InstrKind::Jl { target_offset }
+            | X64InstrKind::Jle { target_offset }
+            | X64InstrKind::Jg { target_offset }
+            | X64InstrKind::Jge { target_offset } => {
+                let target = branch_target_abs(tail, *target_offset);
+                if let Some(&succ) = block_by_start.get(&target) {
+                    edges.push((bb.id as u16, succ as u16));
+                }
+                if let Some(succ) = next_bb {
+                    edges.push((bb.id as u16, succ));
+                }
+            }
+            X64InstrKind::Ret => {}
+            _ => {
+                if let Some(succ) = next_bb {
+                    edges.push((bb.id as u16, succ));
+                }
+            }
+        }
+    }
+
+    edges.push((crate::vm::block_map::ENTRY_PRED_BB, 0));
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+}
+
+pub fn incoming_edge_counts(edges: &[(u16, u16)]) -> std::collections::HashMap<u16, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for &(_, succ) in edges {
+        counts.entry(succ).and_modify(|c| *c += 1).or_insert(1);
+    }
+    counts
+}
+
+fn branch_target_abs(instr: &X64Instruction, rel: i32) -> usize {
+    (instr.offset as i64 + instr.bytes.len() as i64 + rel as i64) as usize
+}
+
 fn is_prologue_start(pe_data: &[u8], off: usize) -> bool {
     pe_data.get(off) == Some(&0x55)
         && pe_data.get(off + 1) == Some(&0x48)

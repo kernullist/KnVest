@@ -1,5 +1,8 @@
 # L4e: Per-block opcode-map rotation
 
+> Superseded for packed images by **L5d transition-keyed maps** (`L5D_TRANSITION_MAP.md`).
+> L4e semantics remain the fallback when no transition table is embedded.
+
 ## Design
 
 L4e rotates the L4a opcode wire map at **basic-block entry** so the same semantic VM opcode (e.g. `load_imm`) encodes as **different raw bytes** in different blocks. This breaks static byte-frequency analysis across a function while keeping handler bodies and IR semantics unchanged.

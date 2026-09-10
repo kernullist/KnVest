@@ -83,15 +83,22 @@ impl Instruction {
                 consecutive_invalid = 0;
                 offset += layout.meta_post_wire_pad as usize;
                 if offset + META_OPERAND_LEN <= bytecode.len() {
-                    let bb_id = u16::from_le_bytes([bytecode[offset], bytecode[offset + 1]]);
+                    let tx_id = u16::from_le_bytes([bytecode[offset], bytecode[offset + 1]]);
                     offset += META_OPERAND_LEN;
                     if let Some(plan) = block_plan {
-                        current_map = plan.map_for_bb_or_base(bb_id, base_map);
+                        current_map = plan.map_for_tx_or_base(tx_id, base_map);
+                    }
+                    let mut operands = vec![Operand::Immediate(u64::from(tx_id))];
+                    if let Some(plan) = block_plan {
+                        if let Some(entry) = plan.map_for_tx(tx_id) {
+                            operands.push(Operand::Immediate(u64::from(entry.bb_id)));
+                            operands.push(Operand::Immediate(u64::from(entry.pred_bb_id)));
+                        }
                     }
                     instructions.push(Instruction {
                         offset: start_offset,
                         opcode: OpCode::SetBlockMap,
-                        operands: vec![Operand::Immediate(u64::from(bb_id))],
+                        operands,
                     });
                     continue;
                 }
