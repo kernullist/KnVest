@@ -1,4 +1,5 @@
 use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
+use crate::vm::isa_mode::{is_stack_alu_op, IsaMode, operand_len_for};
 use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::layout::BytecodeLayout;
 use crate::vm::opcode_map::OpcodeMap;
@@ -65,6 +66,24 @@ impl Instruction {
         block_plan: Option<&BlockMapPlan>,
         dispatch_mode: DispatchMode,
         layout: &BytecodeLayout,
+    ) -> Vec<Self> {
+        Self::disassemble_with_layout_and_isa(
+            bytecode,
+            base_map,
+            block_plan,
+            dispatch_mode,
+            layout,
+            IsaMode::Reg,
+        )
+    }
+
+    pub fn disassemble_with_layout_and_isa(
+        bytecode: &[u8],
+        base_map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
+        dispatch_mode: DispatchMode,
+        layout: &BytecodeLayout,
+        isa_mode: IsaMode,
     ) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
@@ -153,20 +172,28 @@ impl Instruction {
                 },
                 
                 OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => {
-                    for _ in 0..3 {
+                    let count = operand_len_for(opcode, isa_mode);
+                    for _ in 0..count {
                         if offset < bytecode.len() {
                             operands.push(Operand::Register(bytecode[offset]));
                             offset += 1;
                         }
                     }
+                    if isa_mode.is_stack() && count == 1 {
+                        operands.push(Operand::Immediate(0)); // stack marker: pops 2 slots
+                    }
                 },
                 
                 OpCode::Cmp | OpCode::Cmp32 => {
-                    for _ in 0..2 {
+                    let count = operand_len_for(opcode, isa_mode);
+                    for _ in 0..count {
                         if offset < bytecode.len() {
                             operands.push(Operand::Register(bytecode[offset]));
                             offset += 1;
                         }
+                    }
+                    if isa_mode.is_stack() && count == 0 {
+                        operands.push(Operand::Immediate(0)); // stack marker: pops 2 slots
                     }
                 },
                 
@@ -305,7 +332,13 @@ impl Instruction {
                 if i > 0 {
                     output.push_str(", ");
                 }
-                output.push_str(&operand.to_string());
+                if matches!(operand, Operand::Immediate(0))
+                    && is_stack_alu_op(instr.opcode)
+                {
+                    output.push_str("<stack>");
+                } else {
+                    output.push_str(&operand.to_string());
+                }
             }
 
             output.push('\n');

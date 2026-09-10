@@ -1,5 +1,6 @@
 use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::dispatch::THREAD_TARGET_SIZE;
+use crate::vm::isa_mode::IsaMode;
 use crate::vm::layout::BytecodeLayout;
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
@@ -23,6 +24,7 @@ fn enumerate_instructions(
     block_plan: &BlockMapPlan,
     layout: &BytecodeLayout,
     dispatch_mode: crate::vm::DispatchMode,
+    isa_mode: IsaMode,
 ) -> Vec<InsnLayout> {
     let mut out = Vec::new();
     let mut offset = 0;
@@ -57,7 +59,7 @@ fn enumerate_instructions(
             Some(op) => op,
             None => break,
         };
-        let operand_len = op.operand_len();
+        let operand_len = op.operand_len_for_isa(isa_mode);
         let raw_len = layout.insn_len(op, operand_len, dispatch_mode, false);
         if offset + raw_len > bytecode.len() {
             break;
@@ -149,6 +151,7 @@ pub fn embed_thread_targets(
     opcode_map: &OpcodeMap,
     block_plan: &BlockMapPlan,
     layout: &BytecodeLayout,
+    isa_mode: IsaMode,
     handler_off_from_table: &dyn Fn(OpCode) -> i32,
     set_map_off: i32,
 ) -> Vec<u8> {
@@ -158,6 +161,7 @@ pub fn embed_thread_targets(
         block_plan,
         layout,
         crate::vm::DispatchMode::Table,
+        isa_mode,
     );
     let code_end = code_section_end(&insns);
     let relocate = |old: usize| relocate_offset(&insns, old);
@@ -183,7 +187,7 @@ pub fn embed_thread_targets(
             InsnKind::SetBlockMap => unreachable!(),
         };
         let op_off = insn.start + layout.operands_offset(op, false);
-        let operand_len = op.operand_len();
+        let operand_len = op.operand_len_for_isa(isa_mode);
         out.extend_from_slice(&bytecode[tail_start..op_off]);
         let mut operands = bytecode[op_off..op_off + operand_len].to_vec();
         patch_operands_for_threaded(insn.kind, &mut operands, &insns, bytecode.len(), &relocate);
@@ -302,6 +306,7 @@ pub fn threaded_load_imm_immediates_with_blocks_layout(
         &plan,
         layout,
         crate::vm::DispatchMode::Threaded,
+        crate::vm::IsaMode::Reg,
     );
     let mut out = Vec::new();
     for insn in insns {
@@ -425,7 +430,7 @@ mod tests {
     use crate::vm::{BlockMapPlan, DispatchMode};
 
     fn stub_for(map: &OpcodeMap) -> Vec<u8> {
-        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[])
+        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[])
             .0
     }
 
@@ -438,6 +443,7 @@ mod tests {
             map,
             &plan,
             &layout,
+            crate::vm::IsaMode::Reg,
             &|op| handler_offset_for_op(stub, map, op),
             set_map,
         )

@@ -130,7 +130,7 @@ pub fn native_call_ids_in_bytecode_with_layout(
                 continue;
             }
         };
-        let operand_len = op.operand_len();
+        let operand_len = op.operand_len_lift();
         let total = layout.insn_len(op, operand_len, dispatch_mode, false);
         if offset + total > bytecode.len() {
             break;
@@ -495,7 +495,7 @@ mod tests {
         use crate::vm::{BlockMapPlan, DispatchMode, OpCode, OpcodeMap};
 
         let map = OpcodeMap::from_seed(0x4C34_4100);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[]);
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
@@ -505,6 +505,7 @@ mod tests {
             &map,
             &BlockMapPlan::default(),
             &crate::vm::BytecodeLayout::identity(),
+            crate::vm::IsaMode::Reg,
             &|op| handler_offset_for_op(&stub, &map, op),
             set_map,
         );
@@ -553,6 +554,7 @@ mod tests {
             &map,
             DispatchMode::Table,
             0,
+            crate::vm::IsaMode::Reg,
             &BytecodeLayout::identity(),
             &[],
             &BlockMapPlan::default(),
@@ -562,13 +564,14 @@ mod tests {
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
-        let laid = apply_layout_diversification(&raw, &layout, &map, &plan);
+        let laid = apply_layout_diversification(&raw, &layout, &map, &plan, crate::vm::IsaMode::Reg);
         let set_map = handler_offset_for_set_block_map(&stub);
         let threaded = embed_thread_targets(
             &laid,
             &map,
             &plan,
             &layout,
+            crate::vm::IsaMode::Reg,
             &|op| handler_offset_for_op(&stub, &map, op),
             set_map,
         );
@@ -597,7 +600,7 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
-        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded, 0)
+        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded, 0, crate::vm::IsaMode::Reg)
             .unwrap();
         let ids = native_call_ids_in_bytecode_with_layout(
             &packed.bytecode,

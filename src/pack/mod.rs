@@ -1,5 +1,5 @@
 use crate::pe::{PEFile, packer};
-use crate::vm::{DispatchMode, OpcodeMap};
+use crate::vm::{DispatchMode, IsaMode, OpcodeMap};
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -11,6 +11,7 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
     partial: bool,
     dispatch_mode: DispatchMode,
     mba_level: u8,
+    isa_mode: IsaMode,
 ) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
@@ -22,15 +23,17 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
         partial,
         dispatch_mode,
         mba_level,
+        isa_mode,
     )
         .context("Failed to pack function")?;
 
     eprintln!(
-        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={})",
+        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={})",
         pack_result.bytecode.len(),
         pack_result.seed,
         pack_result.dispatch_mode,
-        mba_level
+        mba_level,
+        isa_mode
     );
 
     pe.write_to_file(&output_path)

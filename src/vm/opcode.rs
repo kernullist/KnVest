@@ -66,8 +66,8 @@ impl OpCode {
         }
     }
 
-    /// Operand bytes following the opcode wire byte (L4a logical layout).
-    pub fn operand_len(self) -> usize {
+    /// Operand bytes following the opcode wire byte (L4a register-ISA layout).
+    pub fn operand_len_reg(self) -> usize {
         match self {
             OpCode::Nop | OpCode::Ret => 0,
             OpCode::LoadImm | OpCode::LoadStr => 1 + 8,
@@ -80,6 +80,19 @@ impl OpCode {
             OpCode::RunNative | OpCode::BailNative => 8 + 8,
             OpCode::SetBlockMap => 2,
         }
+    }
+
+    /// Operand length for the active lift/pack ISA mode (thread-local during pack/lift).
+    pub fn operand_len(self) -> usize {
+        self.operand_len_reg()
+    }
+
+    pub fn operand_len_for_isa(self, isa: crate::vm::IsaMode) -> usize {
+        crate::vm::isa_mode::operand_len_for(self, isa)
+    }
+
+    pub fn operand_len_lift(self) -> usize {
+        crate::vm::isa_mode::operand_len_for(self, crate::vm::isa_mode::current_isa_mode())
     }
 
     pub fn name(&self) -> &'static str {

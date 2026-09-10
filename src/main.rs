@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         Commands::Ir { input } => {
             handle_ir_command(input)?;
         }
-        Commands::Pack { input, output, rva, seed, partial, dispatch, mba } => {
+        Commands::Pack { input, output, rva, seed, partial, dispatch, mba, isa } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
                 Some(u32::from_str_radix(rva_str, 16)?)
@@ -31,6 +31,7 @@ fn main() -> Result<()> {
                 .parse::<crate::vm::DispatchMode>()
                 .map_err(|e| anyhow::anyhow!(e))?;
             let mba_level = cli::parse_mba_level(&mba)?;
+            let isa_mode = cli::parse_isa_mode(&isa)?;
             handle_pack_command(
                 input,
                 output,
@@ -39,6 +40,7 @@ fn main() -> Result<()> {
                 partial,
                 dispatch_mode,
                 mba_level,
+                isa_mode,
             )?;
         }
     }
@@ -98,13 +100,23 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
         "{}",
         crate::vm::virt_isa::format_ir_header(&opcode_map, dispatch_mode)
     );
+
+    print!(
+        "{}",
+        crate::vm::isa_mode::format_ir_header(
+            pack_meta.isa_mode,
+            &opcode_map,
+            dispatch_mode,
+        )
+    );
     
-    let instructions = ir::Instruction::disassemble_with_layout(
+    let instructions = ir::Instruction::disassemble_with_layout_and_isa(
         &bytecode,
         &opcode_map,
         block_plan.as_ref(),
         dispatch_mode,
         &layout_plan,
+        pack_meta.isa_mode,
     );
     let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
     
@@ -121,8 +133,9 @@ fn handle_pack_command(
     partial: bool,
     dispatch_mode: crate::vm::DispatchMode,
     mba_level: u8,
+    isa_mode: crate::vm::IsaMode,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode, mba_level)?;
+    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode, mba_level, isa_mode)?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }

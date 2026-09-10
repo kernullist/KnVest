@@ -1,5 +1,6 @@
 use super::block_map::{BlockMapPlan, META_OPERAND_LEN, META_WIRE_BYTE};
 use super::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
+use super::isa_mode::IsaMode;
 use super::opcode::OpCode;
 use super::opcode_map::{CANONICAL_OPCODES, OpcodeMap};
 
@@ -165,6 +166,7 @@ pub fn enumerate_raw_instructions(
     block_plan: &BlockMapPlan,
     layout: &BytecodeLayout,
     dispatch_mode: DispatchMode,
+    isa_mode: IsaMode,
 ) -> Vec<RawInsn> {
     let mut out = Vec::new();
     let mut offset = 0;
@@ -198,7 +200,7 @@ pub fn enumerate_raw_instructions(
             Some(op) => op,
             None => break,
         };
-        let operand_len = op.operand_len();
+        let operand_len = op.operand_len_for_isa(isa_mode);
         let total = layout.insn_len(op, operand_len, dispatch_mode, false);
         if offset + total > bytecode.len() {
             break;

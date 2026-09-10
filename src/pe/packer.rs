@@ -11,8 +11,8 @@ use super::cfg::{
 use crate::vm::block_map::ENTRY_PRED_BB;
 use super::partial::{NativeSledBuilder, PartialVirtPlan, KNV5_MAGIC};
 use crate::vm::{
-    BlockMapPlan, BytecodeLayout, DispatchMode, OpcodeMap, PackMetadata, random_seed, set_active_map,
-    clear_active_map, KNV6_MAGIC, KNV7_MAGIC,
+    BlockMapPlan, BytecodeLayout, DispatchMode, IsaMode, OpcodeMap, PackMetadata, random_seed,
+    set_active_map, clear_active_map, clear_isa_mode, set_isa_mode, KNV6_MAGIC, KNV7_MAGIC,
 };
 use crate::vm::block_map::validate_handler_table_targets;
 use crate::vm::opcode_map::KNV4_MAGIC;
@@ -67,6 +67,7 @@ pub fn pack_function(
     partial_enabled: bool,
     dispatch_mode: DispatchMode,
     mba_level: u8,
+    isa_mode: IsaMode,
 ) -> PEResult<PackResult> {
     let explicit_rva = function_rva.is_some();
     let target_rva = if let Some(rva) = function_rva {
@@ -88,6 +89,7 @@ pub fn pack_function(
         pack_seed,
         partial_enabled,
         mba_level,
+        isa_mode,
     )?;
 
     let layout_plan = BytecodeLayout::from_seed(pack_seed);
@@ -101,6 +103,7 @@ pub fn pack_function(
         &translated.native_sleds,
         &translated.native_sync,
         mba_level,
+        isa_mode,
     )?;
 
     add_vm_section(
@@ -137,6 +140,7 @@ fn build_section_bytecode(
     native_sleds: &[u8],
     native_sync: &[(i32, u8)],
     mba_level: u8,
+    isa_mode: IsaMode,
 ) -> PEResult<SectionBytecode> {
     let knv5 = partial_plan.to_embedded_bytes();
     // Pass 1: finalize stub and capture L4a redirect plan from emitter labels (not read-back).
@@ -146,6 +150,7 @@ fn build_section_bytecode(
         opcode_map,
         dispatch_mode,
         mba_level,
+        isa_mode,
         layout_plan,
         &knv5,
         block_map_plan,
@@ -160,6 +165,7 @@ fn build_section_bytecode(
         opcode_map,
         dispatch_mode,
         mba_level,
+        isa_mode,
         layout_plan,
         &knv5,
         block_map_plan,
@@ -169,13 +175,21 @@ fn build_section_bytecode(
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     validate_live_handler_table_image(&vm_stub, block_map_plan);
+    set_isa_mode(isa_mode);
     let laid_out = apply_layout_diversification(
         bytecode,
         layout_plan,
         opcode_map,
         block_map_plan,
+        isa_mode,
     );
-    validate_meta_bb_ids_in_bytecode(&laid_out, block_map_plan, opcode_map, layout_plan);
+    validate_meta_bb_ids_in_bytecode(
+        &laid_out,
+        block_map_plan,
+        opcode_map,
+        layout_plan,
+        isa_mode,
+    );
     if dispatch_mode == DispatchMode::Table {
         validate_call_redirect_wires_in_bytecode(
             &vm_stub,
@@ -183,6 +197,7 @@ fn build_section_bytecode(
             block_map_plan,
             opcode_map,
             layout_plan,
+            isa_mode,
         );
     }
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
@@ -191,12 +206,14 @@ fn build_section_bytecode(
             opcode_map,
             block_map_plan,
             layout_plan,
+            isa_mode,
             &|op| handler_plan.offset_for(op),
             handler_plan.set_block_map,
         )
     } else {
         laid_out
     };
+    clear_isa_mode();
     Ok(SectionBytecode {
         stub: vm_stub,
         bytecode: section_bytecode,
@@ -209,6 +226,7 @@ fn validate_meta_bb_ids_in_bytecode(
     block_map_plan: &BlockMapPlan,
     opcode_map: &OpcodeMap,
     layout: &BytecodeLayout,
+    isa_mode: IsaMode,
 ) {
     use crate::vm::layout::{RawInsnKind, enumerate_raw_instructions};
     use crate::vm::OpCode;
@@ -222,6 +240,7 @@ fn validate_meta_bb_ids_in_bytecode(
         block_map_plan,
         layout,
         DispatchMode::Table,
+        isa_mode,
     );
     for insn in insns {
         if insn.kind != RawInsnKind::SetBlockMap {
@@ -244,6 +263,7 @@ fn validate_call_redirect_wires_in_bytecode(
     block_map_plan: &BlockMapPlan,
     opcode_map: &OpcodeMap,
     layout: &BytecodeLayout,
+    isa_mode: IsaMode,
 ) {
     use crate::ir::Instruction;
     use crate::vm::block_map::{collect_handler_redirect_plan, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
@@ -257,12 +277,13 @@ fn validate_call_redirect_wires_in_bytecode(
         .iter()
         .position(|&o| o == OpCode::Call)
         .unwrap();
-    let insns = Instruction::disassemble_with_layout(
+    let insns = Instruction::disassemble_with_layout_and_isa(
         bytecode,
         opcode_map,
         Some(block_map_plan),
         DispatchMode::Table,
         layout,
+        isa_mode,
     );
     let table_base = table_base_from_stub(stub);
     let knv6 = stub
@@ -683,6 +704,7 @@ fn translate_to_vm_bytecode(
     pack_seed: u64,
     partial_enabled: bool,
     mba_level: u8,
+    isa_mode: IsaMode,
 ) -> PEResult<TranslateResult> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
@@ -750,6 +772,7 @@ fn translate_to_vm_bytecode(
     let mut sled_builder = NativeSledBuilder::new();
 
     set_active_map(opcode_map);
+    set_isa_mode(isa_mode);
     crate::pe::mba::set_mba_context(mba_level, pack_seed);
     let (bytecode, stack_map) = lift_to_vm_bytecode_for_main(
         &all_instrs,
@@ -764,6 +787,7 @@ fn translate_to_vm_bytecode(
         &mut sled_builder,
     );
     crate::pe::mba::clear_mba_context();
+    clear_isa_mode();
     clear_active_map();
 
     let native_sleds = sled_builder.blob();
@@ -1289,19 +1313,19 @@ mod tests {
     }
 
     fn pack_pe(pe: &mut PEFile, rva: Option<u32>) -> PackResult {
-        pack_function(pe, rva, Some(TEST_SEED), false, crate::vm::DispatchMode::Table, 0).unwrap()
+        pack_function(pe, rva, Some(TEST_SEED), false, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg).unwrap()
     }
 
     fn pack_pe_seed(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
-        pack_function(pe, rva, Some(seed), false, crate::vm::DispatchMode::Table, 0).unwrap()
+        pack_function(pe, rva, Some(seed), false, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg).unwrap()
     }
 
     fn pack_pe_partial(pe: &mut PEFile, rva: Option<u32>, seed: u64) -> PackResult {
-        pack_function(pe, rva, Some(seed), true, crate::vm::DispatchMode::Table, 0).unwrap()
+        pack_function(pe, rva, Some(seed), true, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg).unwrap()
     }
 
     fn pack_pe_mba(pe: &mut PEFile, rva: Option<u32>, seed: u64, level: u8) -> PackResult {
-        pack_function(pe, rva, Some(seed), false, crate::vm::DispatchMode::Table, level).unwrap()
+        pack_function(pe, rva, Some(seed), false, crate::vm::DispatchMode::Table, level, crate::vm::IsaMode::Reg).unwrap()
     }
 
     #[test]
@@ -1601,6 +1625,7 @@ mod tests {
                 false,
                 crate::vm::DispatchMode::Table,
                 level,
+                crate::vm::IsaMode::Reg,
             )
             .unwrap();
             NC2_R2.with(|c| c.set(None));
@@ -2151,7 +2176,7 @@ mod tests {
     
     #[test]
     fn test_stub_encoding_correctness() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         
         let mut i = 0;
         while i < stub.len() {
@@ -2186,7 +2211,7 @@ mod tests {
 
     #[test]
     fn test_stub_does_not_clobber_writefile_slot() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         // mov [rbp-0xB0], rsi would clobber the WriteFile function pointer slot
         let clobber_pattern = [0x48u8, 0x89, 0xB5, 0x50, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -2203,7 +2228,7 @@ mod tests {
 
     #[test]
     fn test_loadbyte_uses_rip_rel_bytecode_base() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let vmbc = stub.windows(4).position(|w| w == b"VMBC").expect("VMBC marker");
         let bytecode_offset = vmbc + 4;
         let cache_store = [0x48u8, 0x89, 0xB5, 0xE8, 0xFE, 0xFF, 0xFF];
@@ -2239,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_prologue_uses_near_jb_ja_not_jl_jg() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let cmp_a = [0x83u8, 0xF8, 0x41];
         let mut found_jb = false;
         for i in 0..stub.len().saturating_sub(cmp_a.len() + 3) {
@@ -2265,7 +2290,7 @@ mod tests {
     #[test]
     fn test_handler_table_resolves_handlers() {
         let map = OpcodeMap::from_seed(0);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let table_base = super::threaded::handler_table_base(&stub);
         let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
         let load_imm_off = i32::from_le_bytes([
@@ -2284,7 +2309,7 @@ mod tests {
     #[test]
     fn test_l4c_threaded_stub_uses_inline_handler_targets() {
         let map = OpcodeMap::from_seed(0xC0FF_EE01);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Threaded, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Threaded, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let inline_load = [0x48u8, 0x63, 0x46, 0x01]; // movsxd rax, dword [rsi+1]
         assert!(
             stub.windows(inline_load.len()).any(|w| w == inline_load),
@@ -2306,7 +2331,7 @@ mod tests {
         let mut pe_thread = PEFile::from_bytes(pe_data).unwrap();
         let seed = 0xA11C_EEDu64;
         let packed_table =
-            pack_function(&mut pe_table, None, Some(seed), false, crate::vm::DispatchMode::Table, 0)
+            pack_function(&mut pe_table, None, Some(seed), false, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg)
                 .unwrap();
         let packed_thread = pack_function(
             &mut pe_thread,
@@ -2314,7 +2339,8 @@ mod tests {
             Some(seed),
             false,
             crate::vm::DispatchMode::Threaded,
-             0,
+            0,
+            crate::vm::IsaMode::Reg,
         )
         .unwrap();
 
@@ -2364,7 +2390,8 @@ mod tests {
             Some(0x14D0_2026),
             true,
             crate::vm::DispatchMode::Threaded,
-             0,
+            0,
+            crate::vm::IsaMode::Reg,
         )
         .unwrap();
         assert_eq!(packed.dispatch_mode, crate::vm::DispatchMode::Threaded);
@@ -2389,7 +2416,8 @@ mod tests {
             Some(0x4C34_4100),
             false,
             crate::vm::DispatchMode::Threaded,
-             0,
+            0,
+            crate::vm::IsaMode::Reg,
         )
         .unwrap();
         let msg = b"Hello, World!";
@@ -2432,7 +2460,8 @@ mod tests {
             Some(0x4C34_4100),
             false,
             crate::vm::DispatchMode::Threaded,
-             0,
+            0,
+            crate::vm::IsaMode::Reg,
         )
         .unwrap();
         let msg = b"IAT puts hello";
@@ -2468,7 +2497,7 @@ mod tests {
 
     #[test]
     fn test_native_call_saves_and_restores_rsi() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let save_rsi = [0x48u8, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         let restore_rsi = [0x48u8, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -2562,7 +2591,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_ne_uses_jne_not_je() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let ne_cond = [0x83u8, 0xF9, 0x02];
         let push_flags = [0xFFu8, 0xB5, 0x70, 0xFF, 0xFF, 0xFF];
         let mut found = false;
@@ -2594,7 +2623,7 @@ mod tests {
 
     #[test]
     fn test_h_cmp_preserves_zf_in_flag_mask() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let mask = [0x48u8, 0x25, 0xC1, 0x08, 0x00, 0x00];
         assert!(
             stub.windows(mask.len()).any(|w| w == mask),
@@ -2604,7 +2633,7 @@ mod tests {
 
     #[test]
     fn test_jmpif_taken_uses_add_rsi_rbx() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let taken_add = [0x48u8, 0x01, 0xDE];
         assert!(
             stub.windows(taken_add.len()).any(|w| w == taken_add),
@@ -2614,7 +2643,7 @@ mod tests {
 
     #[test]
     fn test_three_digit_printer_uses_rcx_buffer() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         // three_digit path must store via rcx (buffer from lea rcx,[rbp-0xF0]), not wrong disp32
         let bad_hundreds = [0x88u8, 0x85, 0xF0, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -2684,7 +2713,7 @@ mod tests {
 
     #[test]
     fn test_module_next_advances_rcx_not_rbx() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let advance_rcx = [0x48u8, 0x8B, 0x09];
         let advance_rbx = [0x48u8, 0x8B, 0x1B];
         assert!(
@@ -2699,7 +2728,7 @@ mod tests {
 
     #[test]
     fn test_handler_targets_for_push_and_native_call() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let table_base = super::threaded::handler_table_base(&stub);
         let map = OpcodeMap::from_seed(0);
         let load_imm_wire = map.encode(OpCode::LoadImm) as usize;
@@ -2797,8 +2826,8 @@ mod tests {
         let packed_a = pack_pe_seed(&mut pe_a, None, seed_a);
         let packed_b = pack_pe_seed(&mut pe_b, None, seed_b);
 
-        let (stub_a, _, _, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
-        let (stub_b, _, _, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub_a, _, _, _) = create_vm_interpreter_stub(0, 0, &packed_a.opcode_map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub_b, _, _, _) = create_vm_interpreter_stub(0, 0, &packed_b.opcode_map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         assert_ne!(stub_a, stub_b, "different Add variants must change stub bytes");
 
         assert!(
@@ -2870,9 +2899,10 @@ mod tests {
                 0,
                 &map_a,
                 crate::vm::DispatchMode::Table,
-                 0,
+                0,
+                crate::vm::IsaMode::Reg,
                 &crate::vm::BytecodeLayout::identity(),
-            &[],
+                &[],
                 &crate::vm::BlockMapPlan::default(),
                 &[],
                 &[],
@@ -2882,9 +2912,10 @@ mod tests {
                 0,
                 &map_b,
                 crate::vm::DispatchMode::Table,
-                 0,
+                0,
+                crate::vm::IsaMode::Reg,
                 &crate::vm::BytecodeLayout::identity(),
-            &[],
+                &[],
                 &crate::vm::BlockMapPlan::default(),
                 &[],
                 &[],
@@ -2928,6 +2959,189 @@ mod tests {
         assert!(
             ir.contains("; virt-isa  | merge"),
             "minimal PE must show xor merge annotation: {ir}"
+        );
+    }
+
+    #[test]
+    fn test_l5e_stack_isa_ir_shows_push_and_stack_alu() {
+        use crate::ir::Instruction;
+        use crate::vm::IsaMode;
+
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_function(
+            &mut pe,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Stack,
+        )
+        .unwrap();
+        let meta = extract_pack_metadata_from_packed(&pe).unwrap();
+        assert_eq!(meta.isa_mode, IsaMode::Stack);
+
+        let insns = Instruction::disassemble_with_layout_and_isa(
+            &packed.bytecode,
+            &packed.opcode_map,
+            Some(&packed.block_map_plan),
+            packed.dispatch_mode,
+            &packed.layout_plan,
+            IsaMode::Stack,
+        );
+        let ir = Instruction::pretty_print(&insns);
+        assert!(
+            ir.contains("push"),
+            "stack ISA IR must show push ops: {ir}"
+        );
+        assert!(
+            ir.contains("<stack>"),
+            "stack ISA IR must annotate stack ALU operands: {ir}"
+        );
+        let hdr = crate::vm::isa_mode::format_ir_header(
+            IsaMode::Stack,
+            &packed.opcode_map,
+            packed.dispatch_mode,
+        );
+        assert!(hdr.contains("isa=stack"));
+    }
+
+    #[test]
+    fn test_l5e_stack_vs_reg_bytecode_and_reg_default_unchanged() {
+        use crate::ir::Instruction;
+        use crate::vm::IsaMode;
+
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe_reg = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_stack = PEFile::from_bytes(pe_data).unwrap();
+        let packed_reg = pack_function(
+            &mut pe_reg,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Reg,
+        )
+        .unwrap();
+        let packed_stack = pack_function(
+            &mut pe_stack,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Stack,
+        )
+        .unwrap();
+        assert_ne!(
+            packed_reg.bytecode,
+            packed_stack.bytecode,
+            "stack and reg ISA must emit different bytecode"
+        );
+        let stack_ir = Instruction::disassemble_with_layout_and_isa(
+            &packed_stack.bytecode,
+            &packed_stack.opcode_map,
+            Some(&packed_stack.block_map_plan),
+            packed_stack.dispatch_mode,
+            &packed_stack.layout_plan,
+            IsaMode::Stack,
+        );
+        assert!(
+            stack_ir.iter().any(|i| i.opcode == OpCode::Push),
+            "stack pack must contain push ops in IR"
+        );
+        let reg_ir = disasm_packed(&packed_reg);
+        let reg_ir_stack = Instruction::disassemble_with_layout_and_isa(
+            &packed_reg.bytecode,
+            &packed_reg.opcode_map,
+            Some(&packed_reg.block_map_plan),
+            packed_reg.dispatch_mode,
+            &packed_reg.layout_plan,
+            IsaMode::Reg,
+        );
+        assert_eq!(
+            reg_ir.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            reg_ir_stack.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            "default reg ISA disassembly unchanged"
+        );
+    }
+
+    #[test]
+    fn test_l5e_stack_reference_vm_alu_smoke() {
+        use crate::pe::mba::emit_add_three;
+        use crate::vm::{IsaMode, OpCode, OpcodeMap, VirtualMachine};
+
+        let map = OpcodeMap::from_seed(0x15E);
+        let mut bytecode = Vec::new();
+        crate::vm::set_active_map(&map);
+        crate::vm::set_isa_mode(IsaMode::Stack);
+        bytecode.push(map.encode(OpCode::LoadImm));
+        bytecode.push(0);
+        bytecode.extend_from_slice(&10u64.to_le_bytes());
+        bytecode.push(map.encode(OpCode::LoadImm));
+        bytecode.push(1);
+        bytecode.extend_from_slice(&20u64.to_le_bytes());
+        emit_add_three(&mut bytecode, 2, 0, 1);
+        crate::vm::clear_isa_mode();
+        crate::vm::clear_active_map();
+        bytecode.push(map.encode(OpCode::Exit));
+        bytecode.push(2);
+
+        let mut vm = VirtualMachine::with_opcode_map(bytecode, map.clone())
+            .with_isa_mode(IsaMode::Stack);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(2).unwrap(), 30);
+        assert_eq!(vm.exit_code, Some(30));
+    }
+
+    #[test]
+    fn test_l5e_stack_packed_minimal_vm_matches_reg_exit() {
+        use crate::vm::{IsaMode, VirtualMachine};
+
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe_reg = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_stack = PEFile::from_bytes(pe_data).unwrap();
+        let packed_reg = pack_function(
+            &mut pe_reg,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Reg,
+        )
+        .unwrap();
+        let packed_stack = pack_function(
+            &mut pe_stack,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Stack,
+        )
+        .unwrap();
+        let mut vm_reg = VirtualMachine::with_block_maps_and_layout(
+            packed_reg.bytecode,
+            packed_reg.opcode_map,
+            packed_reg.block_map_plan,
+            packed_reg.layout_plan,
+        );
+        vm_reg.run().unwrap();
+        let mut vm_stack = VirtualMachine::with_block_maps_and_layout(
+            packed_stack.bytecode,
+            packed_stack.opcode_map,
+            packed_stack.block_map_plan,
+            packed_stack.layout_plan,
+        )
+        .with_isa_mode(IsaMode::Stack);
+        vm_stack.run().unwrap();
+        assert_eq!(
+            vm_stack.exit_code,
+            vm_reg.exit_code,
+            "stack layout pack must match reg stdout/exit semantics"
         );
     }
 
@@ -3014,6 +3228,36 @@ mod tests {
         vm.run()
             .unwrap_or_else(|e| panic!("forward-jmp loop VM run failed: {e}"));
         assert_eq!(vm.exit_code, Some(0), "forward-jmp loop must exit 0");
+    }
+
+    #[test]
+    fn test_l5e_stack_forward_jmp_loop_pack_smoke() {
+        use crate::vm::{IsaMode, VirtualMachine};
+
+        let pe_data = test_pe::create_pe64_with_forward_jmp_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_function(
+            &mut pe,
+            Some(main_rva),
+            Some(0x15D0_2026),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Stack,
+        )
+        .unwrap();
+        let mut vm = VirtualMachine::with_block_maps_and_layout(
+            packed.bytecode.clone(),
+            packed.opcode_map.clone(),
+            packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
+        )
+        .with_isa_mode(IsaMode::Stack);
+        vm.run()
+            .unwrap_or_else(|e| panic!("stack forward-jmp loop VM run failed: {e}"));
+        assert_eq!(vm.exit_code, Some(0), "stack forward-jmp loop must exit 0");
     }
 
     #[test]
@@ -3194,6 +3438,7 @@ mod tests {
                 &packed.opcode_map,
                 crate::vm::DispatchMode::Table,
                 0,
+                crate::vm::IsaMode::Reg,
                 &packed.layout_plan,
                 &[],
                 &BlockMapPlan::default(),
@@ -3296,7 +3541,7 @@ mod tests {
             }
             for seed in [None, Some(0xAAAA_AAAA_u64)] {
                 let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
-                let packed = pack_function(&mut pe, None, seed, false, DispatchMode::Table, 0)
+                let packed = pack_function(&mut pe, None, seed, false, DispatchMode::Table, 0, crate::vm::IsaMode::Reg)
                     .unwrap();
                 let insns = Instruction::disassemble_with_layout(
                     &packed.bytecode,
@@ -3379,7 +3624,7 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
-        let packed = pack_function(&mut pe, None, Some(seed), false, DispatchMode::Table, 0).unwrap();
+        let packed = pack_function(&mut pe, None, Some(seed), false, DispatchMode::Table, 0, crate::vm::IsaMode::Reg).unwrap();
         let section = pe.get_section(".knvest").unwrap();
         let start = section.pointer_to_raw_data as usize;
         let section_data = &pe.data[start..start + section.size_of_raw_data as usize];
@@ -3504,7 +3749,7 @@ mod tests {
             sync.iter().any(|(off, _)| *off == -4),
             "countdown loop counter [rbp-4] must sync across run_native"
         );
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
         assert!(
             stub.windows(7).any(|w| w == [0x48, 0x89, 0xAD, 0xE8, 0xFE, 0xFF, 0xFF]),
             "run_native handler must persist VM frame at [rbp-0x118]"
@@ -3537,7 +3782,7 @@ mod tests {
             "first run_native sled bytes (sub dword [rbp-4],1; ret)"
         );
         let sync = packed.native_sync.clone();
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
         // Handler contract: prologue caches native_frame_ptr; invoke lea r14 + mov rbp,r14 before sync.
     }
@@ -3722,7 +3967,7 @@ mod tests {
             sleds
         );
         let sync = packed.native_sync.clone();
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &packed.opcode_map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync);
         assert_run_native_stub_uses_native_rsp(&stub);
         for sled in &sleds {
             assert_run_native_sled_straight_line(sled);
@@ -3947,7 +4192,7 @@ mod tests {
     #[test]
     fn test_l4d_stub_has_native_sled_handlers() {
         let map = OpcodeMap::from_seed(0xDEAD_BEEF);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[]);
         let call_r10 = [0x41u8, 0xFF, 0xD2];
         assert!(
             stub.windows(call_r10.len()).any(|w| w == call_r10),

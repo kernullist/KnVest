@@ -1,4 +1,4 @@
-use crate::vm::{active_encode, OpCode};
+use crate::vm::{active_encode, current_isa_mode, IsaMode, OpCode};
 
 /// Legacy IR annotation anchors (L4f); runtime temps are allocated dynamically.
 pub const MBA_TEMP_ZERO: u8 = 14;
@@ -190,7 +190,19 @@ fn raw_move(bytecode: &mut Vec<u8>, dst: u8, src: u8) {
     bytecode.push(src);
 }
 
+fn emit_stack_push(bytecode: &mut Vec<u8>, reg: u8) {
+    bytecode.push(active_encode(OpCode::Push));
+    bytecode.push(reg);
+}
+
 fn raw_add(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    if current_isa_mode() == IsaMode::Stack {
+        emit_stack_push(bytecode, src1);
+        emit_stack_push(bytecode, src2);
+        bytecode.push(active_encode(OpCode::Add));
+        bytecode.push(dst);
+        return;
+    }
     bytecode.push(active_encode(OpCode::Add));
     bytecode.push(dst);
     bytecode.push(src1);
@@ -198,6 +210,13 @@ fn raw_add(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 }
 
 fn raw_sub(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    if current_isa_mode() == IsaMode::Stack {
+        emit_stack_push(bytecode, src1);
+        emit_stack_push(bytecode, src2);
+        bytecode.push(active_encode(OpCode::Sub));
+        bytecode.push(dst);
+        return;
+    }
     bytecode.push(active_encode(OpCode::Sub));
     bytecode.push(dst);
     bytecode.push(src1);
@@ -205,6 +224,13 @@ fn raw_sub(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 }
 
 fn raw_mul(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    if current_isa_mode() == IsaMode::Stack {
+        emit_stack_push(bytecode, src1);
+        emit_stack_push(bytecode, src2);
+        bytecode.push(active_encode(OpCode::Mul));
+        bytecode.push(dst);
+        return;
+    }
     bytecode.push(active_encode(OpCode::Mul));
     bytecode.push(dst);
     bytecode.push(src1);
@@ -212,6 +238,13 @@ fn raw_mul(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 }
 
 fn raw_xor(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    if current_isa_mode() == IsaMode::Stack {
+        emit_stack_push(bytecode, src1);
+        emit_stack_push(bytecode, src2);
+        bytecode.push(active_encode(OpCode::Xor));
+        bytecode.push(dst);
+        return;
+    }
     bytecode.push(active_encode(OpCode::Xor));
     bytecode.push(dst);
     bytecode.push(src1);
@@ -219,10 +252,35 @@ fn raw_xor(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 }
 
 fn raw_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    if current_isa_mode() == IsaMode::Stack {
+        emit_stack_push(bytecode, src1);
+        emit_stack_push(bytecode, src2);
+        bytecode.push(active_encode(OpCode::And));
+        bytecode.push(dst);
+        return;
+    }
     bytecode.push(active_encode(OpCode::And));
     bytecode.push(dst);
     bytecode.push(src1);
     bytecode.push(src2);
+}
+
+/// Emit compare of two VM registers (Cmp or Cmp32).
+pub fn emit_cmp_regs(bytecode: &mut Vec<u8>, op: OpCode, src1: u8, src2: u8) {
+    if current_isa_mode() == IsaMode::Stack {
+        emit_stack_push(bytecode, src1);
+        emit_stack_push(bytecode, src2);
+        bytecode.push(active_encode(op));
+        return;
+    }
+    bytecode.push(active_encode(op));
+    bytecode.push(src1);
+    bytecode.push(src2);
+}
+
+/// Emit `dst = src1 * src2` (lift helper for imul).
+pub fn emit_mul_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    raw_mul(bytecode, dst, src1, src2);
 }
 
 fn temps_excluding(count: usize, exclude: &[u8]) -> Vec<u8> {
