@@ -204,6 +204,13 @@ fn raw_sub(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
     bytecode.push(src2);
 }
 
+fn raw_mul(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    bytecode.push(active_encode(OpCode::Mul));
+    bytecode.push(dst);
+    bytecode.push(src1);
+    bytecode.push(src2);
+}
+
 fn raw_xor(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
     bytecode.push(active_encode(OpCode::Xor));
     bytecode.push(dst);
@@ -216,6 +223,40 @@ fn raw_and(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
     bytecode.push(dst);
     bytecode.push(src1);
     bytecode.push(src2);
+}
+
+fn raw_push(bytecode: &mut Vec<u8>, reg: u8) {
+    bytecode.push(active_encode(OpCode::Push));
+    bytecode.push(reg);
+}
+
+fn raw_pop(bytecode: &mut Vec<u8>, reg: u8) {
+    bytecode.push(active_encode(OpCode::Pop));
+    bytecode.push(reg);
+}
+
+/// Save MBA scratch pool (r8–r15) except `preserve`, run `body`, then restore.
+/// Lifter maps stack locals into this pool; MBA expansions must not clobber them.
+fn scratch_regs_to_save(preserve: &[u8]) -> Vec<u8> {
+    MBA_POOL
+        .iter()
+        .copied()
+        .filter(|r| !preserve.contains(r))
+        .collect()
+}
+
+fn push_saved_scratch_regs(bytecode: &mut Vec<u8>, preserve: &[u8]) -> Vec<u8> {
+    let saved = scratch_regs_to_save(preserve);
+    for &reg in &saved {
+        raw_push(bytecode, reg);
+    }
+    saved
+}
+
+fn pop_saved_scratch_regs(bytecode: &mut Vec<u8>, saved: &[u8]) {
+    for &reg in saved.iter().rev() {
+        raw_pop(bytecode, reg);
+    }
 }
 
 fn temps_excluding(count: usize, exclude: &[u8]) -> Vec<u8> {
@@ -346,10 +387,19 @@ pub fn emit_add_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 
 fn emit_add_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
     if should_rewrite(depth) {
-        match pick_identity(MbaFamily::Add) {
+        let identity = pick_identity(MbaFamily::Add);
+        let saved = if depth == 0 {
+            Some(push_saved_scratch_regs(bytecode, &[dst]))
+        } else {
+            None
+        };
+        match identity {
             MbaIdentity::AddViaNeg => expand_add_via_neg(bytecode, dst, src1, src2),
             MbaIdentity::AddViaXorAnd => expand_add_via_xor_and(bytecode, dst, src1, src2, depth),
             _ => raw_add(bytecode, dst, src1, src2),
+        }
+        if let Some(saved) = saved {
+            pop_saved_scratch_regs(bytecode, &saved);
         }
     } else {
         raw_add(bytecode, dst, src1, src2);
@@ -374,10 +424,19 @@ pub fn emit_sub_three(bytecode: &mut Vec<u8>, dst: u8, lhs: u8, rhs: u8) {
 
 fn emit_sub_three_depth(bytecode: &mut Vec<u8>, dst: u8, lhs: u8, rhs: u8, depth: u32) {
     if should_rewrite(depth) {
-        match pick_identity(MbaFamily::Sub) {
+        let identity = pick_identity(MbaFamily::Sub);
+        let saved = if depth == 0 {
+            Some(push_saved_scratch_regs(bytecode, &[dst]))
+        } else {
+            None
+        };
+        match identity {
             MbaIdentity::SubViaNeg => expand_sub_via_neg(bytecode, dst, lhs, rhs),
             MbaIdentity::SubViaXorAnd => expand_sub_via_xor_and(bytecode, dst, lhs, rhs, depth),
             _ => raw_sub(bytecode, dst, lhs, rhs),
+        }
+        if let Some(saved) = saved {
+            pop_saved_scratch_regs(bytecode, &saved);
         }
     } else {
         raw_sub(bytecode, dst, lhs, rhs);
@@ -395,9 +454,18 @@ pub fn emit_xor_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 
 fn emit_xor_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
     if should_rewrite(depth) {
-        match pick_identity(MbaFamily::Xor) {
+        let identity = pick_identity(MbaFamily::Xor);
+        let saved = if depth == 0 {
+            Some(push_saved_scratch_regs(bytecode, &[dst]))
+        } else {
+            None
+        };
+        match identity {
             MbaIdentity::XorViaAddAnd => expand_xor_via_add_and(bytecode, dst, src1, src2, depth),
             _ => raw_xor(bytecode, dst, src1, src2),
+        }
+        if let Some(saved) = saved {
+            pop_saved_scratch_regs(bytecode, &saved);
         }
     } else {
         raw_xor(bytecode, dst, src1, src2);
@@ -411,9 +479,18 @@ pub fn emit_and_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
 
 fn emit_and_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, depth: u32) {
     if should_rewrite(depth) {
-        match pick_identity(MbaFamily::And) {
+        let identity = pick_identity(MbaFamily::And);
+        let saved = if depth == 0 {
+            Some(push_saved_scratch_regs(bytecode, &[dst]))
+        } else {
+            None
+        };
+        match identity {
             MbaIdentity::AndViaOrXor => expand_and_via_or_xor(bytecode, dst, src1, src2, depth),
             _ => raw_and(bytecode, dst, src1, src2),
+        }
+        if let Some(saved) = saved {
+            pop_saved_scratch_regs(bytecode, &saved);
         }
     } else {
         raw_and(bytecode, dst, src1, src2);
@@ -626,5 +703,103 @@ mod tests {
         let hdr = format_ir_header(MbaLevel::Single, 0x1234);
         assert!(hdr.contains("level=1"));
         assert!(hdr.contains("(a^b)+2*(a&b)"));
+    }
+
+    /// Stack locals live in r8–r15; MBA must not clobber unrelated spill values.
+    #[test]
+    fn mba_preserves_live_spill_regs_across_xor_form_add() {
+        use crate::vm::VirtualMachine;
+        let seed = seed_picking(MbaFamily::Add, MbaIdentity::AddViaXorAnd);
+        let map = OpcodeMap::from_seed(seed);
+        crate::vm::set_active_map(&map);
+        set_mba_context(1, seed);
+        let mut bc = Vec::new();
+        raw_load_imm(&mut bc, 1, 3);
+        raw_load_imm(&mut bc, 2, 4);
+        raw_load_imm(&mut bc, 11, 5); // live local `c` in spill reg r11
+        raw_load_imm(&mut bc, 12, 999); // unrelated spill
+        emit_add_three(&mut bc, 3, 1, 2); // (a+b) -> r3
+        raw_move(&mut bc, 0, 3);
+        bc.push(map.encode(OpCode::Exit));
+        bc.push(0);
+        clear_mba_context();
+        crate::vm::clear_active_map();
+
+        let mut vm = VirtualMachine::with_opcode_map(bc, map);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 7);
+        assert_eq!(vm.get_register(11).unwrap(), 5, "spill r11 must survive MBA add");
+        assert_eq!(vm.get_register(12).unwrap(), 999, "spill r12 must survive MBA add");
+    }
+
+    #[test]
+    fn mba_preserves_live_spill_regs_across_neg_form_add() {
+        use crate::vm::VirtualMachine;
+        let seed = seed_picking(MbaFamily::Add, MbaIdentity::AddViaNeg);
+        let map = OpcodeMap::from_seed(seed);
+        crate::vm::set_active_map(&map);
+        set_mba_context(1, seed);
+        let mut bc = Vec::new();
+        raw_load_imm(&mut bc, 1, 3);
+        raw_load_imm(&mut bc, 2, 4);
+        raw_load_imm(&mut bc, 11, 5);
+        emit_add_three(&mut bc, 3, 1, 2);
+        raw_move(&mut bc, 0, 3);
+        bc.push(map.encode(OpCode::Exit));
+        bc.push(0);
+        clear_mba_context();
+        crate::vm::clear_active_map();
+
+        let mut vm = VirtualMachine::with_opcode_map(bc, map);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 7);
+        assert_eq!(vm.get_register(11).unwrap(), 5);
+    }
+
+    /// Arith-shaped: add then mul while `c` stays in r11.
+    #[test]
+    fn mba_arith_shaped_add_mul_preserves_spills() {
+        use crate::vm::VirtualMachine;
+        for (level, seed) in [(1u8, 0xAAAA_u64), (1, 0xBBBB), (2, 0xAAAA), (2, 0xBBBB)] {
+            let map = OpcodeMap::from_seed(seed);
+            crate::vm::set_active_map(&map);
+            set_mba_context(level, seed);
+            let mut bc = Vec::new();
+            raw_load_imm(&mut bc, 1, 3);
+            raw_load_imm(&mut bc, 2, 4);
+            raw_load_imm(&mut bc, 11, 5);
+            emit_add_three(&mut bc, 3, 1, 2);
+            raw_move(&mut bc, 4, 11);
+            raw_mul(&mut bc, 0, 3, 4); // (a+b)*c
+            bc.push(map.encode(OpCode::Exit));
+            bc.push(0);
+            clear_mba_context();
+            crate::vm::clear_active_map();
+
+            let mut vm = VirtualMachine::with_opcode_map(bc, map);
+            vm.run().unwrap();
+            assert_eq!(
+                vm.get_register(0).unwrap(),
+                35,
+                "level={level} seed={seed:#x}"
+            );
+            assert_eq!(
+                vm.get_register(11).unwrap(),
+                5,
+                "level={level} seed={seed:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn mba_depth0_rewrite_emits_scratch_push_pop() {
+        let seed = seed_picking(MbaFamily::Add, MbaIdentity::AddViaXorAnd);
+        with_mba(1, seed, || {
+            let map = OpcodeMap::from_seed(seed);
+            let mut bc = Vec::new();
+            emit_add_three(&mut bc, 3, 1, 2);
+            assert!(bc.contains(&map.encode(OpCode::Push)));
+            assert!(bc.contains(&map.encode(OpCode::Pop)));
+        });
     }
 }
