@@ -1364,8 +1364,20 @@ mod tests {
         );
     }
 
-    fn bytecode_has_char_output_native(bytecode: &[u8], map: &OpcodeMap) -> bool {
-        !native_call_ids_in_bytecode_with_map(bytecode, map).is_empty()
+    fn bytecode_has_char_output_native(
+        bytecode: &[u8],
+        map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
+        layout: &crate::vm::BytecodeLayout,
+    ) -> bool {
+        !native_call_ids_in_bytecode_with_layout(
+            bytecode,
+            map,
+            DispatchMode::Table,
+            block_plan,
+            layout,
+        )
+        .is_empty()
     }
 
     fn disasm_packed_table(packed: &PackResult) -> String {
@@ -1828,7 +1840,12 @@ mod tests {
         }
 
         assert!(
-            bytecode_has_char_output_native(&bc, &map),
+            bytecode_has_char_output_native(
+                &bc,
+                &map,
+                Some(&packed.block_map_plan),
+                &packed.layout_plan,
+            ),
             "packed nested must emit at least one native_call for char output, got {:?}",
             native_call_ids_in_bytecode_with_layout(
                 &bc,

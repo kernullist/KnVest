@@ -536,6 +536,56 @@ mod tests {
     }
 
     #[test]
+    fn native_call_ids_in_threaded_bytecode_with_layout_padding() {
+        use crate::pe::layout_pass::apply_layout_diversification;
+        use crate::pe::threaded::{
+            embed_thread_targets, handler_offset_for_op, handler_offset_for_set_block_map,
+        };
+        use crate::pe::vm_stub::create_vm_interpreter_stub;
+        use crate::vm::{BlockMapPlan, BytecodeLayout, DispatchMode, OpCode, OpcodeMap};
+
+        let map = OpcodeMap::from_seed(0x4C34_4100);
+        let layout = BytecodeLayout::from_seed(0x14D0_2026);
+        let plan = BlockMapPlan::default();
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            DispatchMode::Table,
+            0,
+            &BytecodeLayout::identity(),
+            &[],
+            &BlockMapPlan::default(),
+            &[],
+            &[],
+        );
+        let ptr_id = native_call_iat_ptr_id(0x8260);
+        let mut raw = vec![map.encode(OpCode::NativeCall)];
+        raw.extend_from_slice(&ptr_id.to_le_bytes());
+        let laid = apply_layout_diversification(&raw, &layout, &map, &plan);
+        let set_map = handler_offset_for_set_block_map(&stub);
+        let threaded = embed_thread_targets(
+            &laid,
+            &map,
+            &plan,
+            &layout,
+            &|op| handler_offset_for_op(&stub, &map, op),
+            set_map,
+        );
+        assert_eq!(
+            native_call_ids_in_bytecode_with_layout(
+                &threaded,
+                &map,
+                DispatchMode::Threaded,
+                None,
+                &layout,
+            ),
+            vec![ptr_id],
+            "threaded layout-aware scan must read native_call id after rel32 and wire pads"
+        );
+    }
+
+    #[test]
     fn native_call_ids_in_l4e_threaded_puts_hello_sample() {
         use crate::pe::packer::pack_function;
         use crate::pe::parser::PEFile;
@@ -549,11 +599,12 @@ mod tests {
         let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
         let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded, 0)
             .unwrap();
-        let ids = native_call_ids_in_bytecode_with_map_dispatch(
+        let ids = native_call_ids_in_bytecode_with_layout(
             &packed.bytecode,
             &packed.opcode_map,
             DispatchMode::Threaded,
             Some(&packed.block_map_plan),
+            &packed.layout_plan,
         );
         assert!(
             ids.iter().any(|id| is_iat_ptr_native_call(*id)),
