@@ -3,7 +3,7 @@ use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 use crate::vm::virt_isa::VIRT_ISA_SPLIT_TEMP;
-use crate::pe::mba::{MBA_TEMP_NEG, MBA_TEMP_ZERO};
+use crate::pe::mba::{MBA_TEMP_NEG, MBA_TEMP_T0, MBA_TEMP_T1, MBA_TEMP_ZERO};
 use std::fmt;
 
 pub struct Instruction {
@@ -238,8 +238,8 @@ impl Instruction {
         Self::pretty_print_annotated(instructions, false, true)
     }
 
-    pub fn pretty_print_with_mba(instructions: &[Self], annotate_mba: bool) -> String {
-        Self::pretty_print_annotated(instructions, annotate_mba, true)
+    pub fn pretty_print_with_mba(instructions: &[Self], mba_level: u8) -> String {
+        Self::pretty_print_annotated(instructions, mba_level >= 1, true)
     }
 
     pub fn pretty_print_annotated(
@@ -300,43 +300,163 @@ fn reg_at(ops: &[Operand], idx: usize) -> Option<u8> {
     ops.get(idx).and_then(reg_operand)
 }
 
-fn mba_note_for(a: u8, b: u8, dst: u8) -> String {
+fn mba_note_add_neg(a: u8, b: u8, dst: u8) -> String {
     format!("add r{dst}, r{a}, r{b}  ==  r{a}-(0-r{b})")
 }
 
-/// Detect L4f MBA expansion: load_imm r14,0 ; sub r15,r14,b ; sub dst,a,r15
-fn find_mba_substitution_starts(instructions: &[Instruction]) -> std::collections::HashMap<usize, String> {
+fn mba_note_add_xor_and(a: u8, b: u8, dst: u8) -> String {
+    format!("add r{dst}, r{a}, r{b}  ==  (r{a}^r{b})+2*(r{a}&r{b})")
+}
+
+fn mba_note_sub_neg(a: u8, b: u8, dst: u8) -> String {
+    format!("sub r{dst}, r{a}, r{b}  ==  r{a}+(0-r{b})")
+}
+
+fn mba_note_xor_add_and(a: u8, b: u8, dst: u8) -> String {
+    format!("xor r{dst}, r{a}, r{b}  ==  (r{a}+r{b})-2*(r{a}&r{b})")
+}
+
+fn mba_note_and_or_xor(a: u8, b: u8, dst: u8) -> String {
+    format!("and r{dst}, r{a}, r{b}  ==  (r{a}+r{b}-(r{a}&r{b}))-(r{a}^r{b})")
+}
+
+/// Detect MBA catalog expansions in lifted bytecode.
+fn find_mba_substitution_starts(
+    instructions: &[Instruction],
+) -> std::collections::HashMap<usize, String> {
     let mut out = std::collections::HashMap::new();
     if instructions.len() < 3 {
         return out;
     }
     for i in 0..instructions.len().saturating_sub(2) {
+        if out.contains_key(&i) {
+            continue;
+        }
         let z = &instructions[i];
         let n = &instructions[i + 1];
         let f = &instructions[i + 2];
-        if z.opcode != OpCode::LoadImm || n.opcode != OpCode::Sub || f.opcode != OpCode::Sub {
-            continue;
+
+        // L4f/L5b add via neg: load_imm r14,0 ; sub r15,r14,b ; sub dst,a,r15
+        if z.opcode == OpCode::LoadImm
+            && n.opcode == OpCode::Sub
+            && f.opcode == OpCode::Sub
+            && reg_at(&z.operands, 0) == Some(MBA_TEMP_ZERO)
+            && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
+            && reg_at(&n.operands, 0) == Some(MBA_TEMP_NEG)
+            && reg_at(&n.operands, 1) == Some(MBA_TEMP_ZERO)
+        {
+            let Some(b) = reg_at(&n.operands, 2) else { continue };
+            let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
+            let Some(a) = reg_at(&f.operands, 1) else { continue };
+            if reg_at(&f.operands, 2) == Some(MBA_TEMP_NEG) {
+                out.insert(i, mba_note_add_neg(a, b, final_dst));
+                continue;
+            }
         }
-        let Some(zero_dst) = reg_at(&z.operands, 0) else { continue };
-        if zero_dst != MBA_TEMP_ZERO {
-            continue;
+
+        // L5b sub via neg: load_imm r14,0 ; sub r15,r14,b ; add dst,a,r15
+        if z.opcode == OpCode::LoadImm
+            && n.opcode == OpCode::Sub
+            && f.opcode == OpCode::Add
+            && reg_at(&z.operands, 0) == Some(MBA_TEMP_ZERO)
+            && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
+            && reg_at(&n.operands, 0) == Some(MBA_TEMP_NEG)
+            && reg_at(&n.operands, 1) == Some(MBA_TEMP_ZERO)
+        {
+            let Some(b) = reg_at(&n.operands, 2) else { continue };
+            let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
+            let Some(a) = reg_at(&f.operands, 1) else { continue };
+            if reg_at(&f.operands, 2) == Some(MBA_TEMP_NEG) {
+                out.insert(i, mba_note_sub_neg(a, b, final_dst));
+                continue;
+            }
         }
-        if !matches!(z.operands.get(1), Some(Operand::Immediate(0))) {
-            continue;
+
+        // L5b add via xor/and: xor t0,a,b ; and t1,a,b ; ...
+        if z.opcode == OpCode::Xor
+            && n.opcode == OpCode::And
+            && reg_at(&z.operands, 0) == Some(MBA_TEMP_T0)
+            && reg_at(&n.operands, 0) == Some(MBA_TEMP_T1)
+        {
+            let Some(a) = reg_at(&z.operands, 1) else { continue };
+            let Some(b) = reg_at(&z.operands, 2) else { continue };
+            if reg_at(&n.operands, 1) == Some(a) && reg_at(&n.operands, 2) == Some(b) {
+                if i + 3 < instructions.len() {
+                    let dbl = &instructions[i + 2];
+                    let fin = &instructions[i + 3];
+                    if dbl.opcode == OpCode::Add
+                        && fin.opcode == OpCode::Add
+                        && reg_at(&dbl.operands, 0) == Some(MBA_TEMP_T1)
+                        && reg_at(&dbl.operands, 1) == Some(MBA_TEMP_T1)
+                        && reg_at(&dbl.operands, 2) == Some(MBA_TEMP_T1)
+                    {
+                        if let Some(dst) = reg_at(&fin.operands, 0) {
+                            out.insert(i, mba_note_add_xor_and(a, b, dst));
+                            continue;
+                        }
+                    }
+                }
+            }
         }
-        let Some(neg_dst) = reg_at(&n.operands, 0) else { continue };
-        let Some(neg_s1) = reg_at(&n.operands, 1) else { continue };
-        let Some(b) = reg_at(&n.operands, 2) else { continue };
-        if neg_dst != MBA_TEMP_NEG || neg_s1 != MBA_TEMP_ZERO {
-            continue;
+
+        // L5b xor via add/and: and t0,a,b ; add t0,t0,t0 ; add t1,a,b ; sub dst,t1,t0
+        if z.opcode == OpCode::And
+            && n.opcode == OpCode::Add
+            && reg_at(&z.operands, 0) == Some(MBA_TEMP_T0)
+        {
+            let Some(a) = reg_at(&z.operands, 1) else { continue };
+            let Some(b) = reg_at(&z.operands, 2) else { continue };
+            if reg_at(&n.operands, 0) == Some(MBA_TEMP_T0)
+                && reg_at(&n.operands, 1) == Some(MBA_TEMP_T0)
+                && reg_at(&n.operands, 2) == Some(MBA_TEMP_T0)
+                && i + 3 < instructions.len()
+            {
+                let sum = &instructions[i + 2];
+                let fin = &instructions[i + 3];
+                if sum.opcode == OpCode::Add
+                    && fin.opcode == OpCode::Sub
+                    && reg_at(&sum.operands, 1) == Some(a)
+                    && reg_at(&sum.operands, 2) == Some(b)
+                {
+                    if let Some(dst) = reg_at(&fin.operands, 0) {
+                        out.insert(i, mba_note_xor_add_and(a, b, dst));
+                        continue;
+                    }
+                }
+            }
         }
-        let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
-        let Some(a) = reg_at(&f.operands, 1) else { continue };
-        let Some(neg_src) = reg_at(&f.operands, 2) else { continue };
-        if neg_src != MBA_TEMP_NEG {
-            continue;
+
+        // L5b and via or/xor: and t0,a,b ; add t1,a,b ; sub t1,t1,t0 ; xor t0,a,b ; sub dst,t1,t0
+        if z.opcode == OpCode::And
+            && n.opcode == OpCode::Add
+            && reg_at(&z.operands, 0) == Some(MBA_TEMP_T0)
+            && i + 4 < instructions.len()
+        {
+            let Some(a) = reg_at(&z.operands, 1) else { continue };
+            let Some(b) = reg_at(&z.operands, 2) else { continue };
+            let sum = &instructions[i + 1];
+            let sub1 = &instructions[i + 2];
+            let x = &instructions[i + 3];
+            let fin = &instructions[i + 4];
+            if sum.opcode == OpCode::Add
+                && sub1.opcode == OpCode::Sub
+                && x.opcode == OpCode::Xor
+                && fin.opcode == OpCode::Sub
+                && reg_at(&sum.operands, 0) == Some(MBA_TEMP_T1)
+                && reg_at(&sum.operands, 1) == Some(a)
+                && reg_at(&sum.operands, 2) == Some(b)
+                && reg_at(&sub1.operands, 0) == Some(MBA_TEMP_T1)
+                && reg_at(&sub1.operands, 1) == Some(MBA_TEMP_T1)
+                && reg_at(&sub1.operands, 2) == Some(MBA_TEMP_T0)
+                && reg_at(&x.operands, 0) == Some(MBA_TEMP_T0)
+                && reg_at(&x.operands, 1) == Some(a)
+                && reg_at(&x.operands, 2) == Some(b)
+            {
+                if let Some(dst) = reg_at(&fin.operands, 0) {
+                    out.insert(i, mba_note_and_or_xor(a, b, dst));
+                }
+            }
         }
-        out.insert(i, mba_note_for(a, b, final_dst));
     }
     out
 }
@@ -489,8 +609,52 @@ mod tests {
                 ],
             },
         ];
-        let out = Instruction::pretty_print_with_mba(&insns, true);
+        let out = Instruction::pretty_print_with_mba(&insns, 1);
         assert!(out.contains("; MBA"));
         assert!(out.contains("add r1, r2, r3"));
+    }
+
+    #[test]
+    fn test_mba_xor_and_add_annotation() {
+        let insns = vec![
+            Instruction {
+                offset: 0,
+                opcode: OpCode::Xor,
+                operands: vec![
+                    Operand::Register(MBA_TEMP_T0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            },
+            Instruction {
+                offset: 4,
+                opcode: OpCode::And,
+                operands: vec![
+                    Operand::Register(MBA_TEMP_T1),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            },
+            Instruction {
+                offset: 8,
+                opcode: OpCode::Add,
+                operands: vec![
+                    Operand::Register(MBA_TEMP_T1),
+                    Operand::Register(MBA_TEMP_T1),
+                    Operand::Register(MBA_TEMP_T1),
+                ],
+            },
+            Instruction {
+                offset: 12,
+                opcode: OpCode::Add,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::Register(MBA_TEMP_T0),
+                    Operand::Register(MBA_TEMP_T1),
+                ],
+            },
+        ];
+        let out = Instruction::pretty_print_with_mba(&insns, 1);
+        assert!(out.contains("(r1^r2)+2*(r1&r2)"));
     }
 }

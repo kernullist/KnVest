@@ -43,14 +43,31 @@ pub enum Commands {
         dispatch: String,
         #[arg(
             long,
-            help = "Enable L4f MBA algebraic substitution for integer add (default: off)"
+            value_name = "LEVEL",
+            num_args = 0..=1,
+            default_missing_value = "1",
+            help = "MBA substitution level: 0/off (default), 1=single catalog rewrite, 2=nested depth-limited"
         )]
-        mba: bool,
+        mba: Option<String>,
     },
 }
 
 impl Cli {
     pub fn parse_args() -> Self {
         Self::parse()
+    }
+}
+
+pub fn parse_mba_level(mba: &Option<String>) -> anyhow::Result<u8> {
+    match mba {
+        None => Ok(0),
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" => Ok(0),
+            "1" | "on" | "true" => Ok(1),
+            "2" => Ok(2),
+            other => anyhow::bail!(
+                "invalid --mba level {other:?}; expected 0/off, 1/on, or 2"
+            ),
+        },
     }
 }

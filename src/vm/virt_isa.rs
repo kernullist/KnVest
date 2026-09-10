@@ -2,6 +2,7 @@ use super::opcode_map::handler_variant_count;
 use super::opcode::OpCode;
 use super::OpcodeMap;
 use super::{active_encode, DispatchMode};
+use crate::pe::mba;
 
 /// Scratch register for L5a lift-time sub split (not used by MBA temps r14/r15).
 pub const VIRT_ISA_SPLIT_TEMP: u8 = 13;
@@ -14,6 +15,17 @@ pub fn sub_lift_split_enabled(seed: u64) -> bool {
 }
 
 pub fn emit_sub_three(bytecode: &mut Vec<u8>, dst: u8, lhs: u8, rhs: u8, seed: u64) {
+    if mba::mba_level().is_enabled() {
+        if sub_lift_split_enabled(seed) && lhs == dst {
+            bytecode.push(active_encode(OpCode::Move));
+            bytecode.push(VIRT_ISA_SPLIT_TEMP);
+            bytecode.push(lhs);
+            mba::emit_sub_three(bytecode, dst, VIRT_ISA_SPLIT_TEMP, rhs);
+        } else {
+            mba::emit_sub_three(bytecode, dst, lhs, rhs);
+        }
+        return;
+    }
     if sub_lift_split_enabled(seed) {
         bytecode.push(active_encode(OpCode::Move));
         bytecode.push(VIRT_ISA_SPLIT_TEMP);

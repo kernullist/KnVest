@@ -10,7 +10,7 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
     seed: Option<u64>,
     partial: bool,
     dispatch_mode: DispatchMode,
-    mba_enabled: bool,
+    mba_level: u8,
 ) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
@@ -21,7 +21,7 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
         seed,
         partial,
         dispatch_mode,
-        mba_enabled,
+        mba_level,
     )
         .context("Failed to pack function")?;
 
@@ -30,7 +30,7 @@ pub fn pack_executable<P: AsRef<Path>, Q: AsRef<Path>>(
         pack_result.bytecode.len(),
         pack_result.seed,
         pack_result.dispatch_mode,
-        mba_enabled
+        mba_level
     );
 
     pe.write_to_file(&output_path)

@@ -909,10 +909,7 @@ fn emit_u32_zext(bytecode: &mut Vec<u8>, reg: u8) {
     bytecode.push(active_encode(OpCode::LoadImm));
     bytecode.push(15);
     bytecode.extend_from_slice(&0xFFFF_FFFFu64.to_le_bytes());
-    bytecode.push(active_encode(OpCode::And));
-    bytecode.push(reg);
-    bytecode.push(reg);
-    bytecode.push(15);
+    crate::pe::mba::emit_and_three(bytecode, reg, reg, 15);
 }
 
 fn cmp_opcode(u32_semantics: bool) -> OpCode {
@@ -4072,7 +4069,9 @@ mod tests {
 
     #[test]
     fn test_l4f_mba_substitutes_add_with_sub_chain() {
-        crate::pe::mba::set_mba_enabled(true);
+        use crate::pe::mba::{seed_picking, MbaFamily, MbaIdentity};
+        let seed = seed_picking(MbaFamily::Add, MbaIdentity::AddViaNeg);
+        crate::pe::mba::set_mba_context(1, seed);
         let main_off = 0x400;
         let instrs = vec![
             X64Instruction {
@@ -4086,11 +4085,11 @@ mod tests {
             ret_at(main_off + 2),
         ];
         let bc = lift_for_test(&instrs, main_off, None);
-        crate::pe::mba::clear_mba_enabled();
+        crate::pe::mba::clear_mba_context();
         let insns = disasm_bc(&bc);
         assert!(!insns.iter().any(|i| i.opcode == OpCode::Add));
         assert!(insns.iter().filter(|i| i.opcode == OpCode::Sub).count() >= 2);
-        let ir = Instruction::pretty_print_with_mba(&insns, true);
+        let ir = Instruction::pretty_print_with_mba(&insns, 1);
         assert!(ir.contains("; MBA"));
         assert!(ir.contains("r0-(0-r1)"));
     }
