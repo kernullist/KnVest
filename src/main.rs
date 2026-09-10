@@ -30,7 +30,16 @@ fn main() -> Result<()> {
             let dispatch_mode = dispatch
                 .parse::<crate::vm::DispatchMode>()
                 .map_err(|e| anyhow::anyhow!(e))?;
-            handle_pack_command(input, output, rva_value, seed_value, partial, dispatch_mode, mba)?;
+            let mba_level = cli::parse_mba_level(&mba)?;
+            handle_pack_command(
+                input,
+                output,
+                rva_value,
+                seed_value,
+                partial,
+                dispatch_mode,
+                mba_level,
+            )?;
         }
     }
 
@@ -50,6 +59,8 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     let pe = PEFile::from_file(&input)?;
     
     let pack_meta = packer::extract_pack_metadata_from_packed(&pe)?;
+    let mba_level = pack_meta.mba_level;
+    let pack_seed = pack_meta.seed();
     let opcode_map = pack_meta.opcode_map;
     let dispatch_mode = pack_meta.dispatch_mode;
     let partial_plan = packer::extract_partial_plan_from_packed(&pe).ok();
@@ -70,8 +81,14 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
         print!("{}", plan.format_ir_header(&opcode_map, dispatch_mode));
     }
 
-    if pack_meta.mba_enabled {
-        print!("{}", crate::pe::mba::format_ir_header(true));
+    if mba_level >= 1 {
+        print!(
+            "{}",
+            crate::pe::mba::format_ir_header(
+                crate::pe::mba::MbaLevel::from_u8(mba_level),
+                pack_seed,
+            )
+        );
     }
 
     print!(
@@ -85,7 +102,7 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
         block_plan.as_ref(),
         dispatch_mode,
     );
-    let output = ir::Instruction::pretty_print_with_mba(&instructions, pack_meta.mba_enabled);
+    let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
     
     println!("{}", output);
     
@@ -99,9 +116,9 @@ fn handle_pack_command(
     seed: Option<u64>,
     partial: bool,
     dispatch_mode: crate::vm::DispatchMode,
-    mba: bool,
+    mba_level: u8,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode, mba)?;
+    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode, mba_level)?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }

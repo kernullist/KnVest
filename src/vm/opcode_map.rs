@@ -11,6 +11,7 @@ pub const KNV4_HEADER_SIZE_V1: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_HEADER_SIZE_V3: usize = 4 + 1 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_MBA_FLAG_ENABLED: u8 = 0x01;
+pub const KNV4_MBA_LEVEL2: u8 = 0x02;
 
 /// Handler polymorphism (L4b/L5a): number of native bodies per logical opcode.
 pub const ADD_HANDLER_VARIANT_COUNT: u8 = 3;
@@ -147,7 +148,7 @@ impl OpcodeMap {
         PackMetadata {
             opcode_map: self.clone(),
             dispatch_mode: DispatchMode::Table,
-            mba_enabled: false,
+            mba_level: 0,
         }
             .to_embedded_bytes()
     }
@@ -157,12 +158,13 @@ impl OpcodeMap {
     }
 }
 
-/// L4a opcode map + L4c dispatch mode (+ optional L4f MBA flag) embedded in `.knvest`.
+/// L4a opcode map + L4c dispatch mode (+ optional L4f/L5b MBA level) embedded in `.knvest`.
 #[derive(Clone, Debug)]
 pub struct PackMetadata {
     pub opcode_map: OpcodeMap,
     pub dispatch_mode: DispatchMode,
-    pub mba_enabled: bool,
+    /// 0=off, 1=single substitution, 2=nested (depth-limited)
+    pub mba_level: u8,
 }
 
 impl PackMetadata {
@@ -170,7 +172,7 @@ impl PackMetadata {
         Self {
             opcode_map: OpcodeMap::from_seed(seed),
             dispatch_mode,
-            mba_enabled: false,
+            mba_level: 0,
         }
     }
 
@@ -178,13 +180,17 @@ impl PackMetadata {
         self.opcode_map.seed()
     }
 
+    pub fn mba_enabled(&self) -> bool {
+        self.mba_level >= 1
+    }
+
     pub fn to_embedded_bytes(&self) -> Vec<u8> {
-        if self.mba_enabled {
+        if self.mba_level >= 1 {
             let mut out = Vec::with_capacity(KNV4_HEADER_SIZE_V3);
             out.extend_from_slice(KNV4_MAGIC);
             out.push(KNV4_VERSION_V3);
             out.push(self.dispatch_mode.as_wire());
-            out.push(KNV4_MBA_FLAG_ENABLED);
+            out.push(mba_level_to_wire(self.mba_level));
             out.extend_from_slice(&self.opcode_map.seed.to_le_bytes());
             out.extend_from_slice(&self.opcode_map.wire);
             out
@@ -217,7 +223,7 @@ impl PackMetadata {
                 Some(Self {
                     opcode_map: OpcodeMap::from_parts(seed, wire),
                     dispatch_mode: DispatchMode::Table,
-                    mba_enabled: false,
+                    mba_level: 0,
                 })
             }
             KNV4_VERSION => {
@@ -234,7 +240,7 @@ impl PackMetadata {
                 Some(Self {
                     opcode_map: OpcodeMap::from_parts(seed, wire),
                     dispatch_mode,
-                    mba_enabled: false,
+                    mba_level: 0,
                 })
             }
             KNV4_VERSION_V3 => {
@@ -242,7 +248,7 @@ impl PackMetadata {
                     return None;
                 }
                 let dispatch_mode = DispatchMode::from_wire(data[5])?;
-                let mba_enabled = data[6] & KNV4_MBA_FLAG_ENABLED != 0;
+                let mba_level = mba_level_from_wire(data[6]);
                 let seed = u64::from_le_bytes(data[7..15].try_into().unwrap());
                 let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
                 wire.copy_from_slice(&data[15..15 + CANONICAL_OPCODE_COUNT]);
@@ -252,11 +258,30 @@ impl PackMetadata {
                 Some(Self {
                     opcode_map: OpcodeMap::from_parts(seed, wire),
                     dispatch_mode,
-                    mba_enabled,
+                    mba_level,
                 })
             }
             _ => None,
         }
+    }
+}
+
+fn mba_level_from_wire(byte: u8) -> u8 {
+    if byte & KNV4_MBA_FLAG_ENABLED == 0 {
+        return 0;
+    }
+    if byte & KNV4_MBA_LEVEL2 != 0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn mba_level_to_wire(level: u8) -> u8 {
+    match level {
+        2 => KNV4_MBA_FLAG_ENABLED | KNV4_MBA_LEVEL2,
+        1 => KNV4_MBA_FLAG_ENABLED,
+        _ => 0,
     }
 }
 
@@ -425,14 +450,27 @@ mod tests {
         let meta = PackMetadata {
             opcode_map: OpcodeMap::from_seed(0xCAFE),
             dispatch_mode: DispatchMode::Table,
-            mba_enabled: true,
+            mba_level: 1,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V3);
         assert_eq!(bytes[6], KNV4_MBA_FLAG_ENABLED);
         let parsed = PackMetadata::from_embedded(&bytes).unwrap();
-        assert!(parsed.mba_enabled);
+        assert_eq!(parsed.mba_level, 1);
         assert_eq!(parsed.seed(), 0xCAFE);
+    }
+
+    #[test]
+    fn pack_metadata_v3_mba_level2_roundtrip() {
+        let meta = PackMetadata {
+            opcode_map: OpcodeMap::from_seed(0xBEEF),
+            dispatch_mode: DispatchMode::Threaded,
+            mba_level: 2,
+        };
+        let bytes = meta.to_embedded_bytes();
+        assert_eq!(bytes[6], KNV4_MBA_FLAG_ENABLED | KNV4_MBA_LEVEL2);
+        let parsed = PackMetadata::from_embedded(&bytes).unwrap();
+        assert_eq!(parsed.mba_level, 2);
     }
 
     #[test]
