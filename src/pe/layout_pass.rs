@@ -1,4 +1,5 @@
 use crate::vm::block_map::{BlockMapPlan, META_OPERAND_LEN, META_WIRE_BYTE};
+use crate::vm::isa_mode::IsaMode;
 use crate::vm::layout::{BytecodeLayout, RawInsnKind, enumerate_raw_instructions};
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
@@ -11,6 +12,7 @@ pub fn apply_layout_diversification(
     layout: &BytecodeLayout,
     opcode_map: &OpcodeMap,
     block_plan: &BlockMapPlan,
+    isa_mode: IsaMode,
 ) -> Vec<u8> {
     let insns = enumerate_raw_instructions(
         bytecode,
@@ -18,13 +20,14 @@ pub fn apply_layout_diversification(
         block_plan,
         &BytecodeLayout::identity(),
         crate::vm::DispatchMode::Table,
+        isa_mode,
     );
     if insns.is_empty() {
         return bytecode.to_vec();
     }
     let code_end = insns.last().map(|i| i.start + i.raw_len).unwrap_or(0);
     let wire_pad_total = total_wire_padding(&insns, layout);
-    let relocate_insn = |old: usize| relocate_offset(&insns, layout, old);
+    let relocate_insn = |old: usize| relocate_offset(&insns, layout, isa_mode, old);
     let relocate = |old: usize| {
         if is_string_or_data_offset(&insns, old, bytecode.len()) {
             old + wire_pad_total
@@ -46,7 +49,7 @@ pub fn apply_layout_diversification(
         let op_start = insn.start + 1;
         let operand_len = match insn.kind {
             RawInsnKind::SetBlockMap => META_OPERAND_LEN,
-            RawInsnKind::Semantic(op) => op.operand_len_lift(),
+            RawInsnKind::Semantic(op) => op.operand_len_for_isa(isa_mode),
         };
         let mut operands = bytecode[op_start..op_start + operand_len].to_vec();
         if let RawInsnKind::Semantic(op) = insn.kind {
@@ -75,6 +78,7 @@ fn total_wire_padding(
 fn relocate_offset(
     insns: &[crate::vm::layout::RawInsn],
     layout: &BytecodeLayout,
+    isa_mode: IsaMode,
     old_pos: usize,
 ) -> usize {
     let mut new_pos = 0usize;
@@ -88,7 +92,7 @@ fn relocate_offset(
         };
         let operand_len = match insn.kind {
             RawInsnKind::SetBlockMap => META_OPERAND_LEN,
-            RawInsnKind::Semantic(op) => op.operand_len_lift(),
+            RawInsnKind::Semantic(op) => op.operand_len_for_isa(isa_mode),
         };
         new_pos += 1 + pad_wire as usize + operand_len;
     }
@@ -148,6 +152,7 @@ fn patch_operands_for_layout(
 mod tests {
     use super::*;
     use crate::vm::DispatchMode;
+    use crate::vm::IsaMode;
 
     #[test]
     fn layout_pass_preserves_string_pool_offsets() {
@@ -163,13 +168,14 @@ mod tests {
         raw.extend_from_slice(msg);
         raw[2..10].copy_from_slice(&(pool_off as u64).to_le_bytes());
 
-        let laid = apply_layout_diversification(&raw, &layout, &map, &plan);
+        let laid = apply_layout_diversification(&raw, &layout, &map, &plan, IsaMode::Reg);
         let insns = enumerate_raw_instructions(
             &laid,
             &map,
             &plan,
             &layout,
             DispatchMode::Table,
+            IsaMode::Reg,
         );
         let wire_pad = total_wire_padding(
             &enumerate_raw_instructions(
@@ -178,6 +184,7 @@ mod tests {
                 &plan,
                 &BytecodeLayout::identity(),
                 DispatchMode::Table,
+                IsaMode::Reg,
             ),
             &layout,
         );
@@ -205,8 +212,8 @@ mod tests {
         raw.extend_from_slice(&42u64.to_le_bytes());
         raw.push(map.encode(OpCode::Exit));
         raw.push(0);
-        let laid_a = apply_layout_diversification(&raw, &layout_a, &map, &plan);
-        let laid_b = apply_layout_diversification(&raw, &layout_b, &map, &plan);
+        let laid_a = apply_layout_diversification(&raw, &layout_a, &map, &plan, IsaMode::Reg);
+        let laid_b = apply_layout_diversification(&raw, &layout_b, &map, &plan, IsaMode::Reg);
         assert_ne!(laid_a, laid_b);
         let insns_a = crate::ir::Instruction::disassemble_with_layout(
             &laid_a,
@@ -225,5 +232,50 @@ mod tests {
         assert_eq!(insns_a.len(), insns_b.len());
         assert_eq!(insns_a[0].opcode, OpCode::LoadImm);
         assert_eq!(insns_b[0].opcode, OpCode::LoadImm);
+    }
+
+    #[test]
+    fn layout_pass_stack_isa_preserves_instruction_boundaries() {
+        use crate::pe::mba::emit_add_three;
+        use crate::vm::{set_active_map, set_isa_mode, clear_active_map, clear_isa_mode};
+
+        let map = OpcodeMap::from_seed(0x15E);
+        let layout = BytecodeLayout::from_seed(0x5A5A_5A5A);
+        let plan = BlockMapPlan::default();
+        let mut raw = Vec::new();
+        set_active_map(&map);
+        set_isa_mode(IsaMode::Stack);
+        raw.push(map.encode(OpCode::LoadImm));
+        raw.push(0);
+        raw.extend_from_slice(&10u64.to_le_bytes());
+        raw.push(map.encode(OpCode::LoadImm));
+        raw.push(1);
+        raw.extend_from_slice(&20u64.to_le_bytes());
+        emit_add_three(&mut raw, 2, 0, 1);
+        raw.push(map.encode(OpCode::Exit));
+        raw.push(2);
+        clear_isa_mode();
+        clear_active_map();
+
+        let laid = apply_layout_diversification(&raw, &layout, &map, &plan, IsaMode::Stack);
+        let insns = enumerate_raw_instructions(
+            &laid,
+            &map,
+            &plan,
+            &layout,
+            DispatchMode::Table,
+            IsaMode::Stack,
+        );
+        assert_eq!(
+            insns.len(),
+            6,
+            "stack layout must preserve load_imm×2 + push×2 + add + exit"
+        );
+        let add = insns
+            .iter()
+            .find(|i| matches!(i.kind, RawInsnKind::Semantic(OpCode::Add)))
+            .expect("add insn");
+        let add_off = add.start + layout.operands_offset(OpCode::Add, false);
+        assert_eq!(laid[add_off], 2, "stack add has 1-byte dst operand");
     }
 }

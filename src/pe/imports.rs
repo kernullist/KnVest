@@ -505,6 +505,7 @@ mod tests {
             &map,
             &BlockMapPlan::default(),
             &crate::vm::BytecodeLayout::identity(),
+            crate::vm::IsaMode::Reg,
             &|op| handler_offset_for_op(&stub, &map, op),
             set_map,
         );
@@ -563,13 +564,14 @@ mod tests {
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
-        let laid = apply_layout_diversification(&raw, &layout, &map, &plan);
+        let laid = apply_layout_diversification(&raw, &layout, &map, &plan, crate::vm::IsaMode::Reg);
         let set_map = handler_offset_for_set_block_map(&stub);
         let threaded = embed_thread_targets(
             &laid,
             &map,
             &plan,
             &layout,
+            crate::vm::IsaMode::Reg,
             &|op| handler_offset_for_op(&stub, &map, op),
             set_map,
         );

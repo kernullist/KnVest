@@ -181,9 +181,15 @@ fn build_section_bytecode(
         layout_plan,
         opcode_map,
         block_map_plan,
+        isa_mode,
     );
-    clear_isa_mode();
-    validate_meta_bb_ids_in_bytecode(&laid_out, block_map_plan, opcode_map, layout_plan);
+    validate_meta_bb_ids_in_bytecode(
+        &laid_out,
+        block_map_plan,
+        opcode_map,
+        layout_plan,
+        isa_mode,
+    );
     if dispatch_mode == DispatchMode::Table {
         validate_call_redirect_wires_in_bytecode(
             &vm_stub,
@@ -191,6 +197,7 @@ fn build_section_bytecode(
             block_map_plan,
             opcode_map,
             layout_plan,
+            isa_mode,
         );
     }
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
@@ -199,12 +206,14 @@ fn build_section_bytecode(
             opcode_map,
             block_map_plan,
             layout_plan,
+            isa_mode,
             &|op| handler_plan.offset_for(op),
             handler_plan.set_block_map,
         )
     } else {
         laid_out
     };
+    clear_isa_mode();
     Ok(SectionBytecode {
         stub: vm_stub,
         bytecode: section_bytecode,
@@ -217,6 +226,7 @@ fn validate_meta_bb_ids_in_bytecode(
     block_map_plan: &BlockMapPlan,
     opcode_map: &OpcodeMap,
     layout: &BytecodeLayout,
+    isa_mode: IsaMode,
 ) {
     use crate::vm::layout::{RawInsnKind, enumerate_raw_instructions};
     use crate::vm::OpCode;
@@ -230,6 +240,7 @@ fn validate_meta_bb_ids_in_bytecode(
         block_map_plan,
         layout,
         DispatchMode::Table,
+        isa_mode,
     );
     for insn in insns {
         if insn.kind != RawInsnKind::SetBlockMap {
@@ -252,6 +263,7 @@ fn validate_call_redirect_wires_in_bytecode(
     block_map_plan: &BlockMapPlan,
     opcode_map: &OpcodeMap,
     layout: &BytecodeLayout,
+    isa_mode: IsaMode,
 ) {
     use crate::ir::Instruction;
     use crate::vm::block_map::{collect_handler_redirect_plan, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
@@ -265,12 +277,13 @@ fn validate_call_redirect_wires_in_bytecode(
         .iter()
         .position(|&o| o == OpCode::Call)
         .unwrap();
-    let insns = Instruction::disassemble_with_layout(
+    let insns = Instruction::disassemble_with_layout_and_isa(
         bytecode,
         opcode_map,
         Some(block_map_plan),
         DispatchMode::Table,
         layout,
+        isa_mode,
     );
     let table_base = table_base_from_stub(stub);
     let knv6 = stub
@@ -3081,6 +3094,55 @@ mod tests {
         vm.run().unwrap();
         assert_eq!(vm.get_register(2).unwrap(), 30);
         assert_eq!(vm.exit_code, Some(30));
+    }
+
+    #[test]
+    fn test_l5e_stack_packed_minimal_vm_matches_reg_exit() {
+        use crate::vm::{IsaMode, VirtualMachine};
+
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe_reg = PEFile::from_bytes(pe_data.clone()).unwrap();
+        let mut pe_stack = PEFile::from_bytes(pe_data).unwrap();
+        let packed_reg = pack_function(
+            &mut pe_reg,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Reg,
+        )
+        .unwrap();
+        let packed_stack = pack_function(
+            &mut pe_stack,
+            None,
+            Some(TEST_SEED),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Stack,
+        )
+        .unwrap();
+        let mut vm_reg = VirtualMachine::with_block_maps_and_layout(
+            packed_reg.bytecode,
+            packed_reg.opcode_map,
+            packed_reg.block_map_plan,
+            packed_reg.layout_plan,
+        );
+        vm_reg.run().unwrap();
+        let mut vm_stack = VirtualMachine::with_block_maps_and_layout(
+            packed_stack.bytecode,
+            packed_stack.opcode_map,
+            packed_stack.block_map_plan,
+            packed_stack.layout_plan,
+        )
+        .with_isa_mode(IsaMode::Stack);
+        vm_stack.run().unwrap();
+        assert_eq!(
+            vm_stack.exit_code,
+            vm_reg.exit_code,
+            "stack layout pack must match reg stdout/exit semantics"
+        );
     }
 
     #[test]
