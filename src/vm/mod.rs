@@ -15,8 +15,8 @@ pub use block_map::{
     collect_handler_redirect_plan, emit_block_map_refresh, meta_instruction_len,
 };
 pub use opcode_map::{
-    OpcodeMap, PackMetadata, active_decode, active_encode, clear_active_map, random_seed,
-    set_active_map, ADD_HANDLER_VARIANT_COUNT, AND_HANDLER_VARIANT_COUNT,
+    OpcodeMap, PackMetadata, active_decode, active_encode, active_opcode_map_or, clear_active_map,
+    random_seed, set_active_map, ADD_HANDLER_VARIANT_COUNT, AND_HANDLER_VARIANT_COUNT,
     SUB_HANDLER_VARIANT_COUNT, XOR_HANDLER_VARIANT_COUNT, CANONICAL_OPCODES, KNV4_HEADER_SIZE,
     KNV4_MAGIC,
 };

@@ -3231,6 +3231,36 @@ mod tests {
     }
 
     #[test]
+    fn test_l5e_stack_forward_jmp_loop_pack_smoke() {
+        use crate::vm::{IsaMode, VirtualMachine};
+
+        let pe_data = test_pe::create_pe64_with_forward_jmp_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_function(
+            &mut pe,
+            Some(main_rva),
+            Some(0x15D0_2026),
+            false,
+            crate::vm::DispatchMode::Table,
+            0,
+            IsaMode::Stack,
+        )
+        .unwrap();
+        let mut vm = VirtualMachine::with_block_maps_and_layout(
+            packed.bytecode.clone(),
+            packed.opcode_map.clone(),
+            packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
+        )
+        .with_isa_mode(IsaMode::Stack);
+        vm.run()
+            .unwrap_or_else(|e| panic!("stack forward-jmp loop VM run failed: {e}"));
+        assert_eq!(vm.exit_code, Some(0), "stack forward-jmp loop must exit 0");
+    }
+
+    #[test]
     fn test_l5d_same_bb_distinct_transition_map_hashes() {
         use std::collections::HashMap;
 

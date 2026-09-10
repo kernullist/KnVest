@@ -346,6 +346,11 @@ pub fn clear_active_map() {
     ACTIVE_MAP.with(|cell| *cell.borrow_mut() = None);
 }
 
+/// Opcode map active during lift (last `set_block_map` refresh), else `base`.
+pub fn active_opcode_map_or(base: &OpcodeMap) -> OpcodeMap {
+    ACTIVE_MAP.with(|cell| cell.borrow().clone().unwrap_or_else(|| base.clone()))
+}
+
 pub fn active_encode(op: OpCode) -> u8 {
     ACTIVE_MAP.with(|cell| {
         cell.borrow()

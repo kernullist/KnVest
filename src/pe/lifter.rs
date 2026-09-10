@@ -1,8 +1,9 @@
 use crate::vm::OpCode;
 use crate::vm::{
-    active_decode, active_encode, clear_active_map, set_active_map, BlockMapPlan, OpcodeMap,
-    emit_block_map_refresh,
+    active_decode, active_encode, active_opcode_map_or, clear_active_map, set_active_map,
+    BlockMapPlan, IsaMode, OpcodeMap, emit_block_map_refresh,
 };
+use crate::vm::isa_mode::{current_isa_mode, operand_len_for};
 use super::imports::{
     is_putchar_import, is_stdio_ptr_import, native_call_iat_id, native_call_iat_ptr_id,
     ImportTable,
@@ -758,29 +759,22 @@ fn resolve_conditional_jump_target(
     resolve_jump_target(label_map, adjusted)
 }
 
-fn vm_instruction_len(bytecode: &[u8], pos: usize) -> Option<usize> {
+fn vm_instruction_len(bytecode: &[u8], pos: usize, isa_mode: IsaMode) -> Option<usize> {
     if pos >= bytecode.len() {
         return None;
     }
-    let op = active_decode(bytecode[pos])?;
-    let operand_bytes = match op {
-        OpCode::Nop | OpCode::Ret => 0,
-        OpCode::LoadImm => 9,
-        OpCode::LoadMem | OpCode::StoreMem | OpCode::Move | OpCode::Cmp | OpCode::Cmp32 => 2,
-        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => 3,
-        OpCode::Jmp | OpCode::Call | OpCode::NativeCall | OpCode::LoadStr => 8,
-        OpCode::JmpIf => 9,
-        OpCode::Push | OpCode::Pop | OpCode::Exit | OpCode::LoadByte => 1,
-        OpCode::RunNative | OpCode::BailNative => 16,
-        OpCode::SetBlockMap => 2,
-    };
-    Some(1 + operand_bytes)
+    let wire = bytecode[pos];
+    if wire == META_WIRE_BYTE {
+        return Some(1 + 2);
+    }
+    let op = active_decode(wire)?;
+    Some(1 + operand_len_for(op, isa_mode))
 }
 
-fn vm_instruction_start_ending_at(bytecode: &[u8], end: usize) -> Option<usize> {
+fn vm_instruction_start_ending_at(bytecode: &[u8], end: usize, isa_mode: IsaMode) -> Option<usize> {
     let mut pos = 0;
     while pos < end {
-        let len = vm_instruction_len(bytecode, pos)?;
+        let len = vm_instruction_len(bytecode, pos, isa_mode)?;
         if pos + len == end {
             return Some(pos);
         }
@@ -804,7 +798,7 @@ fn retarget_vm_jmpif_from_mul_to_move(target_vm: usize, bytecode: &[u8]) -> usiz
         return target_vm;
     }
     let mul_dst = bytecode[target_vm + 1];
-    let Some(move_start) = vm_instruction_start_ending_at(bytecode, target_vm) else {
+    let Some(move_start) = vm_instruction_start_ending_at(bytecode, target_vm, current_isa_mode()) else {
         return target_vm;
     };
     if bytecode[move_start] != active_encode(OpCode::Move) {
@@ -1667,6 +1661,7 @@ fn retarget_jmp_operands_to_pad(
     entry_map: OpcodeMap,
     body_start: usize,
     pad_start: usize,
+    isa_mode: IsaMode,
 ) {
     let mut map = entry_map;
     let mut i = 0usize;
@@ -1700,7 +1695,7 @@ fn retarget_jmp_operands_to_pad(
             }
             _ => {}
         }
-        i += 1 + op.operand_len_lift();
+        i += 1 + operand_len_for(op, isa_mode);
     }
 }
 
@@ -1712,6 +1707,7 @@ fn reencode_path_for_edge(
     base_map: &OpcodeMap,
     entry_from_map: OpcodeMap,
     entry_to_map: OpcodeMap,
+    isa_mode: IsaMode,
 ) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(slice.len());
     let mut from_map = entry_from_map;
@@ -1734,7 +1730,7 @@ fn reencode_path_for_edge(
         }
         let op = from_map.decode(wire)?;
         out.push(to_map.encode(op));
-        let operand_len = op.operand_len_lift();
+        let operand_len = operand_len_for(op, isa_mode);
         if i + 1 + operand_len > slice.len() {
             return None;
         }
@@ -1752,11 +1748,18 @@ fn emit_forward_edge_pad_body(
     succ_body_end: usize,
     from_map: OpcodeMap,
     to_map: OpcodeMap,
+    isa_mode: IsaMode,
 ) {
     let body_slice = bytecode[body_start..succ_body_end].to_vec();
-    let mut duplicate =
-        reencode_path_for_edge(&body_slice, block_plan, base_map, from_map, to_map.clone())
-            .expect("succ BB body must re-encode for edge landing pad");
+    let mut duplicate = reencode_path_for_edge(
+        &body_slice,
+        block_plan,
+        base_map,
+        from_map,
+        to_map.clone(),
+        isa_mode,
+    )
+    .expect("succ BB body must re-encode for edge landing pad");
     duplicate.push(to_map.encode(OpCode::Jmp));
     duplicate.extend_from_slice(&(succ_body_end as u64).to_le_bytes());
     bytecode.extend(duplicate);
@@ -1769,11 +1772,13 @@ fn edge_pad_for_target(
     edge_pads: &mut std::collections::HashMap<(u16, u16), usize>,
     bb_body_starts: &std::collections::HashMap<usize, usize>,
     bb_body_ends: &std::collections::HashMap<usize, usize>,
+    bb_body_entry_map: &std::collections::HashMap<usize, OpcodeMap>,
     bb_fallthrough_tx: &std::collections::HashMap<usize, u16>,
     incoming: &std::collections::HashMap<u16, usize>,
     pred_bb_id: u16,
     succ_bb_id: u16,
     jmp_placeholder: usize,
+    isa_mode: IsaMode,
 ) -> usize {
     if incoming.get(&succ_bb_id).copied().unwrap_or(1) <= 1 {
         return bb_body_starts
@@ -1807,7 +1812,10 @@ fn edge_pad_for_target(
                 .map(|e| e.tx_id)
         })
         .expect("multi-pred BB must record fallthrough transition id");
-    let from_map = block_plan.map_for_tx_or_base(fallthrough_tx, base_map);
+    let from_map = bb_body_entry_map
+        .get(&(succ_bb_id as usize))
+        .cloned()
+        .unwrap_or_else(|| block_plan.map_for_tx_or_base(fallthrough_tx, base_map));
     let to_map = block_plan.map_for_tx_or_base(tx_id, base_map);
     let succ_body_end = bb_body_ends
         .get(&(succ_bb_id as usize))
@@ -1826,6 +1834,7 @@ fn edge_pad_for_target(
             succ_body_end,
             from_map.clone(),
             to_map.clone(),
+            isa_mode,
         );
     } else if let Some(mut duplicate) = reencode_path_for_edge(
         &bytecode[body_start..jmp_end],
@@ -1833,6 +1842,7 @@ fn edge_pad_for_target(
         base_map,
         from_map.clone(),
         to_map.clone(),
+        isa_mode,
     ) {
         // Back-edge loop: duplicate succ header through this jmp operand.
         retarget_jmp_operands_to_pad(
@@ -1842,6 +1852,7 @@ fn edge_pad_for_target(
             to_map,
             body_start,
             pad,
+            isa_mode,
         );
         bytecode.extend(duplicate);
     } else {
@@ -1854,6 +1865,7 @@ fn edge_pad_for_target(
             succ_body_end,
             from_map.clone(),
             to_map,
+            isa_mode,
         );
     }
 
@@ -2327,6 +2339,8 @@ fn lift_to_vm_bytecode_internal_with_main(
         std::collections::HashMap::new();
     let mut bb_body_ends: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
+    let mut bb_body_entry_map: std::collections::HashMap<usize, OpcodeMap> =
+        std::collections::HashMap::new();
     let mut bb_fallthrough_tx: std::collections::HashMap<usize, u16> =
         std::collections::HashMap::new();
 
@@ -2380,6 +2394,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                         bb_fallthrough_tx.insert(bb.id, tx_id);
                     }
                     bb_body_starts.insert(bb.id, bytecode.len());
+                    bb_body_entry_map.insert(bb.id, active_opcode_map_or(opcode_map));
                 } else {
                     if let Some(pred) = fallthrough_pred(bb, &main_blocks, instrs) {
                         emit_transition_refresh(
@@ -2396,6 +2411,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                         }
                     }
                     bb_body_starts.insert(bb.id, bytecode.len());
+                    bb_body_entry_map.insert(bb.id, active_opcode_map_or(opcode_map));
                 }
                 emitted_block_map.insert(bb.id);
             }
@@ -2911,9 +2927,12 @@ fn lift_to_vm_bytecode_internal_with_main(
                     bytecode.push(active_encode(OpCode::LoadImm));
                     bytecode.push(15);
                     bytecode.extend_from_slice(&0u64.to_le_bytes());
-                    bytecode.push(active_encode(cmp_opcode(u32_semantics)));
-                    bytecode.push(reg1.to_vm_reg());
-                    bytecode.push(15);
+                    emit_cmp_regs(
+                        &mut bytecode,
+                        cmp_opcode(u32_semantics),
+                        reg1.to_vm_reg(),
+                        15,
+                    );
                 }
             }
             X64InstrKind::Lea { .. }
@@ -2978,11 +2997,13 @@ fn lift_to_vm_bytecode_internal_with_main(
             &mut edge_pads,
             &bb_body_starts,
             &bb_body_ends,
+            &bb_body_entry_map,
             &bb_fallthrough_tx,
             &incoming,
             pred_bb,
             succ_bb,
             placeholder_pos,
+            current_isa_mode(),
         );
         bytecode[placeholder_pos..placeholder_pos + 8]
             .copy_from_slice(&(pad as u64).to_le_bytes());
@@ -3878,6 +3899,201 @@ mod tests {
         let has_sub = bc_has_op(&bc, OpCode::Sub);
         assert!(has_cmp, "loop lift must emit Cmp for [rbp+disp], 0");
         assert!(has_sub, "loop lift must emit Sub for [rbp+disp], 1");
+    }
+
+    #[test]
+    fn loop_mem_cmp_sub_lift_stack_isa_edge_pad_smoke() {
+        use crate::vm::IsaMode;
+
+        let main_off = 0x500;
+        let mut off = main_off;
+        let mut instrs = Vec::new();
+        let push_bytes = vec![0x55, 0x48, 0x89, 0xE5];
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: push_bytes.clone(),
+            kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+        });
+        off += push_bytes.len();
+        for (bytes, kind) in [
+            (
+                vec![0xC7, 0x45, 0xFC, 0x05, 0x00, 0x00, 0x00],
+                X64InstrKind::MovMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                    imm: 5,
+                },
+            ),
+            (
+                vec![0xEB, 0x10],
+                X64InstrKind::Jmp { target_offset: 0x10 },
+            ),
+            (
+                vec![0x8B, 0x45, 0xFC],
+                X64InstrKind::MovRegMem {
+                    dst: X64Reg::Eax,
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                },
+            ),
+            (
+                vec![0x83, 0x6D, 0xFC, 0x01],
+                X64InstrKind::SubMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                    imm: 1,
+                },
+            ),
+            (
+                vec![0x83, 0x7D, 0xFC, 0x00],
+                X64InstrKind::CmpMemImm {
+                    base: X64Reg::Rbp,
+                    offset: -4,
+                    imm: 0,
+                },
+            ),
+            (
+                vec![0x7F, 0xF0],
+                X64InstrKind::Jg { target_offset: -0x10 },
+            ),
+        ] {
+            instrs.push(X64Instruction {
+                offset: off,
+                bytes: bytes.clone(),
+                kind,
+            });
+            off += bytes.len();
+        }
+        instrs.push(ret_at(off));
+
+        let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
+        let map = test_opcode_map();
+        let block_plan = lift_plan_for(&instrs, main_off);
+        stash_lift_plan(&block_plan);
+        let mut sled = NativeSledBuilder::new();
+        crate::vm::set_isa_mode(IsaMode::Stack);
+        let (bc, _) = lift_to_vm_bytecode_for_main(
+            &instrs,
+            0x1000,
+            main_off,
+            &pe,
+            None,
+            &ImportTable::default(),
+            &map,
+            None,
+            &block_plan,
+            &mut sled,
+        );
+        crate::vm::clear_isa_mode();
+        assert!(bc_has_op(&bc, OpCode::Cmp));
+        assert!(bc_has_op(&bc, OpCode::Sub));
+    }
+
+    #[test]
+    fn str_style_movzx_loop_lift_stack_isa_edge_pad_smoke() {
+        use crate::vm::IsaMode;
+
+        let main_off = 0x500;
+        let mut off = main_off;
+        let mut instrs = Vec::new();
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0x55],
+            kind: X64InstrKind::Push { reg: X64Reg::Rbp },
+        });
+        off += 1;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0x48, 0x8D, 0x1D, 0, 0, 0, 0],
+            kind: X64InstrKind::LeaRipRel {
+                dst: X64Reg::Rbx,
+                offset: 0,
+            },
+        });
+        off += 7;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0xC7, 0x45, 0xFC, 0x00, 0x00, 0x00, 0x00],
+            kind: X64InstrKind::MovMemImm {
+                base: X64Reg::Rbp,
+                offset: -4,
+                imm: 0,
+            },
+        });
+        off += 7;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0xEB, 0x14],
+            kind: X64InstrKind::Jmp { target_offset: 0x14 },
+        });
+        off += 2;
+        let test_off = off;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0x42, 0x0F, 0xB6, 0x04, 0x33],
+            kind: X64InstrKind::MovzxByteRegReg {
+                dst: X64Reg::Eax,
+                base: X64Reg::Rbx,
+                index: X64Reg::Rsi,
+            },
+        });
+        off += 5;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0x83, 0xF8, 0x00],
+            kind: X64InstrKind::CmpRegImm {
+                reg: X64Reg::Eax,
+                imm: 0,
+            },
+        });
+        off += 3;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0x74, 0x0A],
+            kind: X64InstrKind::Je { target_offset: 0x0A },
+        });
+        off += 2;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0x83, 0x45, 0xFC, 0x01],
+            kind: X64InstrKind::AddMemImm {
+                base: X64Reg::Rbp,
+                offset: -4,
+                imm: 1,
+            },
+        });
+        off += 4;
+        instrs.push(X64Instruction {
+            offset: off,
+            bytes: vec![0xEB, 0xE6],
+            kind: X64InstrKind::Jmp { target_offset: -0x1A },
+        });
+        off += 2;
+        instrs.push(call_at(off, 0x1000));
+        off += 5;
+        instrs.push(ret_at(off));
+
+        let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
+        let map = test_opcode_map();
+        let block_plan = lift_plan_for(&instrs, main_off);
+        stash_lift_plan(&block_plan);
+        let mut sled = NativeSledBuilder::new();
+        crate::vm::set_isa_mode(IsaMode::Stack);
+        let (bc, _) = lift_to_vm_bytecode_for_main(
+            &instrs,
+            0x1000,
+            main_off,
+            &pe,
+            None,
+            &ImportTable::default(),
+            &map,
+            None,
+            &block_plan,
+            &mut sled,
+        );
+        crate::vm::clear_isa_mode();
+        assert!(bc.windows(7).any(|w| w == b"knvest\0"));
+        assert!(bc_has_op(&bc, OpCode::LoadByte));
     }
 
     #[test]
