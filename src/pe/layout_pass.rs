@@ -46,7 +46,7 @@ pub fn apply_layout_diversification(
         let op_start = insn.start + 1;
         let operand_len = match insn.kind {
             RawInsnKind::SetBlockMap => META_OPERAND_LEN,
-            RawInsnKind::Semantic(op) => op.operand_len(),
+            RawInsnKind::Semantic(op) => op.operand_len_lift(),
         };
         let mut operands = bytecode[op_start..op_start + operand_len].to_vec();
         if let RawInsnKind::Semantic(op) = insn.kind {
@@ -88,7 +88,7 @@ fn relocate_offset(
         };
         let operand_len = match insn.kind {
             RawInsnKind::SetBlockMap => META_OPERAND_LEN,
-            RawInsnKind::Semantic(op) => op.operand_len(),
+            RawInsnKind::Semantic(op) => op.operand_len_lift(),
         };
         new_pos += 1 + pad_wire as usize + operand_len;
     }

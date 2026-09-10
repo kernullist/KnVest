@@ -1,3 +1,4 @@
+use super::isa_mode::IsaMode;
 use super::opcode::OpCode;
 use super::opcode_map::OpcodeMap;
 use super::block_map::{BlockMapPlan, META_WIRE_BYTE};
@@ -47,6 +48,10 @@ pub struct VirtualMachine {
     native_functions: HashMap<u64, fn(&mut VirtualMachine) -> VMResult<()>>,
     pub exit_code: Option<i32>,
     pub data_section: Vec<u8>,
+    isa_mode: IsaMode,
+    /// VM data-stack depth for stack-ISA ALU (mirrors stub [rbp-0xE8]).
+    data_stack_depth: usize,
+    data_stack: Vec<u64>,
 }
 
 impl VirtualMachine {
@@ -66,7 +71,15 @@ impl VirtualMachine {
             native_functions: HashMap::new(),
             exit_code: None,
             data_section: Vec::new(),
+            isa_mode: IsaMode::Reg,
+            data_stack_depth: 0,
+            data_stack: Vec::with_capacity(STACK_SIZE),
         }
+    }
+
+    pub fn with_isa_mode(mut self, isa_mode: IsaMode) -> Self {
+        self.isa_mode = isa_mode;
+        self
     }
 
     pub fn with_opcode_map(bytecode: Vec<u8>, opcode_map: OpcodeMap) -> Self {
@@ -159,6 +172,27 @@ impl VirtualMachine {
         }
         self.sp -= 1;
         self.stack.pop().ok_or(VMError::StackUnderflow)
+    }
+
+    fn push_data_stack(&mut self, value: u64) -> VMResult<()> {
+        if self.data_stack_depth >= STACK_SIZE {
+            return Err(VMError::StackOverflow);
+        }
+        if self.data_stack_depth == self.data_stack.len() {
+            self.data_stack.push(value);
+        } else {
+            self.data_stack[self.data_stack_depth] = value;
+        }
+        self.data_stack_depth += 1;
+        Ok(())
+    }
+
+    fn pop_data_stack(&mut self) -> VMResult<u64> {
+        if self.data_stack_depth == 0 {
+            return Err(VMError::StackUnderflow);
+        }
+        self.data_stack_depth -= 1;
+        Ok(self.data_stack[self.data_stack_depth])
     }
 
     fn skip_layout_pad_meta(&mut self) -> VMResult<()> {
@@ -269,55 +303,93 @@ impl VirtualMachine {
             },
             
             OpCode::Add => {
-                let dst = self.read_u8()?;
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)?;
-                let val2 = self.get_register(src2)?;
-                self.set_register(dst, val1.wrapping_add(val2))?;
+                if self.isa_mode.is_stack() {
+                    let dst = self.read_u8()?;
+                    let val2 = self.pop_data_stack()?;
+                    let val1 = self.pop_data_stack()?;
+                    self.set_register(dst, val1.wrapping_add(val2))?;
+                } else {
+                    let dst = self.read_u8()?;
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    let val1 = self.get_register(src1)?;
+                    let val2 = self.get_register(src2)?;
+                    self.set_register(dst, val1.wrapping_add(val2))?;
+                }
             },
             
             OpCode::Sub => {
-                let dst = self.read_u8()?;
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)?;
-                let val2 = self.get_register(src2)?;
-                self.set_register(dst, val1.wrapping_sub(val2))?;
+                if self.isa_mode.is_stack() {
+                    let dst = self.read_u8()?;
+                    let val2 = self.pop_data_stack()?;
+                    let val1 = self.pop_data_stack()?;
+                    self.set_register(dst, val1.wrapping_sub(val2))?;
+                } else {
+                    let dst = self.read_u8()?;
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    let val1 = self.get_register(src1)?;
+                    let val2 = self.get_register(src2)?;
+                    self.set_register(dst, val1.wrapping_sub(val2))?;
+                }
             },
             
             OpCode::Mul => {
-                let dst = self.read_u8()?;
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)?;
-                let val2 = self.get_register(src2)?;
-                self.set_register(dst, val1.wrapping_mul(val2))?;
+                if self.isa_mode.is_stack() {
+                    let dst = self.read_u8()?;
+                    let val2 = self.pop_data_stack()?;
+                    let val1 = self.pop_data_stack()?;
+                    self.set_register(dst, val1.wrapping_mul(val2))?;
+                } else {
+                    let dst = self.read_u8()?;
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    let val1 = self.get_register(src1)?;
+                    let val2 = self.get_register(src2)?;
+                    self.set_register(dst, val1.wrapping_mul(val2))?;
+                }
             },
 
             OpCode::And => {
-                let dst = self.read_u8()?;
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)?;
-                let val2 = self.get_register(src2)?;
-                self.set_register(dst, val1 & val2)?;
+                if self.isa_mode.is_stack() {
+                    let dst = self.read_u8()?;
+                    let val2 = self.pop_data_stack()?;
+                    let val1 = self.pop_data_stack()?;
+                    self.set_register(dst, val1 & val2)?;
+                } else {
+                    let dst = self.read_u8()?;
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    let val1 = self.get_register(src1)?;
+                    let val2 = self.get_register(src2)?;
+                    self.set_register(dst, val1 & val2)?;
+                }
             },
             
             OpCode::Xor => {
-                let dst = self.read_u8()?;
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)?;
-                let val2 = self.get_register(src2)?;
-                self.set_register(dst, val1 ^ val2)?;
+                if self.isa_mode.is_stack() {
+                    let dst = self.read_u8()?;
+                    let val2 = self.pop_data_stack()?;
+                    let val1 = self.pop_data_stack()?;
+                    self.set_register(dst, val1 ^ val2)?;
+                } else {
+                    let dst = self.read_u8()?;
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    let val1 = self.get_register(src1)?;
+                    let val2 = self.get_register(src2)?;
+                    self.set_register(dst, val1 ^ val2)?;
+                }
             },
             
             OpCode::Cmp => {
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)?;
-                let val2 = self.get_register(src2)?;
+                let (val1, val2) = if self.isa_mode.is_stack() {
+                    (self.pop_data_stack()?, self.pop_data_stack()?)
+                } else {
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    (self.get_register(src1)?, self.get_register(src2)?)
+                };
                 let result = val1.wrapping_sub(val2);
                 let zf = val1 == val2;
                 let sf = (result as i64) < 0;
@@ -330,10 +402,19 @@ impl VirtualMachine {
             },
 
             OpCode::Cmp32 => {
-                let src1 = self.read_u8()?;
-                let src2 = self.read_u8()?;
-                let val1 = self.get_register(src1)? as u32 as u64;
-                let val2 = self.get_register(src2)? as u32 as u64;
+                let (val1, val2) = if self.isa_mode.is_stack() {
+                    (
+                        self.pop_data_stack()? as u32 as u64,
+                        self.pop_data_stack()? as u32 as u64,
+                    )
+                } else {
+                    let src1 = self.read_u8()?;
+                    let src2 = self.read_u8()?;
+                    (
+                        self.get_register(src1)? as u32 as u64,
+                        self.get_register(src2)? as u32 as u64,
+                    )
+                };
                 let result = val1.wrapping_sub(val2);
                 let zf = val1 == val2;
                 let sf = (result as i64) < 0;
@@ -413,12 +494,20 @@ impl VirtualMachine {
             OpCode::Push => {
                 let reg = self.read_u8()?;
                 let value = self.get_register(reg)?;
-                self.push_stack(value)?;
+                if self.isa_mode.is_stack() {
+                    self.push_data_stack(value)?;
+                } else {
+                    self.push_stack(value)?;
+                }
             },
             
             OpCode::Pop => {
                 let reg = self.read_u8()?;
-                let value = self.pop_stack()?;
+                let value = if self.isa_mode.is_stack() {
+                    self.pop_data_stack()?
+                } else {
+                    self.pop_stack()?
+                };
                 self.set_register(reg, value)?;
             },
             

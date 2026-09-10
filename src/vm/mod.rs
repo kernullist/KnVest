@@ -5,6 +5,7 @@ pub mod opcode_map;
 pub mod machine;
 pub mod dispatch;
 pub mod virt_isa;
+pub mod isa_mode;
 
 pub use opcode::OpCode;
 pub use dispatch::{DispatchMode, THREAD_TARGET_SIZE};
@@ -22,6 +23,10 @@ pub use opcode_map::{
 pub use virt_isa::{
     format_ir_header as virt_isa_ir_header, emit_sub_reg_reg, seed_for_handler_variant,
     seed_for_sub_split, sub_lift_split_enabled, VIRT_ISA_SPLIT_TEMP,
+};
+pub use isa_mode::{
+    clear_isa_mode, current_isa_mode, format_ir_header as isa_ir_header, is_stack_alu_op,
+    operand_len_for, set_isa_mode, IsaMode,
 };
 pub use layout::{BytecodeLayout, KNV7_MAGIC, KNV7_HEADER_SIZE};
 pub use machine::{VirtualMachine, VMError, VMResult};

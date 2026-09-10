@@ -49,6 +49,13 @@ pub enum Commands {
             help = "MBA substitution level: 0/off (default), 1=single catalog rewrite, 2=nested depth-limited"
         )]
         mba: Option<String>,
+        #[arg(
+            long,
+            value_name = "MODE",
+            default_value = "reg",
+            help = "VM ISA mode: reg (default, 3-operand registers) or stack (push/pop ALU)"
+        )]
+        isa: String,
     },
 }
 
@@ -56,6 +63,10 @@ impl Cli {
     pub fn parse_args() -> Self {
         Self::parse()
     }
+}
+
+pub fn parse_isa_mode(isa: &str) -> anyhow::Result<crate::vm::IsaMode> {
+    crate::vm::IsaMode::from_str(isa).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn parse_mba_level(mba: &Option<String>) -> anyhow::Result<u8> {

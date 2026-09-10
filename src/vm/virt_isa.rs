@@ -1,7 +1,7 @@
 use super::opcode_map::handler_variant_count;
 use super::opcode::OpCode;
 use super::OpcodeMap;
-use super::{active_encode, DispatchMode};
+use super::{active_encode, current_isa_mode, DispatchMode, IsaMode};
 use crate::pe::mba;
 
 /// Scratch register for L5a lift-time sub split (not used by MBA temps r14/r15).
@@ -23,6 +23,27 @@ pub fn emit_sub_three(bytecode: &mut Vec<u8>, dst: u8, lhs: u8, rhs: u8, seed: u
             mba::emit_sub_three(bytecode, dst, VIRT_ISA_SPLIT_TEMP, rhs);
         } else {
             mba::emit_sub_three(bytecode, dst, lhs, rhs);
+        }
+        return;
+    }
+    if current_isa_mode() == IsaMode::Stack {
+        if sub_lift_split_enabled(seed) && lhs == dst {
+            bytecode.push(active_encode(OpCode::Move));
+            bytecode.push(VIRT_ISA_SPLIT_TEMP);
+            bytecode.push(lhs);
+            bytecode.push(active_encode(OpCode::Push));
+            bytecode.push(VIRT_ISA_SPLIT_TEMP);
+            bytecode.push(active_encode(OpCode::Push));
+            bytecode.push(rhs);
+            bytecode.push(active_encode(OpCode::Sub));
+            bytecode.push(dst);
+        } else {
+            bytecode.push(active_encode(OpCode::Push));
+            bytecode.push(lhs);
+            bytecode.push(active_encode(OpCode::Push));
+            bytecode.push(rhs);
+            bytecode.push(active_encode(OpCode::Sub));
+            bytecode.push(dst);
         }
         return;
     }

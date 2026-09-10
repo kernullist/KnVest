@@ -57,7 +57,7 @@ fn enumerate_instructions(
             Some(op) => op,
             None => break,
         };
-        let operand_len = op.operand_len();
+        let operand_len = op.operand_len_lift();
         let raw_len = layout.insn_len(op, operand_len, dispatch_mode, false);
         if offset + raw_len > bytecode.len() {
             break;
@@ -183,7 +183,7 @@ pub fn embed_thread_targets(
             InsnKind::SetBlockMap => unreachable!(),
         };
         let op_off = insn.start + layout.operands_offset(op, false);
-        let operand_len = op.operand_len();
+        let operand_len = op.operand_len_lift();
         out.extend_from_slice(&bytecode[tail_start..op_off]);
         let mut operands = bytecode[op_off..op_off + operand_len].to_vec();
         patch_operands_for_threaded(insn.kind, &mut operands, &insns, bytecode.len(), &relocate);
@@ -425,7 +425,7 @@ mod tests {
     use crate::vm::{BlockMapPlan, DispatchMode};
 
     fn stub_for(map: &OpcodeMap) -> Vec<u8> {
-        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[])
+        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[])
             .0
     }
 
