@@ -23,7 +23,15 @@ pub fn apply_layout_diversification(
         return bytecode.to_vec();
     }
     let code_end = insns.last().map(|i| i.start + i.raw_len).unwrap_or(0);
-    let relocate = |old: usize| relocate_offset(&insns, layout, old);
+    let wire_pad_total = total_wire_padding(&insns, layout);
+    let relocate_insn = |old: usize| relocate_offset(&insns, layout, old);
+    let relocate = |old: usize| {
+        if is_string_or_data_offset(&insns, old, bytecode.len()) {
+            old + wire_pad_total
+        } else {
+            relocate_insn(old)
+        }
+    };
 
     let mut out = Vec::with_capacity(bytecode.len() + insns.len() * 4);
     for insn in &insns {
@@ -50,6 +58,18 @@ pub fn apply_layout_diversification(
         out.extend_from_slice(&bytecode[code_end..]);
     }
     out
+}
+
+fn total_wire_padding(
+    insns: &[crate::vm::layout::RawInsn],
+    layout: &BytecodeLayout,
+) -> usize {
+    insns.iter().map(|insn| {
+        match insn.kind {
+            RawInsnKind::SetBlockMap => layout.meta_post_wire_pad as usize,
+            RawInsnKind::Semantic(op) => layout.post_wire_pad_for(op) as usize,
+        }
+    }).sum()
 }
 
 fn relocate_offset(
@@ -128,6 +148,52 @@ fn patch_operands_for_layout(
 mod tests {
     use super::*;
     use crate::vm::DispatchMode;
+
+    #[test]
+    fn layout_pass_preserves_string_pool_offsets() {
+        let map = OpcodeMap::from_seed(10);
+        let layout = BytecodeLayout::from_seed(0x5A5A_5A5A);
+        let plan = BlockMapPlan::default();
+        let msg = b"pool\0";
+        let mut raw = vec![map.encode(OpCode::LoadImm), 0];
+        raw.extend_from_slice(&0u64.to_le_bytes());
+        raw.push(map.encode(OpCode::Exit));
+        raw.push(0);
+        let pool_off = raw.len();
+        raw.extend_from_slice(msg);
+        raw[2..10].copy_from_slice(&(pool_off as u64).to_le_bytes());
+
+        let laid = apply_layout_diversification(&raw, &layout, &map, &plan);
+        let insns = enumerate_raw_instructions(
+            &laid,
+            &map,
+            &plan,
+            &layout,
+            DispatchMode::Table,
+        );
+        let wire_pad = total_wire_padding(
+            &enumerate_raw_instructions(
+                &raw,
+                &map,
+                &plan,
+                &BytecodeLayout::identity(),
+                DispatchMode::Table,
+            ),
+            &layout,
+        );
+        let expected_pool = pool_off + wire_pad;
+        let load = insns
+            .iter()
+            .find(|i| matches!(i.kind, RawInsnKind::Semantic(OpCode::LoadImm)))
+            .expect("load_imm");
+        let imm_off = load.start + layout.operands_offset(OpCode::LoadImm, false) + 1;
+        let imm = u64::from_le_bytes(laid[imm_off..imm_off + 8].try_into().unwrap()) as usize;
+        assert_eq!(imm, expected_pool, "load_imm must track padded tail offset");
+        assert!(
+            laid[imm..].starts_with(msg),
+            "load_imm must still reference string pool bytes"
+        );
+    }
 
     #[test]
     fn layout_pass_changes_wire_bytes() {

@@ -1223,6 +1223,7 @@ mod tests {
         iat_native_call_ids_in_bytecode_with_map_dispatch,
         is_iat_native_call, is_iat_ptr_native_call,
         native_call_iat_ptr_id, native_call_ids_in_bytecode_with_map,
+        native_call_ids_in_bytecode_with_layout,
         native_call_ids_in_bytecode_with_map_dispatch,
     };
     use crate::pe::test_pe;
@@ -1382,32 +1383,34 @@ mod tests {
         bc: &[u8],
         base_map: &OpcodeMap,
         plan: &BlockMapPlan,
+        layout: &crate::vm::BytecodeLayout,
         r1: u8,
         r2: u8,
     ) -> bool {
-        use crate::vm::block_map::{META_OPERAND_LEN, META_WIRE_BYTE};
+        use crate::vm::block_map::META_WIRE_BYTE;
         let mut offset = 0usize;
         let mut current_map = base_map.clone();
         while offset < bc.len() {
             if bc[offset] == META_WIRE_BYTE {
-                if offset + 1 + META_OPERAND_LEN <= bc.len() {
-                    let bb_id = u16::from_le_bytes([bc[offset + 1], bc[offset + 2]]);
+                let meta_off = offset
+                    + layout.operands_offset(OpCode::SetBlockMap, true);
+                if meta_off + 2 <= bc.len() {
+                    let bb_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
                     current_map = plan.map_for_bb_or_base(bb_id, base_map);
-                    offset += 1 + META_OPERAND_LEN;
+                    offset += layout.table_meta_len();
                     continue;
                 }
                 break;
             }
             let wire = bc[offset];
             if let Some(op) = current_map.decode(wire) {
-                if op == OpCode::Cmp32
-                    && offset + 3 <= bc.len()
-                    && bc[offset + 1] == r1
-                    && bc[offset + 2] == r2
-                {
-                    return true;
+                if op == OpCode::Cmp32 {
+                    let op_off = offset + layout.operands_offset(op, false);
+                    if op_off + 2 <= bc.len() && bc[op_off] == r1 && bc[op_off + 1] == r2 {
+                        return true;
+                    }
                 }
-                offset += 1 + op.operand_len();
+                offset += layout.table_insn_len(op, op.operand_len());
             } else {
                 offset += 1;
             }
@@ -1419,39 +1422,41 @@ mod tests {
         bc: &[u8],
         base_map: &OpcodeMap,
         plan: &BlockMapPlan,
+        layout: &crate::vm::BytecodeLayout,
         r1: u8,
         r2: u8,
     ) -> Option<OpCode> {
-        use crate::vm::block_map::{META_OPERAND_LEN, META_WIRE_BYTE};
+        use crate::vm::block_map::META_WIRE_BYTE;
         let mut offset = 0usize;
         let mut current_map = base_map.clone();
         while offset < bc.len() {
             if bc[offset] == META_WIRE_BYTE {
-                if offset + 1 + META_OPERAND_LEN <= bc.len() {
-                    let bb_id = u16::from_le_bytes([bc[offset + 1], bc[offset + 2]]);
+                let meta_off = offset
+                    + layout.operands_offset(OpCode::SetBlockMap, true);
+                if meta_off + 2 <= bc.len() {
+                    let bb_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
                     current_map = plan.map_for_bb_or_base(bb_id, base_map);
-                    offset += 1 + META_OPERAND_LEN;
+                    offset += layout.table_meta_len();
                     continue;
                 }
                 break;
             }
             let wire = bc[offset];
             if let Some(op) = current_map.decode(wire) {
-                if op == OpCode::Cmp32
-                    && offset + 3 <= bc.len()
-                    && bc[offset + 1] == r1
-                    && bc[offset + 2] == r2
-                {
-                    let next = offset + 3;
-                    if next >= bc.len() {
-                        return None;
+                if op == OpCode::Cmp32 {
+                    let op_off = offset + layout.operands_offset(op, false);
+                    if op_off + 2 <= bc.len() && bc[op_off] == r1 && bc[op_off + 1] == r2 {
+                        let next = offset + layout.table_insn_len(op, op.operand_len());
+                        if next >= bc.len() {
+                            return None;
+                        }
+                        if bc[next] == META_WIRE_BYTE {
+                            return Some(OpCode::SetBlockMap);
+                        }
+                        return current_map.decode(bc[next]);
                     }
-                    if bc[next] == META_WIRE_BYTE {
-                        return Some(OpCode::SetBlockMap);
-                    }
-                    return current_map.decode(bc[next]);
                 }
-                offset += 1 + op.operand_len();
+                offset += layout.table_insn_len(op, op.operand_len());
             } else {
                 offset += 1;
             }
@@ -1566,10 +1571,11 @@ mod tests {
             )
             .unwrap();
             NC2_R2.with(|c| c.set(None));
-            let mut vm = VirtualMachine::with_block_maps(
+            let mut vm = VirtualMachine::with_block_maps_and_layout(
                 packed.bytecode.clone(),
                 packed.opcode_map.clone(),
                 packed.block_map_plan.clone(),
+                packed.layout_plan.clone(),
             );
             vm.register_native(2, nc2_capture);
             vm.run()
@@ -1706,11 +1712,25 @@ mod tests {
             ir.contains("cmp32        | r12, r15") || ir.contains("cmp32          | r12, r15"),
             "nested must cmp32 product against 9:\n{ir}"
         );
-        let product_cmp = table_bytecode_has_cmp32_regs(bc, map, &packed.block_map_plan, 12, 15);
+        let product_cmp = table_bytecode_has_cmp32_regs(
+            bc,
+            map,
+            &packed.block_map_plan,
+            &packed.layout_plan,
+            12,
+            15,
+        );
         assert!(product_cmp, "nested bytecode must contain cmp32 r12,r15");
         assert!(
             matches!(
-                table_bytecode_insn_after_cmp32_regs(bc, map, &packed.block_map_plan, 12, 15),
+                table_bytecode_insn_after_cmp32_regs(
+                    bc,
+                    map,
+                    &packed.block_map_plan,
+                    &packed.layout_plan,
+                    12,
+                    15,
+                ),
                 Some(OpCode::Jmp) | Some(OpCode::JmpIf)
             ),
             "cmp32 r12,r15 must branch to single-digit path (jmp or fused jle)"
@@ -1726,15 +1746,17 @@ mod tests {
         bytecode: &[u8],
         map: &OpcodeMap,
         block_plan: Option<&BlockMapPlan>,
+        layout: &crate::vm::BytecodeLayout,
         putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
     ) {
-        for id in iat_native_call_ids_in_bytecode_with_map_dispatch(
+        for id in native_call_ids_in_bytecode_with_layout(
             bytecode,
             map,
             crate::vm::DispatchMode::Table,
             block_plan,
+            layout,
         ) {
-            if !is_iat_ptr_native_call(id) {
+            if is_iat_native_call(id) && !is_iat_ptr_native_call(id) {
                 vm.register_native(id, putchar);
             }
         }
@@ -1746,14 +1768,16 @@ mod tests {
         bytecode: &[u8],
         map: &OpcodeMap,
         block_plan: Option<&BlockMapPlan>,
+        layout: &crate::vm::BytecodeLayout,
         putchar: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
         printf: fn(&mut crate::vm::VirtualMachine) -> crate::vm::VMResult<()>,
     ) {
-        for id in native_call_ids_in_bytecode_with_map_dispatch(
+        for id in native_call_ids_in_bytecode_with_layout(
             bytecode,
             map,
             crate::vm::DispatchMode::Table,
             block_plan,
+            layout,
         ) {
             if is_iat_ptr_native_call(id) {
                 vm.register_native(id, printf);
@@ -1806,23 +1830,26 @@ mod tests {
         assert!(
             bytecode_has_char_output_native(&bc, &map),
             "packed nested must emit at least one native_call for char output, got {:?}",
-            native_call_ids_in_bytecode_with_map_dispatch(
+            native_call_ids_in_bytecode_with_layout(
                 &bc,
                 &map,
                 crate::vm::DispatchMode::Table,
                 Some(&packed.block_map_plan),
+                &packed.layout_plan,
             )
         );
-        let mut vm = crate::vm::VirtualMachine::with_block_maps(
+        let mut vm = crate::vm::VirtualMachine::with_block_maps_and_layout(
             bc.clone(),
             map.clone(),
             packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
         );
         register_packed_putchar_natives(
             &mut vm,
             &bc,
             &map,
             Some(&packed.block_map_plan),
+            &packed.layout_plan,
             putchar_native,
         );
         vm.run().expect("nested VM run");
@@ -1881,16 +1908,18 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = crate::vm::VirtualMachine::with_block_maps(
+        let mut vm = crate::vm::VirtualMachine::with_block_maps_and_layout(
             bc.clone(),
             map.clone(),
             packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
         );
         register_packed_stdio_natives(
             &mut vm,
             &bc,
             &map,
             Some(&packed.block_map_plan),
+            &packed.layout_plan,
             putchar_native,
             printf_native,
         );
@@ -1940,16 +1969,18 @@ mod tests {
             Ok(())
         }
 
-        let mut vm = crate::vm::VirtualMachine::with_block_maps(
+        let mut vm = crate::vm::VirtualMachine::with_block_maps_and_layout(
             bc.clone(),
             map.clone(),
             packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
         );
         register_packed_stdio_natives(
             &mut vm,
             &bc,
             &map,
             Some(&packed.block_map_plan),
+            &packed.layout_plan,
             putchar_native,
             printf_native,
         );
@@ -2383,11 +2414,12 @@ mod tests {
             packed.bytecode[imm..].starts_with(msg),
             "load_imm must reference IAT puts prefix at {imm}"
         );
-        let ids = native_call_ids_in_bytecode_with_map_dispatch(
+        let ids = native_call_ids_in_bytecode_with_layout(
             &packed.bytecode,
             &packed.opcode_map,
             packed.dispatch_mode,
             Some(&packed.block_map_plan),
+            &packed.layout_plan,
         );
         assert!(
             ids.iter().any(|id| is_iat_ptr_native_call(*id)),
