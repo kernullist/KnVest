@@ -10,7 +10,7 @@ use super::imports::{
 use super::parser::PEFile;
 use super::partial::{bb_can_run_native, native_sled_instr_range, NativeSledBuilder, PartialVirtPlan};
 use super::cfg::{BasicBlock, build_basic_blocks, collect_cfg_edges, incoming_edge_counts};
-use crate::vm::block_map::ENTRY_PRED_BB;
+use crate::vm::block_map::{ENTRY_PRED_BB, META_WIRE_BYTE};
 use super::mba::{emit_add_reg_imm, emit_add_reg_reg, emit_add_three};
 use crate::vm::virt_isa::emit_sub_three;
 use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
@@ -1632,14 +1632,11 @@ fn emit_transition_refresh(
         set_active_map(&BlockMapPlan::block_opcode_map(base_map.seed(), bb_id as usize));
         return;
     }
-    if let Some(tx_id) = block_plan.transition_for_edge(pred_bb_id, bb_id) {
-        emit_block_map_refresh(bytecode, tx_id);
-        set_active_map(&block_plan.map_for_tx_or_base(tx_id, base_map));
-    } else {
-        // Linear lift may touch blocks only reached via VM jump retargeting (no CFG edge).
-        emit_block_map_refresh(bytecode, bb_id);
-        set_active_map(&BlockMapPlan::block_opcode_map(base_map.seed(), bb_id as usize));
-    }
+    let tx_id = block_plan
+        .tx_id_for_transition(pred_bb_id, bb_id)
+        .expect("block map plan missing transition for BB entry");
+    emit_block_map_refresh(bytecode, tx_id);
+    set_active_map(&block_plan.map_for_tx_or_base(tx_id, base_map));
 }
 
 fn fallthrough_pred(
@@ -1663,15 +1660,97 @@ fn fallthrough_pred(
     None
 }
 
+fn retarget_jmp_operands_to_pad(
+    body: &mut [u8],
+    block_plan: &BlockMapPlan,
+    base_map: &OpcodeMap,
+    entry_map: OpcodeMap,
+    body_start: usize,
+    pad_start: usize,
+) {
+    let mut map = entry_map;
+    let mut i = 0usize;
+    while i < body.len() {
+        let wire = body[i];
+        if wire == META_WIRE_BYTE {
+            let tx_id = u16::from_le_bytes([body[i + 1], body[i + 2]]);
+            map = block_plan.map_for_tx_or_base(tx_id, base_map);
+            i += 1 + 2;
+            continue;
+        }
+        let op = map
+            .decode(wire)
+            .expect("edge-pad body must decode under transition map");
+        match op {
+            OpCode::Jmp | OpCode::Call => {
+                let off = i + 1;
+                let target =
+                    u64::from_le_bytes(body[off..off + 8].try_into().unwrap()) as usize;
+                if target == body_start {
+                    body[off..off + 8].copy_from_slice(&(pad_start as u64).to_le_bytes());
+                }
+            }
+            OpCode::JmpIf => {
+                let off = i + 2;
+                let target =
+                    u64::from_le_bytes(body[off..off + 8].try_into().unwrap()) as usize;
+                if target == body_start {
+                    body[off..off + 8].copy_from_slice(&(pad_start as u64).to_le_bytes());
+                }
+            }
+            _ => {}
+        }
+        i += 1 + op.operand_len();
+    }
+}
+
+/// Re-encode a linear VM path for an edge landing pad: the entry block uses
+/// `entry_to_map` while inner blocks reached via embedded META keep their maps.
+fn reencode_path_for_edge(
+    slice: &[u8],
+    block_plan: &BlockMapPlan,
+    base_map: &OpcodeMap,
+    entry_from_map: OpcodeMap,
+    entry_to_map: OpcodeMap,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(slice.len());
+    let mut from_map = entry_from_map;
+    let mut to_map = entry_to_map;
+    let mut i = 0usize;
+    while i < slice.len() {
+        let wire = slice[i];
+        if wire == META_WIRE_BYTE {
+            out.push(wire);
+            let tx_id = u16::from_le_bytes([slice[i + 1], slice[i + 2]]);
+            out.extend_from_slice(&slice[i + 1..i + 3]);
+            let inner = block_plan.map_for_tx_or_base(tx_id, base_map);
+            from_map = inner.clone();
+            to_map = inner;
+            i += 1 + 2;
+            continue;
+        }
+        let op = from_map
+            .decode(wire)
+            .expect("edge path slice must decode under active transition map");
+        out.push(to_map.encode(op));
+        let operand_len = op.operand_len();
+        out.extend_from_slice(&slice[i + 1..i + 1 + operand_len]);
+        i += 1 + operand_len;
+    }
+    out
+}
+
 fn edge_pad_for_target(
     bytecode: &mut Vec<u8>,
     block_plan: &BlockMapPlan,
     base_map: &OpcodeMap,
     edge_pads: &mut std::collections::HashMap<(u16, u16), usize>,
     bb_body_starts: &std::collections::HashMap<usize, usize>,
+    bb_fallthrough_tx: &std::collections::HashMap<usize, u16>,
     incoming: &std::collections::HashMap<u16, usize>,
     pred_bb_id: u16,
     succ_bb_id: u16,
+    jmp_placeholder: usize,
 ) -> usize {
     if incoming.get(&succ_bb_id).copied().unwrap_or(1) <= 1 {
         return bb_body_starts
@@ -1682,17 +1761,51 @@ fn edge_pad_for_target(
     if let Some(&pad) = edge_pads.get(&(pred_bb_id, succ_bb_id)) {
         return pad;
     }
-    let body = bb_body_starts
+    let body_start = bb_body_starts
         .get(&(succ_bb_id as usize))
         .copied()
         .expect("multi-pred BB must record body start");
     if block_plan.transition_for_edge(pred_bb_id, succ_bb_id).is_none() {
-        return body;
+        return body_start;
     }
+    let tx_id = block_plan
+        .transition_for_edge(pred_bb_id, succ_bb_id)
+        .expect("edge pad requires CFG transition");
+    // Include the full linear path from the succ body through this back-edge jmp.
+    // `jmp_placeholder` points at the 8-byte operand slot (see pending_jumps).
+    let body_end = jmp_placeholder + 8;
+    let fallthrough_tx = bb_fallthrough_tx
+        .get(&(succ_bb_id as usize))
+        .copied()
+        .or_else(|| {
+            block_plan
+                .entries
+                .iter()
+                .find(|e| e.bb_id == succ_bb_id)
+                .map(|e| e.tx_id)
+        })
+        .expect("multi-pred BB must record fallthrough transition id");
+    let from_map = block_plan.map_for_tx_or_base(fallthrough_tx, base_map);
+    let to_map = block_plan.map_for_tx_or_base(tx_id, base_map);
     let pad = bytecode.len();
     emit_transition_refresh(bytecode, block_plan, base_map, pred_bb_id, succ_bb_id);
-    bytecode.push(active_encode(OpCode::Jmp));
-    bytecode.extend_from_slice(&(body as u64).to_le_bytes());
+    let body_slice = bytecode[body_start..body_end].to_vec();
+    let mut duplicate = reencode_path_for_edge(
+        &body_slice,
+        block_plan,
+        base_map,
+        from_map,
+        to_map.clone(),
+    );
+    retarget_jmp_operands_to_pad(
+        &mut duplicate,
+        block_plan,
+        base_map,
+        to_map,
+        body_start,
+        pad,
+    );
+    bytecode.extend(duplicate);
     edge_pads.insert((pred_bb_id, succ_bb_id), pad);
     pad
 }
@@ -2154,6 +2267,10 @@ fn lift_to_vm_bytecode_internal_with_main(
         std::collections::HashMap::new();
     let mut bb_body_starts: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
+    let mut bb_body_ends: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut bb_fallthrough_tx: std::collections::HashMap<usize, u16> =
+        std::collections::HashMap::new();
 
     let mut hit_main_ret = false;
     let lift_indices = lift_order_indices(instrs, main_x64_offset);
@@ -2199,6 +2316,11 @@ fn lift_to_vm_bytecode_internal_with_main(
                         pred,
                         bb.id as u16,
                     );
+                    if let Some(tx_id) =
+                        block_plan.tx_id_for_transition(pred, bb.id as u16)
+                    {
+                        bb_fallthrough_tx.insert(bb.id, tx_id);
+                    }
                     bb_body_starts.insert(bb.id, bytecode.len());
                 } else {
                     if let Some(pred) = fallthrough_pred(bb, &main_blocks, instrs) {
@@ -2209,11 +2331,13 @@ fn lift_to_vm_bytecode_internal_with_main(
                             pred,
                             bb.id as u16,
                         );
+                        if let Some(tx_id) =
+                            block_plan.tx_id_for_transition(pred, bb.id as u16)
+                        {
+                            bb_fallthrough_tx.insert(bb.id, tx_id);
+                        }
                     }
                     bb_body_starts.insert(bb.id, bytecode.len());
-                }
-                if instr.offset == bb.start {
-                    label_map.insert(bb.start, bytecode.len());
                 }
                 emitted_block_map.insert(bb.id);
             }
@@ -2743,38 +2867,60 @@ fn lift_to_vm_bytecode_internal_with_main(
                 }
             }
         }
+
+        if instr.offset >= main_x64_offset {
+            if let Some(bb) = bb_for_offset(&main_blocks, instr.offset) {
+                if bb_body_starts.contains_key(&bb.id) {
+                    bb_body_ends.insert(bb.id, bytecode.len());
+                }
+            }
+        }
     }
 
+    let mut edge_jump_sites: Vec<(usize, u16, u16)> = Vec::new();
     for (placeholder_pos, target_x64_offset, is_unconditional, source_x64_offset) in pending_jumps {
-        let target_vm_offset = if is_unconditional {
-            resolve_unconditional_jump_target(instrs, &label_map, target_x64_offset)
+        let resolved_x64 = if is_unconditional {
+            retarget_unconditional_jmp_from_jcc(instrs, target_x64_offset)
         } else {
-            resolve_conditional_jump_target(instrs, &label_map, target_x64_offset)
+            retarget_conditional_jmp_from_mul(instrs, target_x64_offset)
         };
+        let target_vm_offset = resolve_jump_target(&label_map, resolved_x64);
         if let Some(mut target_vm_offset) = target_vm_offset {
             if !is_unconditional {
                 target_vm_offset = retarget_vm_jmpif_from_mul_to_move(target_vm_offset, &bytecode);
             }
             if let (Some(pred_bb), Some(succ_bb)) = (
                 bb_for_offset(&main_blocks, source_x64_offset).map(|b| b.id as u16),
-                bb_for_offset(&main_blocks, target_x64_offset).map(|b| b.id as u16),
+                bb_for_offset(&main_blocks, resolved_x64).map(|b| b.id as u16),
             ) {
                 if incoming.get(&succ_bb).copied().unwrap_or(1) > 1 {
-                    target_vm_offset = edge_pad_for_target(
-                        &mut bytecode,
-                        block_plan,
-                        opcode_map,
-                        &mut edge_pads,
-                        &bb_body_starts,
-                        &incoming,
-                        pred_bb,
-                        succ_bb,
-                    );
+                    edge_jump_sites.push((placeholder_pos, pred_bb, succ_bb));
+                    target_vm_offset = bb_body_starts
+                        .get(&(succ_bb as usize))
+                        .copied()
+                        .unwrap_or(target_vm_offset);
                 }
             }
             let target_bytes = (target_vm_offset as u64).to_le_bytes();
             bytecode[placeholder_pos..placeholder_pos + 8].copy_from_slice(&target_bytes);
         }
+    }
+
+    for (placeholder_pos, pred_bb, succ_bb) in edge_jump_sites {
+        let pad = edge_pad_for_target(
+            &mut bytecode,
+            block_plan,
+            opcode_map,
+            &mut edge_pads,
+            &bb_body_starts,
+            &bb_fallthrough_tx,
+            &incoming,
+            pred_bb,
+            succ_bb,
+            placeholder_pos,
+        );
+        bytecode[placeholder_pos..placeholder_pos + 8]
+            .copy_from_slice(&(pad as u64).to_le_bytes());
     }
 
     if has_putchar_callees {

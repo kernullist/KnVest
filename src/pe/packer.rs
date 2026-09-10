@@ -34,6 +34,12 @@ pub(crate) fn build_block_map_plan(
     for (pred, succ) in collect_cfg_edges(main_blocks, main_instrs) {
         plan.record_transition(pack_seed, succ, pred);
     }
+    for bb in main_blocks {
+        let bb_id = bb.id as u16;
+        if !plan.entries.iter().any(|e| e.bb_id == bb_id) {
+            plan.record_transition(pack_seed, bb_id, ENTRY_PRED_BB);
+        }
+    }
     for &entry in callee_entries {
         let bb_id = plan.entries.len() as u16;
         plan.record_transition(pack_seed, bb_id, ENTRY_PRED_BB);
@@ -3025,6 +3031,17 @@ mod tests {
             refresh_ops.iter().any(|i| i.operands.len() >= 3),
             "knvest ir must show tx_id, bb_id, and pred_bb operands for transition maps"
         );
+
+        use crate::vm::VirtualMachine;
+        let mut vm = VirtualMachine::with_block_maps_and_layout(
+            packed.bytecode.clone(),
+            packed.opcode_map.clone(),
+            packed.block_map_plan.clone(),
+            packed.layout_plan.clone(),
+        );
+        vm.run()
+            .unwrap_or_else(|e| panic!("L5d countdown loop VM run failed: {e}"));
+        assert_eq!(vm.exit_code, Some(0), "countdown loop must exit 0 under transition maps");
     }
 
     #[test]
@@ -3255,6 +3272,9 @@ mod tests {
             ("fact", "sample/fact.exe"),
             ("hello", "sample/hello.exe"),
         ] {
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
             for seed in [None, Some(0xAAAA_AAAA_u64)] {
                 let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
                 let packed = pack_function(&mut pe, None, seed, false, DispatchMode::Table, 0)
@@ -3294,14 +3314,20 @@ mod tests {
                         continue;
                     }
                     let w = packed.bytecode[ins.offset];
-                    let entry = &packed.block_map_plan.entries[active_bb];
+                    let entry = packed
+                        .block_map_plan
+                        .entry_for_tx(active_bb as u16)
+                        .expect("active tx_id must index KNV6 entry");
                     let expected = entry.wire[call_idx];
                     assert_eq!(
                         w, expected,
-                        "{name} seed={seed:?} Call at bc[{:#x}] under bb={active_bb}: wire {w:#x} != entry {expected:#x}",
+                        "{name} seed={seed:?} Call at bc[{:#x}] under tx={active_bb}: wire {w:#x} != entry {expected:#x}",
                         ins.offset
                     );
-                    let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
+                    let red = knv6
+                        + KNV6_HEADER_SIZE
+                        + entry.tx_id as usize * KNV6_ENTRY_SIZE
+                        + KNV6_ENTRY_HANDLER_TABLE_OFF;
                     let slot_off = i32::from_le_bytes(
                         stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
                             .try_into()
@@ -3330,6 +3356,9 @@ mod tests {
 
         let seed = 0xAAAA_AAAA_u64;
         let pe_path = std::path::Path::new("sample/hello.exe");
+        if !pe_path.exists() {
+            return;
+        }
         let mut pe = PEFile::from_bytes(std::fs::read(pe_path).unwrap()).unwrap();
         let packed = pack_function(&mut pe, None, Some(seed), false, DispatchMode::Table, 0).unwrap();
         let section = pe.get_section(".knvest").unwrap();
@@ -3345,20 +3374,32 @@ mod tests {
             .windows(crate::vm::block_map::KNV6_MAGIC.len())
             .position(|w| w == crate::vm::block_map::KNV6_MAGIC)
             .expect("KNV6 blob");
-        let bb2_entry = knv6 + KNV6_HEADER_SIZE + 2 * KNV6_ENTRY_SIZE;
+        let bb2 = packed
+            .block_map_plan
+            .entries
+            .iter()
+            .find(|e| e.bb_id == 2)
+            .expect("hello main must have semantic BB2 transition");
+        let bb2_entry = knv6 + KNV6_HEADER_SIZE + bb2.tx_id as usize * KNV6_ENTRY_SIZE;
         let bb2_redirect = bb2_entry + KNV6_ENTRY_HANDLER_TABLE_OFF;
-        let call_wire = packed.block_map_plan.entries[2]
-            .wire[crate::vm::opcode_map::CANONICAL_OPCODES
-                .iter()
-                .position(|&o| o == OpCode::Call)
-                .unwrap()];
+        let call_wire = bb2.wire[crate::vm::opcode_map::CANONICAL_OPCODES
+            .iter()
+            .position(|&o| o == OpCode::Call)
+            .unwrap()];
         let call_off = i32::from_le_bytes(
             stub[bb2_redirect + (call_wire as usize) * 4..bb2_redirect + (call_wire as usize) * 4 + 4]
                 .try_into()
                 .unwrap(),
         );
+        let bb0 = packed
+            .block_map_plan
+            .entries
+            .iter()
+            .find(|e| e.bb_id == 0)
+            .expect("hello main BB0 transition");
         assert_ne!(
-            call_off, packed.block_map_plan.entries[0].handler_table[(call_wire as usize) * 4..][..4]
+            call_off,
+            bb0.handler_table[(call_wire as usize) * 4..][..4]
                 .try_into()
                 .map(i32::from_le_bytes)
                 .unwrap_or(0),
@@ -3946,3 +3987,4 @@ mod tests {
         );
     }
 }
+

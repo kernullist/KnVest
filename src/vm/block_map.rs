@@ -115,6 +115,22 @@ impl BlockMapPlan {
             .map(|e| e.tx_id)
     }
 
+    /// Resolve the transition id to embed in META for `(pred_bb → bb_id)`.
+    /// Falls back to the first transition that enters `bb_id` when only the
+    /// semantic block is known (jmp-retarget landing pads).
+    pub fn tx_id_for_transition(&self, pred_bb_id: u16, bb_id: u16) -> Option<u16> {
+        self.transition_for_edge(pred_bb_id, bb_id).or_else(|| {
+            self.entries
+                .iter()
+                .find(|e| e.bb_id == bb_id)
+                .map(|e| e.tx_id)
+        })
+    }
+
+    pub fn entry_for_tx(&self, tx_id: u16) -> Option<&BlockMapEntry> {
+        self.entries.get(tx_id as usize).filter(|e| e.tx_id == tx_id)
+    }
+
     pub fn map_for_tx(&self, tx_id: u16) -> Option<&BlockMapEntry> {
         self.entries.iter().find(|e| e.tx_id == tx_id)
     }

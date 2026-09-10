@@ -191,6 +191,11 @@ impl VirtualMachine {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn program_counter(&self) -> usize {
+        self.pc
+    }
+
     pub fn step(&mut self) -> VMResult<()> {
         let opcode_byte = self.read_u8()?;
 

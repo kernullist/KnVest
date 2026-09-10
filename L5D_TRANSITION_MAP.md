@@ -48,9 +48,10 @@ table-mode `ret` restore.
 | per entry: wire[20] | 20 |
 | per entry: handler_table | 1024 |
 
-Multi-predecessor blocks use **edge landing pads** (`set_block_map` + `jmp` to
-shared body) so each incoming path installs its own transition map before
-executing shared bytecode.
+Multi-predecessor blocks use **edge landing pads** (`set_block_map` + a
+transition-reencoded copy of the linear path from the succ body through the
+back-edge jmp) so each incoming path executes with its own wire map. Fallthrough
+entry keeps the original lifted bytecode; jmp edges target the pad.
 
 ### IR (`knvest ir`)
 
