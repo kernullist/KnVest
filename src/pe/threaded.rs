@@ -1,5 +1,6 @@
 use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
 use crate::vm::dispatch::THREAD_TARGET_SIZE;
+use crate::vm::layout::BytecodeLayout;
 use crate::vm::opcode_map::OpcodeMap;
 use crate::vm::OpCode;
 
@@ -16,24 +17,37 @@ struct InsnLayout {
     raw_len: usize,
 }
 
-fn enumerate_instructions(bytecode: &[u8], base_map: &OpcodeMap, block_plan: &BlockMapPlan) -> Vec<InsnLayout> {
+fn enumerate_instructions(
+    bytecode: &[u8],
+    base_map: &OpcodeMap,
+    block_plan: &BlockMapPlan,
+    layout: &BytecodeLayout,
+    dispatch_mode: crate::vm::DispatchMode,
+) -> Vec<InsnLayout> {
     let mut out = Vec::new();
     let mut offset = 0;
     let mut current_bb: Option<u16> = None;
     while offset < bytecode.len() {
         let wire = bytecode[offset];
         if wire == META_WIRE_BYTE {
-            if offset + 1 + META_OPERAND_LEN > bytecode.len() {
+            let total = layout.insn_len(
+                OpCode::SetBlockMap,
+                META_OPERAND_LEN,
+                dispatch_mode,
+                true,
+            );
+            if offset + total > bytecode.len() {
                 break;
             }
-            let bb_id = u16::from_le_bytes([bytecode[offset + 1], bytecode[offset + 2]]);
+            let op_off = offset + layout.operands_offset_dispatch(OpCode::SetBlockMap, true, dispatch_mode);
+            let bb_id = u16::from_le_bytes([bytecode[op_off], bytecode[op_off + 1]]);
             current_bb = Some(bb_id);
             out.push(InsnLayout {
                 start: offset,
                 kind: InsnKind::SetBlockMap,
-                raw_len: 1 + META_OPERAND_LEN,
+                raw_len: total,
             });
-            offset += 1 + META_OPERAND_LEN;
+            offset += total;
             continue;
         }
         let map = current_bb
@@ -44,7 +58,7 @@ fn enumerate_instructions(bytecode: &[u8], base_map: &OpcodeMap, block_plan: &Bl
             None => break,
         };
         let operand_len = op.operand_len();
-        let raw_len = 1 + operand_len;
+        let raw_len = layout.insn_len(op, operand_len, dispatch_mode, false);
         if offset + raw_len > bytecode.len() {
             break;
         }
@@ -134,10 +148,17 @@ pub fn embed_thread_targets(
     bytecode: &[u8],
     opcode_map: &OpcodeMap,
     block_plan: &BlockMapPlan,
+    layout: &BytecodeLayout,
     handler_off_from_table: &dyn Fn(OpCode) -> i32,
     set_map_off: i32,
 ) -> Vec<u8> {
-    let insns = enumerate_instructions(bytecode, opcode_map, block_plan);
+    let insns = enumerate_instructions(
+        bytecode,
+        opcode_map,
+        block_plan,
+        layout,
+        crate::vm::DispatchMode::Table,
+    );
     let code_end = code_section_end(&insns);
     let relocate = |old: usize| relocate_offset(&insns, old);
 
@@ -151,13 +172,23 @@ pub fn embed_thread_targets(
         };
         out.push(bytecode[insn.start]);
         out.extend_from_slice(&handler_off.to_le_bytes());
+        let tail_start = insn.start + 1;
+        let tail_end = insn.start + insn.raw_len;
         if insn.kind == InsnKind::SetBlockMap {
-            out.extend_from_slice(&bytecode[insn.start + 1..insn.start + insn.raw_len]);
+            out.extend_from_slice(&bytecode[tail_start..tail_end]);
             continue;
         }
-        let mut operands = bytecode[insn.start + 1..insn.start + insn.raw_len].to_vec();
+        let op = match insn.kind {
+            InsnKind::Semantic(op) => op,
+            InsnKind::SetBlockMap => unreachable!(),
+        };
+        let op_off = insn.start + layout.operands_offset(op, false);
+        let operand_len = op.operand_len();
+        out.extend_from_slice(&bytecode[tail_start..op_off]);
+        let mut operands = bytecode[op_off..op_off + operand_len].to_vec();
         patch_operands_for_threaded(insn.kind, &mut operands, &insns, bytecode.len(), &relocate);
         out.extend_from_slice(&operands);
+        out.extend_from_slice(&bytecode[op_off + operand_len..tail_end]);
     }
     if code_end < bytecode.len() {
         out.extend_from_slice(&bytecode[code_end..]);
@@ -250,43 +281,40 @@ pub fn threaded_load_imm_immediates_with_blocks(
     opcode_map: &OpcodeMap,
     block_plan: Option<&BlockMapPlan>,
 ) -> Vec<usize> {
+    threaded_load_imm_immediates_with_blocks_layout(
+        bytecode,
+        opcode_map,
+        block_plan,
+        &BytecodeLayout::identity(),
+    )
+}
+
+pub fn threaded_load_imm_immediates_with_blocks_layout(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    layout: &BytecodeLayout,
+) -> Vec<usize> {
+    let plan = block_plan.cloned().unwrap_or_default();
+    let insns = enumerate_instructions(
+        bytecode,
+        opcode_map,
+        &plan,
+        layout,
+        crate::vm::DispatchMode::Threaded,
+    );
     let mut out = Vec::new();
-    let mut offset = 0;
-    let mut current_map = opcode_map.clone();
-    while offset < bytecode.len() {
-        if bytecode[offset] == META_WIRE_BYTE {
-            if offset + 1 + THREAD_TARGET_SIZE + META_OPERAND_LEN <= bytecode.len() {
-                let bb_id = u16::from_le_bytes([
-                    bytecode[offset + 1 + THREAD_TARGET_SIZE],
-                    bytecode[offset + 1 + THREAD_TARGET_SIZE + 1],
-                ]);
-                current_map = block_plan
-                    .map(|p| p.map_for_bb_or_base(bb_id, opcode_map))
-                    .unwrap_or_else(|| BlockMapPlan::block_opcode_map(opcode_map.seed(), bb_id as usize));
-                offset += 1 + THREAD_TARGET_SIZE + META_OPERAND_LEN;
-                continue;
-            }
-            break;
+    for insn in insns {
+        if insn.kind != InsnKind::Semantic(OpCode::LoadImm) {
+            continue;
         }
-        let wire = bytecode[offset];
-        let op = match current_map.decode(wire) {
-            Some(op) => op,
-            None => break,
-        };
-        let operand_len = op.operand_len();
-        let threaded_insn_len = 1 + THREAD_TARGET_SIZE + operand_len;
-        if offset + threaded_insn_len > bytecode.len() {
-            break;
-        }
-        if op == OpCode::LoadImm && operand_len >= 9 {
-            let imm = u64::from_le_bytes(
-                bytecode[offset + 1 + THREAD_TARGET_SIZE + 1..offset + 1 + THREAD_TARGET_SIZE + 9]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
+        let reg_off = insn.start
+            + layout.operands_offset_dispatch(OpCode::LoadImm, false, crate::vm::DispatchMode::Threaded);
+        let imm_off = reg_off + 1;
+        if imm_off + 8 <= bytecode.len() {
+            let imm = u64::from_le_bytes(bytecode[imm_off..imm_off + 8].try_into().unwrap()) as usize;
             out.push(imm);
         }
-        offset += threaded_insn_len;
     }
     out
 }
@@ -307,6 +335,17 @@ pub fn threaded_load_imm_points_at_with_blocks(
     target: usize,
 ) -> bool {
     threaded_load_imm_immediates_with_blocks(bytecode, opcode_map, block_plan).contains(&target)
+}
+
+pub fn threaded_load_imm_points_at_with_blocks_layout(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    layout: &BytecodeLayout,
+    target: usize,
+) -> bool {
+    threaded_load_imm_immediates_with_blocks_layout(bytecode, opcode_map, block_plan, layout)
+        .contains(&target)
 }
 
 /// Walk threaded bytecode and find a `load_imm` whose immediate points at `needle`.
@@ -351,12 +390,32 @@ pub fn threaded_string_pool_link_with_blocks(
     block_plan: Option<&BlockMapPlan>,
     needle: &[u8],
 ) -> Option<(usize, usize)> {
+    threaded_string_pool_link_with_blocks_layout(
+        bytecode,
+        opcode_map,
+        block_plan,
+        &BytecodeLayout::identity(),
+        needle,
+    )
+}
+
+pub fn threaded_string_pool_link_with_blocks_layout(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    layout: &BytecodeLayout,
+    needle: &[u8],
+) -> Option<(usize, usize)> {
     let str_off = bytecode_prefix_offset(bytecode, needle)?;
-    if threaded_load_imm_points_at_with_blocks(bytecode, opcode_map, block_plan, str_off) {
+    if threaded_load_imm_points_at_with_blocks_layout(bytecode, opcode_map, block_plan, layout, str_off) {
         return Some((str_off, str_off));
     }
-    threaded_load_imm_target_with_blocks(bytecode, opcode_map, block_plan, needle)
-        .map(|imm| (str_off, imm))
+    for imm in threaded_load_imm_immediates_with_blocks_layout(bytecode, opcode_map, block_plan, layout) {
+        if bytecode_starts_with_at(bytecode, imm, needle) {
+            return Some((str_off, imm));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -366,14 +425,22 @@ mod tests {
     use crate::vm::{BlockMapPlan, DispatchMode};
 
     fn stub_for(map: &OpcodeMap) -> Vec<u8> {
-        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, &[], &BlockMapPlan::default(), &[], &[])
+        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[])
             .0
     }
 
     fn embed(map: &OpcodeMap, stub: &[u8], raw: &[u8]) -> Vec<u8> {
         let plan = BlockMapPlan::default();
+        let layout = BytecodeLayout::identity();
         let set_map = handler_offset_for_set_block_map(stub);
-        embed_thread_targets(raw, map, &plan, &|op| handler_offset_for_op(stub, map, op), set_map)
+        embed_thread_targets(
+            raw,
+            map,
+            &plan,
+            &layout,
+            &|op| handler_offset_for_op(stub, map, op),
+            set_map,
+        )
     }
 
     #[test]

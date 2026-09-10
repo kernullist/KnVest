@@ -1,4 +1,5 @@
 pub mod block_map;
+pub mod layout;
 pub mod opcode;
 pub mod opcode_map;
 pub mod machine;
@@ -21,4 +22,5 @@ pub use virt_isa::{
     format_ir_header as virt_isa_ir_header, emit_sub_reg_reg, seed_for_handler_variant,
     seed_for_sub_split, sub_lift_split_enabled, VIRT_ISA_SPLIT_TEMP,
 };
+pub use layout::{BytecodeLayout, KNV7_MAGIC, KNV7_HEADER_SIZE};
 pub use machine::{VirtualMachine, VMError, VMResult};

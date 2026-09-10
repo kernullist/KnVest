@@ -1,6 +1,7 @@
 use super::opcode::OpCode;
 use super::opcode_map::OpcodeMap;
 use super::block_map::{BlockMapPlan, META_WIRE_BYTE};
+use super::layout::BytecodeLayout;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -40,6 +41,7 @@ pub struct VirtualMachine {
     bytecode: Vec<u8>,
     opcode_map: Option<OpcodeMap>,
     block_map_plan: Option<BlockMapPlan>,
+    layout: BytecodeLayout,
     /// Active L4e basic-block id (updated on META set_block_map).
     current_bb_id: u16,
     native_functions: HashMap<u64, fn(&mut VirtualMachine) -> VMResult<()>>,
@@ -59,6 +61,7 @@ impl VirtualMachine {
             bytecode,
             opcode_map: None,
             block_map_plan: None,
+            layout: BytecodeLayout::identity(),
             current_bb_id: 0,
             native_functions: HashMap::new(),
             exit_code: None,
@@ -77,8 +80,23 @@ impl VirtualMachine {
         opcode_map: OpcodeMap,
         block_map_plan: BlockMapPlan,
     ) -> Self {
+        Self::with_block_maps_and_layout(
+            bytecode,
+            opcode_map,
+            block_map_plan,
+            BytecodeLayout::identity(),
+        )
+    }
+
+    pub fn with_block_maps_and_layout(
+        bytecode: Vec<u8>,
+        opcode_map: OpcodeMap,
+        block_map_plan: BlockMapPlan,
+        layout: BytecodeLayout,
+    ) -> Self {
         let mut vm = Self::with_opcode_map(bytecode, opcode_map);
         vm.block_map_plan = Some(block_map_plan);
+        vm.layout = layout;
         vm
     }
 
@@ -143,6 +161,20 @@ impl VirtualMachine {
         self.stack.pop().ok_or(VMError::StackUnderflow)
     }
 
+    fn skip_layout_pad_meta(&mut self) -> VMResult<()> {
+        for _ in 0..self.layout.meta_post_wire_pad {
+            self.read_u8()?;
+        }
+        Ok(())
+    }
+
+    fn skip_layout_pad_semantic(&mut self, op: OpCode) -> VMResult<()> {
+        for _ in 0..self.layout.post_wire_pad_for(op) {
+            self.read_u8()?;
+        }
+        Ok(())
+    }
+
     fn read_u16(&mut self) -> VMResult<u16> {
         if self.pc + 2 > self.bytecode.len() {
             return Err(VMError::PCOutOfBounds);
@@ -168,6 +200,7 @@ impl VirtualMachine {
                 .as_ref()
                 .ok_or(VMError::InvalidOpcode(opcode_byte))?
                 .seed();
+            self.skip_layout_pad_meta()?;
             let bb_id = self.read_u16()?;
             let new_map = if let Some(plan) = &self.block_map_plan {
                 plan.map_for_bb_or_base(bb_id, self.opcode_map.as_ref().unwrap())
@@ -185,6 +218,8 @@ impl VirtualMachine {
         } else {
             OpCode::from_u8(opcode_byte).ok_or(VMError::InvalidOpcode(opcode_byte))?
         };
+
+        self.skip_layout_pad_semantic(opcode)?;
 
         match opcode {
             OpCode::Nop => {},

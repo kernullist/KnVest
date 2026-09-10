@@ -7,7 +7,7 @@ pub use pe::test_pe;
 pub use vm::{OpCode, OpcodeMap, DispatchMode, PackMetadata};
 pub use pe::{PEFile, packer};
 pub use pe::partial::{PartialVirtPlan, KNV5_MAGIC};
-pub use vm::{BlockMapPlan, KNV6_MAGIC, META_WIRE_BYTE};
+pub use vm::{BlockMapPlan, BytecodeLayout, KNV6_MAGIC, KNV7_MAGIC, META_WIRE_BYTE};
 pub use ir::Instruction;
 
 pub fn pack_executable<P: AsRef<std::path::Path>, Q: AsRef<std::path::Path>>(
@@ -47,6 +47,16 @@ pub fn disassemble_with_block_maps(
     Instruction::disassemble_with_block_maps(bytecode, opcode_map, block_plan, dispatch_mode)
 }
 
+pub fn disassemble_with_layout(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    block_plan: Option<&BlockMapPlan>,
+    dispatch_mode: DispatchMode,
+    layout: &BytecodeLayout,
+) -> Vec<Instruction> {
+    Instruction::disassemble_with_layout(bytecode, opcode_map, block_plan, dispatch_mode, layout)
+}
+
 pub fn pretty_print(instructions: &[Instruction]) -> String {
     Instruction::pretty_print(instructions)
 }
@@ -57,4 +67,8 @@ pub fn pretty_print_with_mba(instructions: &[Instruction], mba_level: u8) -> Str
 
 pub fn extract_partial_plan(pe: &PEFile) -> Result<PartialVirtPlan, pe::PEError> {
     packer::extract_partial_plan_from_packed(pe)
+}
+
+pub fn extract_layout_plan(pe: &PEFile) -> Result<BytecodeLayout, pe::PEError> {
+    packer::extract_layout_from_packed(pe)
 }
