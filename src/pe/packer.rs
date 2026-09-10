@@ -5,7 +5,10 @@ use super::lifter::{
 use super::vm_stub::create_vm_interpreter_stub;
 use super::layout_pass::apply_layout_diversification;
 use super::threaded::{self, embed_thread_targets};
-use super::cfg::{collect_cfg_entries, disassemble_cfg_function, build_basic_blocks};
+use super::cfg::{
+    collect_cfg_edges, collect_cfg_entries, disassemble_cfg_function, build_basic_blocks,
+};
+use crate::vm::block_map::ENTRY_PRED_BB;
 use super::partial::{NativeSledBuilder, PartialVirtPlan, KNV5_MAGIC};
 use crate::vm::{
     BlockMapPlan, BytecodeLayout, DispatchMode, OpcodeMap, PackMetadata, random_seed, set_active_map,
@@ -16,6 +19,28 @@ use crate::vm::opcode_map::KNV4_MAGIC;
 
 const SECTION_ALIGNMENT: u32 = 0x1000;
 const FILE_ALIGNMENT: u32 = 0x200;
+
+pub(crate) fn build_block_map_plan(
+    pack_seed: u64,
+    main_blocks: &[super::cfg::BasicBlock],
+    main_instrs: &[super::lifter::X64Instruction],
+    callee_entries: &[usize],
+) -> BlockMapPlan {
+    let mut plan = BlockMapPlan {
+        decode_key: BlockMapPlan::global_decode_key(pack_seed),
+        entries: Vec::new(),
+        ..Default::default()
+    };
+    for (pred, succ) in collect_cfg_edges(main_blocks, main_instrs) {
+        plan.record_transition(pack_seed, succ, pred);
+    }
+    for &entry in callee_entries {
+        let bb_id = plan.entries.len() as u16;
+        plan.record_transition(pack_seed, bb_id, ENTRY_PRED_BB);
+        plan.callee_entry_bb_ids.insert(entry, bb_id);
+    }
+    plan
+}
 
 pub struct PackResult {
     pub bytecode: Vec<u8>,
@@ -172,7 +197,7 @@ fn build_section_bytecode(
     })
 }
 
-/// Every L4e META refresh operand must index a KNV6 entry (bb_id is dense 0..N-1).
+/// Every L5d META refresh operand must reference a valid KNV6 transition id.
 fn validate_meta_bb_ids_in_bytecode(
     bytecode: &[u8],
     block_map_plan: &BlockMapPlan,
@@ -197,18 +222,10 @@ fn validate_meta_bb_ids_in_bytecode(
             continue;
         }
         let op_off = insn.start + layout.operands_offset(OpCode::SetBlockMap, true);
-        let bb_id = u16::from_le_bytes([bytecode[op_off], bytecode[op_off + 1]]) as usize;
-        if bb_id >= block_map_plan.entries.len() {
-            panic!(
-                "bytecode META at offset {:#x} references bb_id={bb_id} but KNV6 has {} entries",
-                insn.start,
-                block_map_plan.entries.len()
-            );
-        }
-        assert_eq!(
-            block_map_plan.entries[bb_id].bb_id as usize,
-            bb_id,
-            "KNV6 entry index must match bb_id for direct lookup (META at {:#x})",
+        let tx_id = u16::from_le_bytes([bytecode[op_off], bytecode[op_off + 1]]);
+        assert!(
+            block_map_plan.map_for_tx(tx_id).is_some(),
+            "bytecode META at offset {:#x} references unknown tx_id={tx_id}",
             insn.start
         );
     }
@@ -247,12 +264,12 @@ fn validate_call_redirect_wires_in_bytecode(
         .position(|w| w == KNV6_MAGIC)
         .expect("KNV6 blob missing for call-wire validation");
     let h_call = collect_handler_redirect_plan(stub, opcode_map).offset_for(OpCode::Call);
-    let mut active_bb = 0usize;
+    let mut active_tx = 0usize;
     for ins in &insns {
         if ins.opcode == OpCode::SetBlockMap {
-            active_bb = match ins.operands.first() {
+            active_tx = match ins.operands.first() {
                 Some(crate::ir::Operand::Immediate(v)) => *v as usize,
-                _ => panic!("set_block_map missing bb_id during call-wire validation"),
+                _ => panic!("set_block_map missing tx_id during call-wire validation"),
             };
             continue;
         }
@@ -260,14 +277,14 @@ fn validate_call_redirect_wires_in_bytecode(
             continue;
         }
         let w = bytecode[ins.offset];
-        let entry = &block_map_plan.entries[active_bb];
+        let entry = &block_map_plan.entries[active_tx];
         let expected = entry.wire[call_idx];
         assert_eq!(
             w, expected,
-            "Call at bc[{:#x}] under bb={active_bb}: wire {w:#x} != entry {expected:#x}",
+            "Call at bc[{:#x}] under tx={active_tx}: wire {w:#x} != entry {expected:#x}",
             ins.offset
         );
-        let red = knv6 + KNV6_HEADER_SIZE + active_bb * KNV6_ENTRY_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
+        let red = knv6 + KNV6_HEADER_SIZE + active_tx * KNV6_ENTRY_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
         let slot_off = i32::from_le_bytes(
             stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
                 .try_into()
@@ -281,7 +298,7 @@ fn validate_call_redirect_wires_in_bytecode(
             .unwrap_or(false);
         assert!(
             lands_on_call,
-            "bb={active_bb} Call wire {w:#x} at bc[{:#x}] must map to h_call (off {slot_off:#x}, want {h_call:#x})",
+            "tx={active_tx} Call wire {w:#x} at bc[{:#x}] must map to h_call (off {slot_off:#x}, want {h_call:#x})",
             ins.offset
         );
     }
@@ -713,19 +730,17 @@ fn translate_to_vm_bytecode(
         partial_enabled,
         &all_instrs,
     )?;
-    let mut block_map_plan = BlockMapPlan {
-        decode_key: BlockMapPlan::global_decode_key(pack_seed),
-        entries: Vec::new(),
-        ..Default::default()
-    };
-    for bb in &main_blocks {
-        block_map_plan.record_block(pack_seed, bb.id);
-    }
-    for &entry in &cfg_entries {
-        if entry < file_offset {
-            block_map_plan.record_callee_entry(pack_seed, entry);
-        }
-    }
+    let callee_entries: Vec<usize> = cfg_entries
+        .iter()
+        .copied()
+        .filter(|&entry| entry < file_offset)
+        .collect();
+    let block_map_plan = build_block_map_plan(
+        pack_seed,
+        &main_blocks,
+        &all_instrs,
+        &callee_entries,
+    );
     let mut sled_builder = NativeSledBuilder::new();
 
     set_active_map(opcode_map);
@@ -1407,8 +1422,8 @@ mod tests {
                 let meta_off = offset
                     + layout.operands_offset(OpCode::SetBlockMap, true);
                 if meta_off + 2 <= bc.len() {
-                    let bb_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
-                    current_map = plan.map_for_bb_or_base(bb_id, base_map);
+                    let tx_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
+                    current_map = plan.map_for_tx_or_base(tx_id, base_map);
                     offset += layout.table_meta_len();
                     continue;
                 }
@@ -1446,8 +1461,8 @@ mod tests {
                 let meta_off = offset
                     + layout.operands_offset(OpCode::SetBlockMap, true);
                 if meta_off + 2 <= bc.len() {
-                    let bb_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
-                    current_map = plan.map_for_bb_or_base(bb_id, base_map);
+                    let tx_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
+                    current_map = plan.map_for_tx_or_base(tx_id, base_map);
                     offset += layout.table_meta_len();
                     continue;
                 }
@@ -2973,6 +2988,42 @@ mod tests {
             map0.encode(OpCode::LoadImm),
             map1.encode(OpCode::LoadImm),
             "same semantic load_imm must encode to different wire bytes in different blocks"
+        );
+    }
+
+    #[test]
+    fn test_l5d_same_bb_distinct_transition_map_hashes() {
+        use std::collections::HashMap;
+
+        let pe_data = test_pe::create_pe64_with_countdown_loop();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let text = pe.get_section(".text").unwrap();
+        let main_rva = text.virtual_address + 0x20;
+        let packed = pack_pe_seed(&mut pe, Some(main_rva), 0x15D0_2026);
+        let mut by_bb: HashMap<u16, Vec<u64>> = HashMap::new();
+        for entry in &packed.block_map_plan.entries {
+            by_bb
+                .entry(entry.bb_id)
+                .or_default()
+                .push(BlockMapPlan::wire_map_hash(entry));
+        }
+        let loop_head = by_bb
+            .iter()
+            .find(|(_, hashes)| hashes.len() >= 2 && hashes[0] != hashes[1])
+            .expect("countdown loop must expose multiple transitions into one semantic BB");
+        assert!(
+            loop_head.1.windows(2).any(|w| w[0] != w[1]),
+            "path-dependent transitions into BB{} must differ in wire map hash",
+            loop_head.0
+        );
+        let insns = disasm_packed(&packed);
+        let refresh_ops = insns
+            .iter()
+            .filter(|i| i.opcode == OpCode::SetBlockMap)
+            .collect::<Vec<_>>();
+        assert!(
+            refresh_ops.iter().any(|i| i.operands.len() >= 3),
+            "knvest ir must show tx_id, bb_id, and pred_bb operands for transition maps"
         );
     }
 
