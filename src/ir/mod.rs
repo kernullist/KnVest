@@ -320,6 +320,36 @@ fn mba_note_and_or_xor(a: u8, b: u8, dst: u8) -> String {
     format!("and r{dst}, r{a}, r{b}  ==  (r{a}+r{b}-(r{a}&r{b}))-(r{a}^r{b})")
 }
 
+fn alu_src_pair(ins: &Instruction) -> Option<(u8, u8)> {
+    let a = reg_at(&ins.operands, 1)?;
+    let b = reg_at(&ins.operands, 2)?;
+    Some((a, b))
+}
+
+fn same_src_pair(a: &Instruction, b: &Instruction) -> Option<(u8, u8)> {
+    let (a1, a2) = alu_src_pair(a)?;
+    let (b1, b2) = alu_src_pair(b)?;
+    if a1 == b1 && a2 == b2 {
+        Some((a1, a2))
+    } else {
+        None
+    }
+}
+
+fn triple_add(ins: &Instruction) -> Option<u8> {
+    if ins.opcode != OpCode::Add {
+        return None;
+    }
+    let dst = reg_at(&ins.operands, 0)?;
+    let s1 = reg_at(&ins.operands, 1)?;
+    let s2 = reg_at(&ins.operands, 2)?;
+    if dst == s1 && s1 == s2 {
+        Some(dst)
+    } else {
+        None
+    }
+}
+
 /// Detect MBA catalog expansions in lifted bytecode.
 fn find_mba_substitution_starts(
     instructions: &[Instruction],
@@ -332,66 +362,106 @@ fn find_mba_substitution_starts(
         if out.contains_key(&i) {
             continue;
         }
-        let z = &instructions[i];
-        let n = &instructions[i + 1];
-        let f = &instructions[i + 2];
 
-        // L4f/L5b add via neg: load_imm r14,0 ; sub r15,r14,b ; sub dst,a,r15
-        if z.opcode == OpCode::LoadImm
-            && n.opcode == OpCode::Sub
-            && f.opcode == OpCode::Sub
-            && reg_at(&z.operands, 0) == Some(MBA_TEMP_ZERO)
-            && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
-            && reg_at(&n.operands, 0) == Some(MBA_TEMP_NEG)
-            && reg_at(&n.operands, 1) == Some(MBA_TEMP_ZERO)
-        {
-            let Some(b) = reg_at(&n.operands, 2) else { continue };
-            let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
-            let Some(a) = reg_at(&f.operands, 1) else { continue };
-            if reg_at(&f.operands, 2) == Some(MBA_TEMP_NEG) {
-                out.insert(i, mba_note_add_neg(a, b, final_dst));
-                continue;
+        // add via neg: load_imm t0,0 ; sub t1,t0,b ; sub dst,a,t1
+        if i + 2 < instructions.len() {
+            let z = &instructions[i];
+            let n = &instructions[i + 1];
+            let f = &instructions[i + 2];
+            if z.opcode == OpCode::LoadImm
+                && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
+                && n.opcode == OpCode::Sub
+                && f.opcode == OpCode::Sub
+            {
+                let Some(zero) = reg_at(&z.operands, 0) else { continue };
+                let Some(neg) = reg_at(&n.operands, 0) else { continue };
+                let Some(zero2) = reg_at(&n.operands, 1) else { continue };
+                let Some(b) = reg_at(&n.operands, 2) else { continue };
+                let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
+                let Some(a) = reg_at(&f.operands, 1) else { continue };
+                let Some(neg2) = reg_at(&f.operands, 2) else { continue };
+                if zero == zero2 && neg == neg2 {
+                    out.insert(i, mba_note_add_neg(a, b, final_dst));
+                    continue;
+                }
             }
         }
 
-        // L5b sub via neg: load_imm r14,0 ; sub r15,r14,b ; add dst,a,r15
-        if z.opcode == OpCode::LoadImm
-            && n.opcode == OpCode::Sub
-            && f.opcode == OpCode::Add
-            && reg_at(&z.operands, 0) == Some(MBA_TEMP_ZERO)
-            && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
-            && reg_at(&n.operands, 0) == Some(MBA_TEMP_NEG)
-            && reg_at(&n.operands, 1) == Some(MBA_TEMP_ZERO)
-        {
-            let Some(b) = reg_at(&n.operands, 2) else { continue };
-            let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
-            let Some(a) = reg_at(&f.operands, 1) else { continue };
-            if reg_at(&f.operands, 2) == Some(MBA_TEMP_NEG) {
-                out.insert(i, mba_note_sub_neg(a, b, final_dst));
-                continue;
+        // sub via neg: load_imm t0,0 ; sub t1,t0,b ; add dst,a,t1
+        if i + 2 < instructions.len() {
+            let z = &instructions[i];
+            let n = &instructions[i + 1];
+            let f = &instructions[i + 2];
+            if z.opcode == OpCode::LoadImm
+                && matches!(z.operands.get(1), Some(Operand::Immediate(0)))
+                && n.opcode == OpCode::Sub
+                && f.opcode == OpCode::Add
+            {
+                let Some(zero) = reg_at(&z.operands, 0) else { continue };
+                let Some(neg) = reg_at(&n.operands, 0) else { continue };
+                let Some(zero2) = reg_at(&n.operands, 1) else { continue };
+                let Some(b) = reg_at(&n.operands, 2) else { continue };
+                let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
+                let Some(a) = reg_at(&f.operands, 1) else { continue };
+                let Some(neg2) = reg_at(&f.operands, 2) else { continue };
+                if zero == zero2 && neg == neg2 {
+                    out.insert(i, mba_note_sub_neg(a, b, final_dst));
+                    continue;
+                }
             }
         }
 
-        // L5b add via xor/and: xor t0,a,b ; and t1,a,b ; ...
-        if z.opcode == OpCode::Xor
-            && n.opcode == OpCode::And
-            && reg_at(&z.operands, 0) == Some(MBA_TEMP_T0)
-            && reg_at(&n.operands, 0) == Some(MBA_TEMP_T1)
-        {
-            let Some(a) = reg_at(&z.operands, 1) else { continue };
-            let Some(b) = reg_at(&z.operands, 2) else { continue };
-            if reg_at(&n.operands, 1) == Some(a) && reg_at(&n.operands, 2) == Some(b) {
-                if i + 3 < instructions.len() {
-                    let dbl = &instructions[i + 2];
-                    let fin = &instructions[i + 3];
-                    if dbl.opcode == OpCode::Add
-                        && fin.opcode == OpCode::Add
-                        && reg_at(&dbl.operands, 0) == Some(MBA_TEMP_T1)
-                        && reg_at(&dbl.operands, 1) == Some(MBA_TEMP_T1)
-                        && reg_at(&dbl.operands, 2) == Some(MBA_TEMP_T1)
-                    {
+        // add via xor/and: [move ta,a][move tb,b] xor ; and ; add t,t,t ; add dst,...
+        for start in i..=i.saturating_add(2).min(instructions.len().saturating_sub(4)) {
+            let mut off = start;
+            let mut orig_a = None;
+            let mut orig_b = None;
+            if instructions[off].opcode == OpCode::Move {
+                orig_a = reg_at(&instructions[off].operands, 1);
+                off += 1;
+            }
+            if off < instructions.len() && instructions[off].opcode == OpCode::Move {
+                orig_b = reg_at(&instructions[off].operands, 1);
+                off += 1;
+            }
+            if off + 3 >= instructions.len() {
+                continue;
+            }
+            let x = &instructions[off];
+            let n = &instructions[off + 1];
+            let dbl = &instructions[off + 2];
+            let fin = &instructions[off + 3];
+            if x.opcode != OpCode::Xor || n.opcode != OpCode::And || fin.opcode != OpCode::Add {
+                continue;
+            }
+            let Some((ta, tb)) = same_src_pair(x, n) else { continue };
+            if triple_add(dbl) != reg_at(&n.operands, 0) {
+                continue;
+            }
+            let Some(dst) = reg_at(&fin.operands, 0) else { continue };
+            let Some(xdst) = reg_at(&x.operands, 0) else { continue };
+            let Some(ndst) = reg_at(&fin.operands, 2) else { continue };
+            if reg_at(&fin.operands, 1) != Some(xdst) || reg_at(&n.operands, 0) != Some(ndst) {
+                continue;
+            }
+            let a = orig_a.unwrap_or(ta);
+            let b = orig_b.unwrap_or(tb);
+            out.insert(start, mba_note_add_xor_and(a, b, dst));
+            break;
+        }
+
+        // xor via add/and: [moves] and ; add t,t,t ; add sum ; sub dst,sum,t
+        if i + 3 < instructions.len() {
+            let z = &instructions[i];
+            let n = &instructions[i + 1];
+            if z.opcode == OpCode::And && triple_add(n) == reg_at(&z.operands, 0) {
+                let sum = &instructions[i + 2];
+                let fin = &instructions[i + 3];
+                if sum.opcode == OpCode::Add && fin.opcode == OpCode::Sub {
+                    let Some((a, b)) = alu_src_pair(&z) else { continue };
+                    if alu_src_pair(sum) == Some((a, b)) {
                         if let Some(dst) = reg_at(&fin.operands, 0) {
-                            out.insert(i, mba_note_add_xor_and(a, b, dst));
+                            out.insert(i, mba_note_xor_add_and(a, b, dst));
                             continue;
                         }
                     }
@@ -399,59 +469,34 @@ fn find_mba_substitution_starts(
             }
         }
 
-        // L5b xor via add/and: and t0,a,b ; add t0,t0,t0 ; add t1,a,b ; sub dst,t1,t0
-        if z.opcode == OpCode::And
-            && n.opcode == OpCode::Add
-            && reg_at(&z.operands, 0) == Some(MBA_TEMP_T0)
-        {
-            let Some(a) = reg_at(&z.operands, 1) else { continue };
-            let Some(b) = reg_at(&z.operands, 2) else { continue };
-            if reg_at(&n.operands, 0) == Some(MBA_TEMP_T0)
-                && reg_at(&n.operands, 1) == Some(MBA_TEMP_T0)
-                && reg_at(&n.operands, 2) == Some(MBA_TEMP_T0)
-                && i + 3 < instructions.len()
-            {
-                let sum = &instructions[i + 2];
-                let fin = &instructions[i + 3];
-                if sum.opcode == OpCode::Add
-                    && fin.opcode == OpCode::Sub
-                    && reg_at(&sum.operands, 1) == Some(a)
-                    && reg_at(&sum.operands, 2) == Some(b)
-                {
-                    if let Some(dst) = reg_at(&fin.operands, 0) {
-                        out.insert(i, mba_note_xor_add_and(a, b, dst));
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // L5b and via or/xor: and t0,a,b ; add t1,a,b ; sub t1,t1,t0 ; xor t0,a,b ; sub dst,t1,t0
-        if z.opcode == OpCode::And
-            && n.opcode == OpCode::Add
-            && reg_at(&z.operands, 0) == Some(MBA_TEMP_T0)
-            && i + 4 < instructions.len()
-        {
-            let Some(a) = reg_at(&z.operands, 1) else { continue };
-            let Some(b) = reg_at(&z.operands, 2) else { continue };
+        // and via or/xor: [moves] and ; add ; sub ; xor ; sub dst
+        if i + 4 < instructions.len() {
+            let z = &instructions[i];
             let sum = &instructions[i + 1];
             let sub1 = &instructions[i + 2];
             let x = &instructions[i + 3];
             let fin = &instructions[i + 4];
-            if sum.opcode == OpCode::Add
+            if z.opcode == OpCode::And
+                && sum.opcode == OpCode::Add
                 && sub1.opcode == OpCode::Sub
                 && x.opcode == OpCode::Xor
                 && fin.opcode == OpCode::Sub
-                && reg_at(&sum.operands, 0) == Some(MBA_TEMP_T1)
-                && reg_at(&sum.operands, 1) == Some(a)
-                && reg_at(&sum.operands, 2) == Some(b)
-                && reg_at(&sub1.operands, 0) == Some(MBA_TEMP_T1)
-                && reg_at(&sub1.operands, 1) == Some(MBA_TEMP_T1)
-                && reg_at(&sub1.operands, 2) == Some(MBA_TEMP_T0)
-                && reg_at(&x.operands, 0) == Some(MBA_TEMP_T0)
-                && reg_at(&x.operands, 1) == Some(a)
-                && reg_at(&x.operands, 2) == Some(b)
             {
+                let Some((a, b)) = alu_src_pair(&z) else { continue };
+                let Some(t0) = reg_at(&z.operands, 0) else { continue };
+                let Some(t1) = reg_at(&sum.operands, 0) else { continue };
+                if alu_src_pair(sum) != Some((a, b)) {
+                    continue;
+                }
+                if reg_at(&sub1.operands, 0) != Some(t1)
+                    || reg_at(&sub1.operands, 1) != Some(t1)
+                    || reg_at(&sub1.operands, 2) != Some(t0)
+                {
+                    continue;
+                }
+                if alu_src_pair(&x) != Some((a, b)) || reg_at(&x.operands, 0) != Some(t0) {
+                    continue;
+                }
                 if let Some(dst) = reg_at(&fin.operands, 0) {
                     out.insert(i, mba_note_and_or_xor(a, b, dst));
                 }
