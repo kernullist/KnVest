@@ -73,6 +73,11 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
     if pack_meta.mba_enabled {
         print!("{}", crate::pe::mba::format_ir_header(true));
     }
+
+    print!(
+        "{}",
+        crate::vm::virt_isa::format_ir_header(&opcode_map, dispatch_mode)
+    );
     
     let instructions = ir::Instruction::disassemble_with_block_maps(
         &bytecode,

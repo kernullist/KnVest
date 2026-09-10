@@ -6,14 +6,17 @@ pub const KNV4_MAGIC: &[u8; 4] = b"KNV4";
 pub const KNV4_VERSION_V1: u8 = 1;
 pub const KNV4_VERSION: u8 = 2;
 pub const KNV4_VERSION_V3: u8 = 3;
-pub const CANONICAL_OPCODE_COUNT: usize = 20;
+pub const CANONICAL_OPCODE_COUNT: usize = 21;
 pub const KNV4_HEADER_SIZE_V1: usize = 4 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_HEADER_SIZE_V3: usize = 4 + 1 + 1 + 1 + 8 + CANONICAL_OPCODE_COUNT;
 pub const KNV4_MBA_FLAG_ENABLED: u8 = 0x01;
 
-/// Handler polymorphism (L4b): number of native bodies per logical opcode.
+/// Handler polymorphism (L4b/L5a): number of native bodies per logical opcode.
 pub const ADD_HANDLER_VARIANT_COUNT: u8 = 3;
+pub const SUB_HANDLER_VARIANT_COUNT: u8 = 2;
+pub const XOR_HANDLER_VARIANT_COUNT: u8 = 2;
+pub const AND_HANDLER_VARIANT_COUNT: u8 = 2;
 const HANDLER_VARIANT_SALT: u64 = 0x504F_4C59; // "POLY"
 
 /// Logical opcodes implemented by the in-process stub (stable index order).
@@ -35,6 +38,7 @@ pub const CANONICAL_OPCODES: [OpCode; CANONICAL_OPCODE_COUNT] = [
     OpCode::LoadByte,
     OpCode::Cmp32,
     OpCode::And,
+    OpCode::Xor,
     OpCode::RunNative,
     OpCode::BailNative,
     OpCode::Exit,
@@ -59,6 +63,7 @@ pub const CANONICAL_HANDLER_LABELS: [&str; CANONICAL_OPCODE_COUNT] = [
     "h_load_byte",
     "h_cmp32",
     "h_and",
+    "h_xor",
     "h_run_native",
     "h_bail_native",
     "h_exit",
@@ -317,6 +322,9 @@ fn handler_label_for(op: OpCode) -> &'static str {
 pub fn handler_variant_count(op: OpCode) -> u8 {
     match op {
         OpCode::Add => ADD_HANDLER_VARIANT_COUNT,
+        OpCode::Sub => SUB_HANDLER_VARIANT_COUNT,
+        OpCode::Xor => XOR_HANDLER_VARIANT_COUNT,
+        OpCode::And => AND_HANDLER_VARIANT_COUNT,
         _ => 1,
     }
 }
@@ -478,11 +486,14 @@ mod tests {
     }
 
     #[test]
-    fn non_polymorphic_ops_always_variant_zero() {
+    fn polymorphic_ops_have_bounded_variants() {
         let map = OpcodeMap::from_seed(0x1234);
         for &op in &CANONICAL_OPCODES {
-            if op != OpCode::Add {
-                assert_eq!(map.handler_variant(op), 0);
+            let count = handler_variant_count(op);
+            if count > 1 {
+                assert!(map.handler_variant(op) < count, "{}", op.name());
+            } else {
+                assert_eq!(map.handler_variant(op), 0, "{}", op.name());
             }
         }
     }

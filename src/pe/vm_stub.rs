@@ -1,7 +1,7 @@
 use crate::vm::dispatch::DispatchMode;
 use crate::vm::block_map::{
-    BlockMapPlan, HandlerRedirectPlan, HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_SIZE,
-    KNV6_HEADER_SIZE, META_WIRE_BYTE,
+    BlockMapPlan, HandlerRedirectPlan, HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_HANDLER_TABLE_OFF,
+    KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE,
 };
 use crate::vm::opcode_map::{CANONICAL_HANDLER_LABELS, CANONICAL_OPCODES, OpcodeMap, PackMetadata};
 use std::collections::HashMap;
@@ -388,12 +388,32 @@ impl StubEmitter {
                 crate::vm::OpCode::LoadByte => self.emit_handler_load_byte(),
                 crate::vm::OpCode::Cmp32 => self.emit_handler_cmp32(),
                 crate::vm::OpCode::And => self.emit_handler_and(),
+                crate::vm::OpCode::Xor => self.emit_handler_xor(),
                 crate::vm::OpCode::RunNative => self.emit_handler_run_native(),
                 crate::vm::OpCode::BailNative => self.emit_handler_bail_native(),
                 crate::vm::OpCode::Exit => self.emit_handler_exit(),
                 _ => unreachable!("canonical opcode set only"),
             }
         }
+    }
+
+    fn emit_lea_rsi_from_r15(&mut self, disp: i32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x49, 0x8D, 0x77, disp as u8]);
+        } else {
+            self.emit(&[0x49, 0x8D, 0xB7]);
+            self.emit(&disp.to_le_bytes());
+        }
+    }
+
+    fn emit_cmp_dword_r15_disp(&mut self, disp: i32, imm: u32) {
+        if (-128..=127).contains(&disp) {
+            self.emit(&[0x41, 0x81, 0x7F, disp as u8]);
+        } else {
+            self.emit(&[0x41, 0x81, 0xBF]);
+            self.emit(&disp.to_le_bytes());
+        }
+        self.emit(&imm.to_le_bytes());
     }
 
     fn emit_handler_nop(&mut self) {
@@ -411,7 +431,7 @@ impl StubEmitter {
         self.emit_block_map_resolve_r15();
         self.label("h_set_block_map_found");
         // Reject bogus KNV6 images: handler_table must start with dword >= 1024.
-        self.emit(&[0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]); // cmp dword [r15+0x1C], 1024
+        self.emit_cmp_dword_r15_disp(KNV6_ENTRY_HANDLER_TABLE_OFF as i32, 1024);
         self.jcc_rel32_short(0x72, "h_set_block_map_fail");
         self.emit_block_map_apply_and_dispatch();
         self.label("h_set_block_map_fail");
@@ -467,8 +487,7 @@ impl StubEmitter {
         // Frame is exactly sub rsp,0x930 — push/pop rsi would spill below rsp and corrupt
         // the saved PC on table-mode ret → set_block_map refresh (call/nested/fact).
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x98], rsi
-        // lea rsi, [r15+0x1C]
-        self.emit(&[0x49, 0x8D, 0x77, 0x1C]);
+        self.emit_lea_rsi_from_r15(KNV6_ENTRY_HANDLER_TABLE_OFF as i32);
         // lea rdi, [rbp+REDIRECT_FRAME_BUF_OFF]
         self.emit_lea_from_rbp(7, REDIRECT_FRAME_BUF_OFF);
         // mov ecx, REDIRECT_FRAME_QWORDS
@@ -552,6 +571,10 @@ impl StubEmitter {
     }
 
     fn emit_add_operand_reads(&mut self) {
+        self.emit_alu_operand_reads();
+    }
+
+    fn emit_alu_operand_reads(&mut self) {
         self.emit(&[0x0F, 0xB6, 0x0E]); // movzx ecx, byte [rsi]
         self.emit(&[0x48, 0xFF, 0xC6]); // inc rsi
         self.emit(&[0x0F, 0xB6, 0x3E]); // movzx edi, byte [rsi]
@@ -561,22 +584,39 @@ impl StubEmitter {
     }
 
     fn emit_add_store_and_dispatch(&mut self) {
+        self.emit_alu_store_and_dispatch();
+    }
+
+    fn emit_alu_store_and_dispatch(&mut self) {
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
 
     fn emit_handler_sub(&mut self) {
         self.label("h_sub");
-        self.emit(&[0x0F, 0xB6, 0x0E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x3E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x16]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
-        self.emit(&[0x48, 0x2B, 0x44, 0xD5, 0x80]);
-        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-        self.jmp_to_dispatch();
+        match self.opcode_map.handler_variant(crate::vm::OpCode::Sub) {
+            0 => self.emit_handler_sub_v0(),
+            _ => self.emit_handler_sub_v1(),
+        }
+    }
+
+    /// Sub v0: `sub rax, [src2]` after loading src1 into rax.
+    fn emit_handler_sub_v0(&mut self) {
+        self.emit_alu_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x2B, 0x44, 0xD5, 0x80]); // sub rax, [rbp+rdx*8-0x80]
+        self.emit_alu_store_and_dispatch();
+    }
+
+    /// Sub v1: subtract via rcx scratch (`mov rcx,rax; sub rcx,rbx; mov rax,rcx`).
+    fn emit_handler_sub_v1(&mut self) {
+        self.emit_alu_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+        self.emit(&[0x48, 0x29, 0xD9]); // sub rcx, rbx
+        self.emit(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+        self.emit_alu_store_and_dispatch();
     }
 
     fn emit_handler_mul(&mut self) {
@@ -595,16 +635,52 @@ impl StubEmitter {
 
     fn emit_handler_and(&mut self) {
         self.label("h_and");
-        self.emit(&[0x0F, 0xB6, 0x0E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x3E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x16]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
-        self.emit(&[0x48, 0x23, 0x44, 0xD5, 0x80]);
-        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-        self.jmp_to_dispatch();
+        match self.opcode_map.handler_variant(crate::vm::OpCode::And) {
+            0 => self.emit_handler_and_v0(),
+            _ => self.emit_handler_and_v1(),
+        }
+    }
+
+    /// And v0: `and rax, [src2]` after loading src1 into rax.
+    fn emit_handler_and_v0(&mut self) {
+        self.emit_alu_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x23, 0x44, 0xD5, 0x80]); // and rax, [rbp+rdx*8-0x80]
+        self.emit_alu_store_and_dispatch();
+    }
+
+    /// And v1: load both operands into rax/rbx then `and rax, rbx`.
+    fn emit_handler_and_v1(&mut self) {
+        self.emit_alu_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit(&[0x48, 0x21, 0xD8]); // and rax, rbx
+        self.emit_alu_store_and_dispatch();
+    }
+
+    fn emit_handler_xor(&mut self) {
+        self.label("h_xor");
+        match self.opcode_map.handler_variant(crate::vm::OpCode::Xor) {
+            0 => self.emit_handler_xor_v0(),
+            _ => self.emit_handler_xor_v1(),
+        }
+    }
+
+    /// Xor v0: `xor rax, [src2]` after loading src1 into rax.
+    fn emit_handler_xor_v0(&mut self) {
+        self.emit_alu_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x33, 0x44, 0xD5, 0x80]); // xor rax, [rbp+rdx*8-0x80]
+        self.emit_alu_store_and_dispatch();
+    }
+
+    /// Xor v1: load both operands into rax/rbx then `xor rax, rbx`.
+    fn emit_handler_xor_v1(&mut self) {
+        self.emit_alu_operand_reads();
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit(&[0x48, 0x31, 0xD8]); // xor rax, rbx
+        self.emit_alu_store_and_dispatch();
     }
 
     fn emit_mov_from_r13_spill(&mut self, spill_reg: u8) {
@@ -1328,7 +1404,7 @@ impl StubEmitter {
 #[cfg(test)]
 mod tests {
     use super::create_vm_interpreter_stub;
-    use crate::vm::block_map::{KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, KNV6_MAGIC};
+    use crate::vm::block_map::{KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, KNV6_MAGIC};
 
     /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
@@ -1419,9 +1495,16 @@ mod tests {
             .position(|w| w == sig)
             .expect("h_set_block_map");
         let body = &stub[pos..pos.saturating_add(160).min(stub.len())];
+        let lea_r15 = [
+            0x49u8,
+            0x8D,
+            0x77,
+            KNV6_ENTRY_HANDLER_TABLE_OFF as u8,
+        ];
         assert!(
-            body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
-            "h_set_block_map must lea rsi,[r15+0x1C] for KNV6 redirect source"
+            body.windows(4).any(|w| w == lea_r15),
+            "h_set_block_map must lea rsi,[r15+{:#x}] for KNV6 redirect source",
+            KNV6_ENTRY_HANDLER_TABLE_OFF
         );
         assert!(
             body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
@@ -1677,16 +1760,23 @@ mod tests {
             !body.contains(&0x56),
             "h_set_block_map must not push rsi (frame is exactly 0x930 — push spills below rsp)"
         );
+        let lea_r15 = [
+            0x49u8,
+            0x8D,
+            0x77,
+            KNV6_ENTRY_HANDLER_TABLE_OFF as u8,
+        ];
         assert!(
-            body.windows(4).any(|w| w == [0x49, 0x8D, 0x77, 0x1C]),
-            "h_set_block_map must lea rsi,[r15+0x1C] as rep movsq source"
+            body.windows(4).any(|w| w == lea_r15),
+            "h_set_block_map must lea rsi,[r15+{:#x}] as rep movsq source",
+            KNV6_ENTRY_HANDLER_TABLE_OFF
         );
         assert!(
             body.windows(3).any(|w| w == [0xF3, 0x48, 0xA5]),
             "h_set_block_map must rep movsq KNV6 redirect into [rbp-0x930] frame buffer"
         );
         assert!(
-            !body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, 0x1C]),
+            !body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, KNV6_ENTRY_HANDLER_TABLE_OFF as u8]),
             "h_set_block_map must not point [rbp-0x130] at raw KNV6 without frame copy"
         );
         assert!(
@@ -1770,9 +1860,20 @@ mod tests {
             .position(|w| w == sig)
             .expect("h_set_block_map");
         let body = &stub[set_map..set_map.saturating_add(160).min(stub.len())];
+        let cmp_r15 = [
+            0x41u8,
+            0x81,
+            0x7F,
+            KNV6_ENTRY_HANDLER_TABLE_OFF as u8,
+            0x00,
+            0x04,
+            0x00,
+            0x00,
+        ];
         assert!(
-            body.windows(8).any(|w| w == [0x41, 0x81, 0x7F, 0x1C, 0x00, 0x04, 0x00, 0x00]),
-            "h_set_block_map must cmp dword [r15+0x1C],1024 before rep movsq"
+            body.windows(8).any(|w| w == cmp_r15),
+            "h_set_block_map must cmp dword [r15+{:#x}],1024 before rep movsq",
+            KNV6_ENTRY_HANDLER_TABLE_OFF
         );
     }
 
