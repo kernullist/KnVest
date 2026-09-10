@@ -166,6 +166,18 @@ impl BlockMapPlan {
         }
     }
 
+    /// L5f: key handler redirect slots by inner wires after outer→inner decode.
+    pub fn fill_nested_handler_tables(
+        &mut self,
+        plan: &HandlerRedirectPlan,
+        outer_decode: &[u8; 256],
+    ) {
+        for entry in &mut self.entries {
+            entry.handler_table =
+                plan.build_nested_handler_table(&entry.wire, outer_decode);
+        }
+    }
+
     pub fn fill_handler_tables_with<F>(&mut self, mut handler_off: F, set_map_off: i32)
     where
         F: FnMut(OpCode) -> i32,
@@ -404,6 +416,26 @@ impl HandlerRedirectPlan {
     ) -> [u8; HANDLER_REDIRECT_TABLE_SIZE] {
         build_handler_table_from_plan(wire, self)
     }
+
+    pub fn build_nested_handler_table(
+        &self,
+        outer_wire: &[u8; CANONICAL_OPCODE_COUNT],
+        outer_decode: &[u8; 256],
+    ) -> [u8; HANDLER_REDIRECT_TABLE_SIZE] {
+        let inner_wire = inner_wires_from_outer(outer_wire, outer_decode);
+        build_handler_table_from_plan(&inner_wire, self)
+    }
+}
+
+fn inner_wires_from_outer(
+    outer_wire: &[u8; CANONICAL_OPCODE_COUNT],
+    outer_decode: &[u8; 256],
+) -> [u8; CANONICAL_OPCODE_COUNT] {
+    let mut inner = [0u8; CANONICAL_OPCODE_COUNT];
+    for (idx, &ow) in outer_wire.iter().enumerate() {
+        inner[idx] = outer_decode[ow as usize];
+    }
+    inner
 }
 
 /// First byte after handler bodies (PackMetadata / string pool); dispatch must stay below this.

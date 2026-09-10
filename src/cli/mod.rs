@@ -56,6 +56,11 @@ pub enum Commands {
             help = "VM ISA mode: reg (default, 3-operand registers) or stack (push/pop ALU)"
         )]
         isa: String,
+        #[arg(
+            long,
+            help = "Enable L5f nested VM (outer decode + inner execute; table dispatch only)"
+        )]
+        nested: bool,
     },
 }
 
