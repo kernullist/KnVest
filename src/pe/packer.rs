@@ -219,6 +219,7 @@ fn build_section_bytecode(
             opcode_map,
             layout_plan,
             isa_mode,
+            nested_plan.enabled,
         );
     }
     let section_bytecode = if dispatch_mode == DispatchMode::Threaded {
@@ -285,9 +286,13 @@ fn validate_call_redirect_wires_in_bytecode(
     opcode_map: &OpcodeMap,
     layout: &BytecodeLayout,
     isa_mode: IsaMode,
+    nested: bool,
 ) {
     use crate::ir::Instruction;
-    use crate::vm::block_map::{collect_handler_redirect_plan, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_HEADER_SIZE, KNV6_ENTRY_SIZE};
+    use crate::vm::block_map::{
+        collect_handler_redirect_plan, knv6_entry_size, knv6_handler_table_off, KNV6_HEADER_SIZE,
+        KNV6_VERSION, KNV6_VERSION_V3,
+    };
     use crate::vm::opcode_map::CANONICAL_OPCODES;
     use crate::vm::OpCode;
 
@@ -312,6 +317,9 @@ fn validate_call_redirect_wires_in_bytecode(
         .position(|w| w == KNV6_MAGIC)
         .expect("KNV6 blob missing for call-wire validation");
     let h_call = collect_handler_redirect_plan(stub, opcode_map).offset_for(OpCode::Call);
+    let version = if nested { KNV6_VERSION_V3 } else { KNV6_VERSION };
+    let entry_stride = knv6_entry_size(version);
+    let handler_table_off = knv6_handler_table_off(version);
     let mut active_tx = 0usize;
     for ins in &insns {
         if ins.opcode == OpCode::SetBlockMap {
@@ -332,9 +340,14 @@ fn validate_call_redirect_wires_in_bytecode(
             "Call at bc[{:#x}] under tx={active_tx}: wire {w:#x} != entry {expected:#x}",
             ins.offset
         );
-        let red = knv6 + KNV6_HEADER_SIZE + active_tx * KNV6_ENTRY_SIZE + KNV6_ENTRY_HANDLER_TABLE_OFF;
+        let index_wire = if nested {
+            entry.outer_decode[w as usize]
+        } else {
+            w
+        };
+        let red = knv6 + KNV6_HEADER_SIZE + active_tx * entry_stride + handler_table_off;
         let slot_off = i32::from_le_bytes(
-            stub[red + (w as usize) * 4..red + (w as usize) * 4 + 4]
+            stub[red + (index_wire as usize) * 4..red + (index_wire as usize) * 4 + 4]
                 .try_into()
                 .unwrap(),
         );
@@ -3663,6 +3676,118 @@ mod tests {
                     assert!(
                         lands_on_call,
                         "{name} seed={seed:?} bb={active_bb} bc={:#x} wire={w:#x} slot_off={slot_off:#x} h_call={h_call:#x}",
+                        ins.offset
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_l5f_nested_packed_call_wires_resolve_via_inner_redirect_index() {
+        use crate::ir::Instruction;
+        use crate::pe::threaded::handler_table_base;
+        use crate::vm::block_map::{
+            knv6_entry_size, knv6_handler_table_off, KNV6_HEADER_SIZE, KNV6_VERSION_V3,
+        };
+
+        let call_idx = CANONICAL_OPCODES
+            .iter()
+            .position(|&o| o == OpCode::Call)
+            .unwrap();
+        for (name, path) in [
+            ("loop", "sample/loop.exe"),
+            ("call", "sample/call.exe"),
+            ("nested", "sample/nested.exe"),
+            ("fact", "sample/fact.exe"),
+            ("str", "sample/str.exe"),
+            ("hello", "sample/hello.exe"),
+            ("arith", "sample/arith.exe"),
+            ("puts_hello", "sample/puts_hello.exe"),
+        ] {
+            if !std::path::Path::new(path).exists() {
+                continue;
+            }
+            for seed in [None, Some(0xAAAA_AAAA_u64)] {
+                let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
+                let packed = pack_function(
+                    &mut pe,
+                    None,
+                    seed,
+                    false,
+                    DispatchMode::Table,
+                    0,
+                    crate::vm::IsaMode::Reg,
+                    true,
+                )
+                .unwrap();
+                let insns = Instruction::disassemble_with_layout(
+                    &packed.bytecode,
+                    &packed.opcode_map,
+                    Some(&packed.block_map_plan),
+                    DispatchMode::Table,
+                    &packed.layout_plan,
+                );
+                let section = pe.get_section(".knvest").unwrap();
+                let start = section.pointer_to_raw_data as usize;
+                let sd = &pe.data[start..start + section.size_of_raw_data as usize];
+                let vmbc = sd.windows(4).position(|w| w == b"VMBC").unwrap();
+                let stub = &sd[..vmbc + 4];
+                let table_base = handler_table_base(stub);
+                let knv6 = sd[..vmbc]
+                    .windows(KNV6_MAGIC.len())
+                    .position(|w| w == KNV6_MAGIC)
+                    .expect("KNV6");
+                assert_eq!(
+                    stub[knv6 + 4],
+                    KNV6_VERSION_V3,
+                    "{name} nested pack must emit KNV6 v3"
+                );
+                let entry_stride = knv6_entry_size(KNV6_VERSION_V3);
+                let handler_table_off = knv6_handler_table_off(KNV6_VERSION_V3);
+                let mut active_tx = 0usize;
+                for ins in &insns {
+                    if ins.opcode == OpCode::SetBlockMap {
+                        active_tx = match ins.operands.first() {
+                            Some(crate::ir::Operand::Immediate(v)) => *v as usize,
+                            _ => panic!("set_block_map missing tx_id"),
+                        };
+                        continue;
+                    }
+                    if ins.opcode != OpCode::Call {
+                        continue;
+                    }
+                    let w = packed.bytecode[ins.offset];
+                    let entry = packed
+                        .block_map_plan
+                        .entry_for_tx(active_tx as u16)
+                        .expect("active tx_id must index KNV6 entry");
+                    let expected = entry.wire[call_idx];
+                    assert_eq!(
+                        w,
+                        expected,
+                        "{name} seed={seed:?} Call at bc[{:#x}] under tx={active_tx}: wire {w:#x} != entry {expected:#x}",
+                        ins.offset
+                    );
+                    let inner = entry.outer_decode[w as usize];
+                    let red = knv6
+                        + KNV6_HEADER_SIZE
+                        + entry.tx_id as usize * entry_stride
+                        + handler_table_off;
+                    let slot_off = i32::from_le_bytes(
+                        stub[red + (inner as usize) * 4..red + (inner as usize) * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let target = table_base as i64 + slot_off as i64;
+                    let sig = [0x48u8, 0x8B, 0x06];
+                    let body = stub.get(target as usize..target as usize + 16);
+                    let lands_on_call = body
+                        .map(|b| b.windows(sig.len()).any(|w| w == sig))
+                        .unwrap_or(false);
+                    assert!(
+                        lands_on_call,
+                        "{name} seed={seed:?} tx={active_tx} outer={w:#x} inner={inner:#x} bc={:#x} slot_off={slot_off:#x}",
                         ins.offset
                     );
                 }
