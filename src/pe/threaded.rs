@@ -430,7 +430,7 @@ mod tests {
     use crate::vm::{BlockMapPlan, DispatchMode};
 
     fn stub_for(map: &OpcodeMap) -> Vec<u8> {
-        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[])
+        create_vm_interpreter_stub(0, 0, map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled())
             .0
     }
 

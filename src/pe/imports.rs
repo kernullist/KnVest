@@ -495,7 +495,7 @@ mod tests {
         use crate::vm::{BlockMapPlan, DispatchMode, OpCode, OpcodeMap};
 
         let map = OpcodeMap::from_seed(0x4C34_4100);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[]);
+        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
@@ -560,7 +560,8 @@ mod tests {
             &BlockMapPlan::default(),
             &[],
             &[],
-        );
+        &crate::vm::NestedVmPlan::disabled(),
+    );
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
@@ -600,7 +601,7 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
-        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded, 0, crate::vm::IsaMode::Reg)
+        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded, 0, crate::vm::IsaMode::Reg, false)
             .unwrap();
         let ids = native_call_ids_in_bytecode_with_layout(
             &packed.bytecode,

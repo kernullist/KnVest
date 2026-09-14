@@ -15,7 +15,7 @@ fn main() -> Result<()> {
         Commands::Ir { input } => {
             handle_ir_command(input)?;
         }
-        Commands::Pack { input, output, rva, seed, partial, dispatch, mba, isa } => {
+        Commands::Pack { input, output, rva, seed, partial, dispatch, mba, isa, nested } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
                 Some(u32::from_str_radix(rva_str, 16)?)
@@ -41,6 +41,7 @@ fn main() -> Result<()> {
                 dispatch_mode,
                 mba_level,
                 isa_mode,
+                nested,
             )?;
         }
     }
@@ -109,6 +110,18 @@ fn handle_ir_command(input: std::path::PathBuf) -> Result<()> {
             dispatch_mode,
         )
     );
+
+    if pack_meta.nested_vm {
+        let nested_plan = crate::vm::NestedVmPlan::from_seed(
+            pack_seed,
+            &crate::vm::collect_outer_maps(
+                pack_seed,
+                &opcode_map,
+                block_plan.as_ref().unwrap_or(&crate::vm::BlockMapPlan::default()),
+            ),
+        );
+        print!("{}", nested_plan.format_ir_header(&opcode_map));
+    }
     
     let instructions = ir::Instruction::disassemble_with_layout_and_isa(
         &bytecode,
@@ -134,8 +147,19 @@ fn handle_pack_command(
     dispatch_mode: crate::vm::DispatchMode,
     mba_level: u8,
     isa_mode: crate::vm::IsaMode,
+    nested_vm: bool,
 ) -> Result<()> {
-    pack::pack_executable(&input, &output, rva, seed, partial, dispatch_mode, mba_level, isa_mode)?;
+    pack::pack_executable(
+        &input,
+        &output,
+        rva,
+        seed,
+        partial,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+    )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
 }

@@ -6,6 +6,7 @@ pub mod machine;
 pub mod dispatch;
 pub mod virt_isa;
 pub mod isa_mode;
+pub mod nested_vm;
 
 pub use opcode::OpCode;
 pub use dispatch::{DispatchMode, THREAD_TARGET_SIZE};
@@ -29,4 +30,5 @@ pub use isa_mode::{
     operand_len_for, set_isa_mode, IsaMode,
 };
 pub use layout::{BytecodeLayout, KNV7_MAGIC, KNV7_HEADER_SIZE};
+pub use nested_vm::{NestedVmPlan, OUTER_DECODE_TABLE_SIZE, collect_outer_maps};
 pub use machine::{VirtualMachine, VMError, VMResult};

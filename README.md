@@ -61,7 +61,20 @@ knvest pack input.exe -o output.exe --rva 0x1234
 knvest pack input.exe -o output.exe --seed 0xdeadbeef
 ```
 
+```bash
+knvest pack input.exe -o output.exe --nested
+```
+
 Each pack (or explicit `--seed`) permutes the 18 implemented opcode wire bytes, shuffles handler placement in the stub, and (L4b) selects native handler bodies for polymorphic opcodes. The seed and wire table are embedded in `.knvest` immediately before the `VMBC` marker as a `KNV4` header so `knvest ir` can decode shuffled bytecode. Handler variant indices are derived from the same seed at pack time (not stored separately). Packing without a reproducible seed picks a random value and records it in the image.
+
+### L5f nested VM (`--nested`, default off)
+
+Inspired by public nested-virtualization ideas (e.g. Tigress NestedVirtualize / DSVMP *concepts* — no commercial packer code), `--nested` adds a **two-layer dispatch** in the interpreter stub:
+
+1. **Outer decode** (`dispatch`): reads the bytecode wire byte and translates it through a per-transition `outer_decode` table (KNV6 v3, swapped on `set_block_map` like handler redirect tables).
+2. **Inner execute** (`dispatch_inner`): uses the translated inner wire to index the handler redirect table and jump to the native handler body.
+
+Bytecode encoding is unchanged (still uses outer/L4a wires); only the runtime stub gains the extra hop. `knvest ir` prints an `L5f nested=outer_decode+inner_execute` header with inner-seed and sample outer→inner wire mappings when the `KNV4` v5 nested flag is set. Requires table dispatch (`--dispatch table`; threaded is rejected). This is intentionally slower than single-VM dispatch — it teaches how nested interpreters separate decode from execute, at the cost of an extra table lookup per instruction.
 
 ### View IR
 
