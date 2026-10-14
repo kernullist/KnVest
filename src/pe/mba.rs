@@ -537,6 +537,43 @@ fn emit_and_three_depth(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8, dep
     }
 }
 
+/// Emit `dst = src1 | src2` synthesized via `(src1 ^ src2) + (src1 & src2)` (with optional MBA rewrite).
+pub fn emit_or_three(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) {
+    let Some((ta, tb)) = materialize_pair(bytecode, dst, src1, src2) else {
+        if src1 == src2 {
+            raw_move(bytecode, dst, src1);
+        }
+        return;
+    };
+    let exclude = [dst, ta, tb];
+    let t = temps_excluding(1, &exclude);
+    if let Some(&txor) = t.first() {
+        emit_xor_three(bytecode, txor, ta, tb);
+        emit_and_three(bytecode, ta, ta, tb);
+        emit_add_three(bytecode, dst, txor, ta);
+    } else {
+        raw_xor(bytecode, dst, ta, tb);
+        raw_and(bytecode, ta, ta, tb);
+        raw_add(bytecode, dst, dst, ta);
+    }
+}
+
+/// Emit `dst = imm` using seed-derived polymorphic constant unfolding (`(imm ^ mask) ^ mask`)
+/// so the plaintext 64-bit constant does not appear directly in the bytecode stream.
+pub fn emit_load_imm_unfolded(bytecode: &mut Vec<u8>, dst: u8, imm: u64, seed: u64) {
+    let exclude = [dst];
+    let t = temps_excluding(1, &exclude);
+    if let Some(&scratch) = t.first() {
+        let mask = splitmix64(seed ^ 0x434F_4E53_554E_464C ^ imm ^ (dst as u64));
+        let encoded = imm ^ mask;
+        raw_load_imm(bytecode, dst, encoded);
+        raw_load_imm(bytecode, scratch, mask);
+        emit_xor_three(bytecode, dst, dst, scratch);
+    } else {
+        raw_load_imm(bytecode, dst, imm);
+    }
+}
+
 pub fn catalog_identities_for_seed(seed: u64) -> Vec<MbaIdentity> {
     let mut out = Vec::new();
     for family in [MbaFamily::Add, MbaFamily::Sub, MbaFamily::Xor, MbaFamily::And] {
@@ -845,5 +882,79 @@ mod tests {
                 "MBA add must not wrap in push/pop spill save"
             );
         });
+    }
+
+    #[test]
+    fn mba_emit_or_three_matches_bitwise_or_across_levels_and_isa_modes() {
+        use crate::vm::isa_mode::set_isa_mode;
+        use crate::vm::VirtualMachine;
+
+        for isa_mode in [IsaMode::Reg, IsaMode::Stack] {
+            for level in [0u8, 1, 2] {
+                for seed in [0xAAAA_u64, 0xBBBB, 0x1337_C0DE] {
+                    let map = OpcodeMap::from_seed(seed);
+                    crate::vm::set_active_map(&map);
+                    set_isa_mode(isa_mode);
+                    set_mba_context(level, seed);
+
+                    let mut bc = Vec::new();
+                    raw_load_imm(&mut bc, 1, 0xF0A5_0011);
+                    raw_load_imm(&mut bc, 2, 0x0F5A_1100);
+                    raw_load_imm(&mut bc, 11, 0x7777); // live spill reg
+                    emit_or_three(&mut bc, 1, 1, 2); // overlapping dst == src1
+                    raw_move(&mut bc, 0, 1);
+                    bc.push(map.encode(OpCode::Exit));
+                    bc.push(0);
+
+                    clear_mba_context();
+                    set_isa_mode(IsaMode::Reg);
+                    crate::vm::clear_active_map();
+
+                    let mut vm = VirtualMachine::with_opcode_map(bc, map).with_isa_mode(isa_mode);
+                    vm.run().unwrap();
+                    assert_eq!(
+                        vm.get_register(0).unwrap(),
+                        0xF0A5_0011 | 0x0F5A_1100,
+                        "isa={isa_mode:?} level={level} seed={seed:#x}"
+                    );
+                    assert_eq!(
+                        vm.get_register(11).unwrap(),
+                        0x7777,
+                        "spill r11 must survive emit_or_three"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mba_emit_load_imm_unfolded_hides_raw_constant_and_restores_value() {
+        use crate::vm::VirtualMachine;
+
+        let secret = 0xDEAD_BEEF_CAFE_BABEu64;
+        let secret_bytes = secret.to_le_bytes();
+        for level in [0u8, 1, 2] {
+            let seed = 0x2026_1014u64;
+            let map = OpcodeMap::from_seed(seed);
+            crate::vm::set_active_map(&map);
+            set_mba_context(level, seed);
+
+            let mut bc = Vec::new();
+            emit_load_imm_unfolded(&mut bc, 0, secret, seed);
+            bc.push(map.encode(OpCode::Exit));
+            bc.push(0);
+
+            clear_mba_context();
+            crate::vm::clear_active_map();
+
+            assert!(
+                !bc.windows(8).any(|w| w == secret_bytes),
+                "unfolded LoadImm must not expose plaintext 64-bit constant in bytecode"
+            );
+
+            let mut vm = VirtualMachine::with_opcode_map(bc, map);
+            vm.run().unwrap();
+            assert_eq!(vm.get_register(0).unwrap(), secret);
+        }
     }
 }

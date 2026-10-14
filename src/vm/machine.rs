@@ -434,6 +434,7 @@ impl VirtualMachine {
             OpCode::JmpIf => {
                 let condition = self.read_u8()?;
                 let offset = self.read_u64()? as usize;
+                let cf = self.flags & 0x01 != 0;
                 let zf = self.flags & 0x40 != 0;
                 let sf = self.flags & 0x80 != 0;
                 let of = self.flags & 0x800 != 0;
@@ -442,8 +443,14 @@ impl VirtualMachine {
                     2 => !zf,                         // JNE: ZF=0
                     3 => !zf && sf == of,             // JG: ZF=0 && SF==OF
                     4 => sf != of,                    // JL: SF!=OF
-                    5 => zf || sf != of,              // JLE
-                    6 => sf == of,                    // JGE
+                    5 => zf || sf != of,              // JLE: ZF=1 || SF!=OF
+                    6 => sf == of,                    // JGE: SF==OF
+                    7 => !cf && !zf,                  // JA: CF=0 && ZF=0
+                    8 => !cf,                         // JAE: CF=0
+                    9 => cf,                          // JB: CF=1
+                    10 => cf || zf,                   // JBE: CF=1 || ZF=1
+                    11 => sf,                         // JS: SF=1
+                    12 => !sf,                        // JNS: SF=0
                     _ => false,
                 };
                 if should_jump {
@@ -671,5 +678,60 @@ mod tests {
         let mut vm = VirtualMachine::new(bytecode);
         vm.run().unwrap();
         assert_eq!(vm.get_register(1).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_jmpif_unsigned_and_sign_conditions() {
+        let eval_cond = |lhs: u64, rhs: u64, cond: u8| -> u64 {
+            let mut bc = Vec::new();
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(1);
+            bc.extend_from_slice(&lhs.to_le_bytes());
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(2);
+            bc.extend_from_slice(&rhs.to_le_bytes());
+            bc.extend_from_slice(&[OpCode::Cmp as u8, 1, 2]);
+            bc.push(OpCode::JmpIf as u8);
+            bc.push(cond);
+            let jmp_patch = bc.len();
+            bc.extend_from_slice(&0u64.to_le_bytes());
+            // Not taken: r0 = 0
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(0);
+            bc.extend_from_slice(&0u64.to_le_bytes());
+            bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+            let taken_pc = bc.len() as u64;
+            bc[jmp_patch..jmp_patch + 8].copy_from_slice(&taken_pc.to_le_bytes());
+            // Taken: r0 = 1
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(0);
+            bc.extend_from_slice(&1u64.to_le_bytes());
+            bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+
+            let mut vm = VirtualMachine::new(bc);
+            vm.run().unwrap();
+            vm.get_register(0).unwrap()
+        };
+
+        // JA (7): unsigned >
+        assert_eq!(eval_cond(10, 5, 7), 1);
+        assert_eq!(eval_cond(5, 5, 7), 0);
+        assert_eq!(eval_cond(u64::MAX, 1, 7), 1);
+        // JAE (8): unsigned >=
+        assert_eq!(eval_cond(5, 5, 8), 1);
+        assert_eq!(eval_cond(4, 5, 8), 0);
+        // JB (9): unsigned <
+        assert_eq!(eval_cond(4, 5, 9), 1);
+        assert_eq!(eval_cond(5, 5, 9), 0);
+        assert_eq!(eval_cond(1, u64::MAX, 9), 1);
+        // JBE (10): unsigned <=
+        assert_eq!(eval_cond(5, 5, 10), 1);
+        assert_eq!(eval_cond(6, 5, 10), 0);
+        // JS (11): SF == 1 (result negative)
+        assert_eq!(eval_cond(3, 10, 11), 1);
+        assert_eq!(eval_cond(10, 3, 11), 0);
+        // JNS (12): SF == 0 (result non-negative)
+        assert_eq!(eval_cond(10, 3, 12), 1);
+        assert_eq!(eval_cond(3, 10, 12), 0);
     }
 }
