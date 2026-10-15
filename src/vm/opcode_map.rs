@@ -19,11 +19,13 @@ pub const KNV4_NESTED_FLAG: u8 = 0x01;
 pub const KNV4_MBA_FLAG_ENABLED: u8 = 0x01;
 pub const KNV4_MBA_LEVEL2: u8 = 0x02;
 
-/// Handler polymorphism (L4b/L5a): number of native bodies per logical opcode.
+/// Handler polymorphism (L4b/L5a/L6): number of native bodies per logical opcode.
 pub const ADD_HANDLER_VARIANT_COUNT: u8 = 3;
 pub const SUB_HANDLER_VARIANT_COUNT: u8 = 2;
 pub const XOR_HANDLER_VARIANT_COUNT: u8 = 2;
 pub const AND_HANDLER_VARIANT_COUNT: u8 = 2;
+pub const MUL_HANDLER_VARIANT_COUNT: u8 = 2;
+pub const MOVE_HANDLER_VARIANT_COUNT: u8 = 2;
 const HANDLER_VARIANT_SALT: u64 = 0x504F_4C59; // "POLY"
 
 /// Logical opcodes implemented by the in-process stub (stable index order).
@@ -443,6 +445,8 @@ pub fn handler_variant_count(op: OpCode) -> u8 {
         OpCode::Sub => SUB_HANDLER_VARIANT_COUNT,
         OpCode::Xor => XOR_HANDLER_VARIANT_COUNT,
         OpCode::And => AND_HANDLER_VARIANT_COUNT,
+        OpCode::Mul => MUL_HANDLER_VARIANT_COUNT,
+        OpCode::Move => MOVE_HANDLER_VARIANT_COUNT,
         _ => 1,
     }
 }

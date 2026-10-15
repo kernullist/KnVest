@@ -175,6 +175,8 @@ impl StubEmitter {
             0x75 => 0x85, // jne/jnz
             0x76 => 0x86, // jbe/jna
             0x77 => 0x87, // ja/jnbe
+            0x78 => 0x88, // js
+            0x79 => 0x89, // jns
             0x7C => 0x8C, // jl
             0x7D => 0x8D, // jge
             0x7E => 0x8E, // jle
@@ -643,6 +645,14 @@ impl StubEmitter {
 
     fn emit_handler_move(&mut self) {
         self.label("h_move");
+        match self.opcode_map.handler_variant(crate::vm::OpCode::Move) {
+            0 => self.emit_handler_move_v0(),
+            _ => self.emit_handler_move_v1(),
+        }
+    }
+
+    /// Move v0: `mov rax, [src]; mov [dst], rax`.
+    fn emit_handler_move_v0(&mut self) {
         self.emit_skip_wire_pad(OpCode::Move);
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -650,6 +660,19 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+        self.jmp_to_dispatch();
+    }
+
+    /// Move v1: load src into rbx, copy to rax, store rax to dst.
+    fn emit_handler_move_v1(&mut self) {
+        self.emit_skip_wire_pad(OpCode::Move);
+        self.emit(&[0x0F, 0xB6, 0x0E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x0F, 0xB6, 0x3E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x48, 0x8B, 0x5C, 0xFD, 0x80]); // mov rbx, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x89, 0xD8]);             // mov rax, rbx
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
 
@@ -789,17 +812,27 @@ impl StubEmitter {
             self.emit_alu_store_and_dispatch();
             return;
         }
-        self.emit_skip_wire_pad(OpCode::Mul);
-        self.emit(&[0x0F, 0xB6, 0x0E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x3E]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x0F, 0xB6, 0x16]);
-        self.emit(&[0x48, 0xFF, 0xC6]);
+        match self.opcode_map.handler_variant(crate::vm::OpCode::Mul) {
+            0 => self.emit_handler_mul_v0(),
+            _ => self.emit_handler_mul_v1(),
+        }
+    }
+
+    /// Mul v0: `imul rax, [src2]` after loading src1 into rax.
+    fn emit_handler_mul_v0(&mut self) {
+        self.emit_alu_operand_reads(OpCode::Mul);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
         self.emit(&[0x48, 0x0F, 0xAF, 0x44, 0xD5, 0x80]);
-        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
-        self.jmp_to_dispatch();
+        self.emit_alu_store_and_dispatch();
+    }
+
+    /// Mul v1: load both operands into rax/rbx then `imul rax, rbx`.
+    fn emit_handler_mul_v1(&mut self) {
+        self.emit_alu_operand_reads(OpCode::Mul);
+        self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit(&[0x48, 0x0F, 0xAF, 0xC3]);       // imul rax, rbx
+        self.emit_alu_store_and_dispatch();
     }
 
     fn emit_handler_and(&mut self) {
@@ -1321,8 +1354,38 @@ impl StubEmitter {
         self.label("jmpif_chk6");
 
         self.emit(&[0x83, 0xF9, 0x06]);
-        self.jcc_rel32(0x85, "jmpif_not_taken");
+        self.jcc_rel32(0x85, "jmpif_chk7");
         self.emit_push_flags_and_jcc(0x8D);
+        self.label("jmpif_chk7");
+
+        self.emit(&[0x83, 0xF9, 0x07]);
+        self.jcc_rel32(0x85, "jmpif_chk8");
+        self.emit_push_flags_and_jcc(0x87); // JA: CF=0 && ZF=0
+        self.label("jmpif_chk8");
+
+        self.emit(&[0x83, 0xF9, 0x08]);
+        self.jcc_rel32(0x85, "jmpif_chk9");
+        self.emit_push_flags_and_jcc(0x83); // JAE: CF=0
+        self.label("jmpif_chk9");
+
+        self.emit(&[0x83, 0xF9, 0x09]);
+        self.jcc_rel32(0x85, "jmpif_chk10");
+        self.emit_push_flags_and_jcc(0x82); // JB: CF=1
+        self.label("jmpif_chk10");
+
+        self.emit(&[0x83, 0xF9, 0x0A]);
+        self.jcc_rel32(0x85, "jmpif_chk11");
+        self.emit_push_flags_and_jcc(0x86); // JBE: CF=1 || ZF=1
+        self.label("jmpif_chk11");
+
+        self.emit(&[0x83, 0xF9, 0x0B]);
+        self.jcc_rel32(0x85, "jmpif_chk12");
+        self.emit_push_flags_and_jcc(0x88); // JS: SF=1
+        self.label("jmpif_chk12");
+
+        self.emit(&[0x83, 0xF9, 0x0C]);
+        self.jcc_rel32(0x85, "jmpif_not_taken");
+        self.emit_push_flags_and_jcc(0x89); // JNS: SF=0
 
         self.label("jmpif_not_taken");
         self.jmp_to_dispatch();
@@ -3530,5 +3593,100 @@ invoke_once:
         let ha = add_handler_offset(&a, &map);
         let hb = add_handler_offset(&b, &map);
         assert_eq!(&a[ha..ha + 48], &b[hb..hb + 48]);
+    }
+
+    #[test]
+    fn mul_and_move_handler_variants_vary_across_seeds() {
+        let handler_off = |stub: &[u8], map: &crate::vm::OpcodeMap, op: crate::vm::OpCode| -> usize {
+            let table_base = handler_table_base(stub);
+            let wire = map.encode(op) as usize;
+            let off = i32::from_le_bytes(
+                stub[table_base + wire * 4..table_base + wire * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            table_base + off as usize
+        };
+
+        for op in [crate::vm::OpCode::Mul, crate::vm::OpCode::Move] {
+            let seed_v0 = (0..512u64)
+                .find(|&s| crate::vm::OpcodeMap::from_seed(s).handler_variant(op) == 0)
+                .expect("seed for v0");
+            let seed_v1 = (0..512u64)
+                .find(|&s| crate::vm::OpcodeMap::from_seed(s).handler_variant(op) == 1)
+                .expect("seed for v1");
+            let map0 = crate::vm::OpcodeMap::from_seed(seed_v0);
+            let map1 = crate::vm::OpcodeMap::from_seed(seed_v1);
+            let (stub0, _, _, _) = create_vm_interpreter_stub(
+                0,
+                0,
+                &map0,
+                crate::vm::DispatchMode::Table,
+                0,
+                crate::vm::IsaMode::Reg,
+                &crate::vm::BytecodeLayout::identity(),
+                &[],
+                &crate::vm::BlockMapPlan::default(),
+                &[],
+                &[],
+                &crate::vm::NestedVmPlan::disabled(),
+            );
+            let (stub1, _, _, _) = create_vm_interpreter_stub(
+                0,
+                0,
+                &map1,
+                crate::vm::DispatchMode::Table,
+                0,
+                crate::vm::IsaMode::Reg,
+                &crate::vm::BytecodeLayout::identity(),
+                &[],
+                &crate::vm::BlockMapPlan::default(),
+                &[],
+                &[],
+                &crate::vm::NestedVmPlan::disabled(),
+            );
+            let h0 = handler_off(&stub0, &map0, op);
+            let h1 = handler_off(&stub1, &map1, op);
+            assert_ne!(
+                &stub0[h0..h0 + 32],
+                &stub1[h1..h1 + 32],
+                "handler body for {:?} must vary between v0 and v1",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn jmpif_handler_emits_extended_condition_branches() {
+        let map = crate::vm::OpcodeMap::from_seed(0x42);
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
+        let table_base = handler_table_base(&stub);
+        let wire = map.encode(crate::vm::OpCode::JmpIf) as usize;
+        let off = i32::from_le_bytes(
+            stub[table_base + wire * 4..table_base + wire * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let h = table_base + off as usize;
+        let region = &stub[h..(h + 360).min(stub.len())];
+        for cond in 7u8..=12 {
+            assert!(
+                region.windows(3).any(|w| w == [0x83, 0xF9, cond]),
+                "jmpif handler must check condition code {cond}"
+            );
+        }
     }
 }

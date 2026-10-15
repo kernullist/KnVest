@@ -294,6 +294,12 @@ fn branch_target_offset(instr: &X64Instruction) -> Option<i32> {
         | X64InstrKind::Jle { target_offset }
         | X64InstrKind::Jg { target_offset }
         | X64InstrKind::Jge { target_offset }
+        | X64InstrKind::Ja { target_offset }
+        | X64InstrKind::Jae { target_offset }
+        | X64InstrKind::Jb { target_offset }
+        | X64InstrKind::Jbe { target_offset }
+        | X64InstrKind::Js { target_offset }
+        | X64InstrKind::Jns { target_offset }
         | X64InstrKind::Call { target_offset } => Some(*target_offset),
         _ => None,
     }
@@ -309,6 +315,12 @@ fn is_block_end(kind: &X64InstrKind) -> bool {
             | X64InstrKind::Jle { .. }
             | X64InstrKind::Jg { .. }
             | X64InstrKind::Jge { .. }
+            | X64InstrKind::Ja { .. }
+            | X64InstrKind::Jae { .. }
+            | X64InstrKind::Jb { .. }
+            | X64InstrKind::Jbe { .. }
+            | X64InstrKind::Js { .. }
+            | X64InstrKind::Jns { .. }
             | X64InstrKind::Ret
             | X64InstrKind::Call { .. }
             | X64InstrKind::CallIndRip { .. }
@@ -330,7 +342,13 @@ fn is_native_eligible(instrs: &[X64Instruction], leader_idx: usize, tail_idx: us
         | X64InstrKind::Jl { .. }
         | X64InstrKind::Jle { .. }
         | X64InstrKind::Jg { .. }
-        | X64InstrKind::Jge { .. } => false,
+        | X64InstrKind::Jge { .. }
+        | X64InstrKind::Ja { .. }
+        | X64InstrKind::Jae { .. }
+        | X64InstrKind::Jb { .. }
+        | X64InstrKind::Jbe { .. }
+        | X64InstrKind::Js { .. }
+        | X64InstrKind::Jns { .. } => false,
         _ => tail_idx == leader_idx || true,
     }
 }
@@ -434,7 +452,13 @@ pub fn collect_cfg_edges(blocks: &[BasicBlock], instrs: &[X64Instruction]) -> Ve
             | X64InstrKind::Jl { target_offset }
             | X64InstrKind::Jle { target_offset }
             | X64InstrKind::Jg { target_offset }
-            | X64InstrKind::Jge { target_offset } => {
+            | X64InstrKind::Jge { target_offset }
+            | X64InstrKind::Ja { target_offset }
+            | X64InstrKind::Jae { target_offset }
+            | X64InstrKind::Jb { target_offset }
+            | X64InstrKind::Jbe { target_offset }
+            | X64InstrKind::Js { target_offset }
+            | X64InstrKind::Jns { target_offset } => {
                 let target = branch_target_abs(tail, *target_offset);
                 if let Some(&succ) = block_by_start.get(&target) {
                     edges.push((bb.id as u16, succ as u16));
