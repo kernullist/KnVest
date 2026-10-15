@@ -1277,6 +1277,238 @@ pub(crate) fn patch_runtime_handler_table(stub: &mut [u8], block_map_plan: &Bloc
     }
 }
 
+pub const KNVM_MAGIC: &[u8; 4] = b"KNVM";
+pub const KNVM_VERSION: u8 = 1;
+
+/// L7.1: Out-of-band sidecar metadata map (`.knvmap` / `KNVM`) that allows `knvest ir`
+/// and offline tooling to decode stripped packed binaries (`--strip-meta`) without any
+/// plaintext `KNV4`/`KNV5`/`KNV6`/`KNV7`/`VMBC` headers inside `.knvest`.
+#[derive(Debug, Clone)]
+pub struct SidecarMap {
+    pub pack_meta: PackMetadata,
+    pub partial_plan: PartialVirtPlan,
+    pub block_map_plan: BlockMapPlan,
+    pub layout_plan: BytecodeLayout,
+    pub vmbc_offset: u32,
+    pub bytecode_len: u32,
+}
+
+impl SidecarMap {
+    pub fn from_packed_pe(pe: &PEFile) -> PEResult<Self> {
+        let pack_meta = extract_pack_metadata_from_packed(pe)?;
+        let partial_plan = extract_partial_plan_from_packed(pe).unwrap_or_default();
+        let block_map_plan = extract_block_map_from_packed(pe).unwrap_or_default();
+        let layout_plan = extract_layout_from_packed(pe)?;
+        let bytecode = extract_bytecode_from_packed(pe)?;
+        let section = pe.get_section(".knvest")?;
+        let section_start = section.pointer_to_raw_data as usize;
+        let section_end = section_start + section.size_of_raw_data as usize;
+        let section_data = &pe.data[section_start..section_end.min(pe.data.len())];
+        let vmbc_offset = section_data
+            .windows(4)
+            .position(|w| w == b"VMBC")
+            .ok_or_else(|| PEError::InvalidPE("VMBC marker not found".to_string()))?
+            as u32;
+        let bc_start = vmbc_offset as usize + 4;
+        let insns = crate::vm::layout::enumerate_raw_instructions(
+            &section_data[bc_start..],
+            &pack_meta.opcode_map,
+            &block_map_plan,
+            &layout_plan,
+            pack_meta.dispatch_mode,
+            pack_meta.isa_mode,
+        );
+        let exact_bc_len = insns
+            .last()
+            .map(|last| last.start + last.raw_len)
+            .unwrap_or(bytecode.len());
+        Ok(Self {
+            pack_meta,
+            partial_plan,
+            block_map_plan,
+            layout_plan,
+            vmbc_offset,
+            bytecode_len: exact_bc_len.max(bytecode.len()) as u32,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let knv4 = self.pack_meta.to_embedded_bytes();
+        let knv5 = self.partial_plan.to_embedded_bytes();
+        let knv6 = self
+            .block_map_plan
+            .to_embedded_bytes_nested(self.pack_meta.nested_vm);
+        let knv7 = self.layout_plan.to_embedded_bytes();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(KNVM_MAGIC);
+        out.push(KNVM_VERSION);
+        out.extend_from_slice(&self.vmbc_offset.to_le_bytes());
+        out.extend_from_slice(&self.bytecode_len.to_le_bytes());
+        for blob in [&knv4, &knv5, &knv6, &knv7] {
+            out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            out.extend_from_slice(blob);
+        }
+        out
+    }
+
+    pub fn from_bytes(data: &[u8]) -> PEResult<Self> {
+        if data.len() < 13 || &data[0..4] != KNVM_MAGIC || data[4] != KNVM_VERSION {
+            return Err(PEError::InvalidPE("Invalid KNVM sidecar header".to_string()));
+        }
+        let vmbc_offset = u32::from_le_bytes(data[5..9].try_into().unwrap());
+        let bytecode_len = u32::from_le_bytes(data[9..13].try_into().unwrap());
+        let mut cursor = 13usize;
+        let mut read_blob = || -> PEResult<&[u8]> {
+            if cursor + 4 > data.len() {
+                return Err(PEError::InvalidPE("Truncated KNVM sidecar".to_string()));
+            }
+            let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + len > data.len() {
+                return Err(PEError::InvalidPE("Truncated KNVM sidecar blob".to_string()));
+            }
+            let slice = &data[cursor..cursor + len];
+            cursor += len;
+            Ok(slice)
+        };
+        let knv4 = read_blob()?;
+        let knv5 = read_blob()?;
+        let knv6 = read_blob()?;
+        let knv7 = read_blob()?;
+
+        let pack_meta = PackMetadata::from_embedded(knv4)
+            .ok_or_else(|| PEError::InvalidPE("Corrupt KNV4 in sidecar".to_string()))?;
+        let partial_plan = PartialVirtPlan::from_embedded(knv5)
+            .ok_or_else(|| PEError::InvalidPE("Corrupt KNV5 in sidecar".to_string()))?;
+        let block_map_plan = BlockMapPlan::from_embedded(knv6)
+            .ok_or_else(|| PEError::InvalidPE("Corrupt KNV6 in sidecar".to_string()))?;
+        let layout_plan = BytecodeLayout::from_embedded(knv7)
+            .ok_or_else(|| PEError::InvalidPE("Corrupt KNV7 in sidecar".to_string()))?;
+
+        Ok(Self {
+            pack_meta,
+            partial_plan,
+            block_map_plan,
+            layout_plan,
+            vmbc_offset,
+            bytecode_len,
+        })
+    }
+
+    pub fn save_to_path<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
+    pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> PEResult<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|e| PEError::InvalidPE(format!("Failed to read sidecar: {e}")))?;
+        Self::from_bytes(&bytes)
+    }
+}
+
+/// L7.1: Scrub embedded static metadata headers (`KNV4`, `KNV5`, `KNV6` magic/key, `KNV7`, `VMBC`)
+/// from the `.knvest` section in `pe` while preserving runtime-referenced KNV6 fields
+/// (`knv6_count` at +9 and the entry array at +11 used by `h_set_block_map`).
+pub fn scrub_embedded_metadata_in_pe(pe: &mut PEFile, seed: u64) -> PEResult<SidecarMap> {
+    let sidecar = SidecarMap::from_packed_pe(pe)?;
+    let section = pe.get_section(".knvest")?;
+    let section_start = section.pointer_to_raw_data as usize;
+    let section_end = section_start + section.size_of_raw_data as usize;
+    if section_end > pe.data.len() {
+        return Err(PEError::InvalidPE("Section data out of bounds".to_string()));
+    }
+    let cipher = crate::vm::BytecodeCipher::from_seed(seed ^ 0x5343_5255_424D_4554);
+    let section_data = &mut pe.data[section_start..section_end];
+
+    // 1. Scrub KNV4 (full 31-byte header — unused at runtime).
+    for i in 0..section_data.len().saturating_sub(crate::vm::KNV4_HEADER_SIZE) {
+        if &section_data[i..i + 4] == KNV4_MAGIC
+            && PackMetadata::from_embedded(&section_data[i..]).is_some()
+        {
+            for k in 0..crate::vm::KNV4_HEADER_SIZE {
+                section_data[i + k] ^= cipher.keystream_byte(i + k) | 0x80;
+            }
+        }
+    }
+
+    // 2. Scrub KNV5 (magic + header + entries — unused at runtime).
+    for i in 0..section_data.len().saturating_sub(super::partial::KNV5_HEADER_SIZE) {
+        if &section_data[i..i + 4] == KNV5_MAGIC {
+            if let Some(plan) = PartialVirtPlan::from_embedded(&section_data[i..]) {
+                let total = plan.to_embedded_bytes().len().min(section_data.len() - i);
+                for k in 0..total {
+                    section_data[i + k] ^= cipher.keystream_byte(i + k) | 0x80;
+                }
+            }
+        }
+    }
+
+    // 3. Scrub KNV6 magic & decode_key (bytes 0..9 of KNV6 header; keep +9..+11 `knv6_count`
+    // and +11.. entries intact because `h_set_block_map` reads `knv6_count` and entry tables at runtime).
+    for i in 0..section_data.len().saturating_sub(crate::vm::block_map::KNV6_HEADER_SIZE) {
+        if &section_data[i..i + 4] == KNV6_MAGIC
+            && BlockMapPlan::from_embedded(&section_data[i..]).is_some()
+        {
+            for k in 0..9 {
+                section_data[i + k] ^= cipher.keystream_byte(i + k) | 0x80;
+            }
+        }
+    }
+
+    // 4. Scrub KNV7 (full 31-byte header — unused at runtime).
+    for i in 0..section_data.len().saturating_sub(crate::vm::KNV7_HEADER_SIZE) {
+        if &section_data[i..i + 4] == KNV7_MAGIC
+            && BytecodeLayout::from_embedded(&section_data[i..]).is_some()
+        {
+            for k in 0..crate::vm::KNV7_HEADER_SIZE {
+                section_data[i + k] ^= cipher.keystream_byte(i + k) | 0x80;
+            }
+        }
+    }
+
+    // 5. Scrub "VMBC" 4-byte marker immediately preceding bytecode.
+    let vmbc = sidecar.vmbc_offset as usize;
+    if vmbc + 4 <= section_data.len() && &section_data[vmbc..vmbc + 4] == b"VMBC" {
+        for k in 0..4 {
+            section_data[vmbc + k] ^= cipher.keystream_byte(vmbc + k) | 0x80;
+        }
+    }
+
+    Ok(sidecar)
+}
+
+/// Extract VM bytecode from a packed PE using either embedded `VMBC` marker or a `SidecarMap`.
+pub fn extract_bytecode_from_packed_with_sidecar(
+    pe: &PEFile,
+    sidecar: Option<&SidecarMap>,
+) -> PEResult<Vec<u8>> {
+    if let Ok(bc) = extract_bytecode_from_packed(pe) {
+        return Ok(bc);
+    }
+    let Some(sc) = sidecar else {
+        return Err(PEError::InvalidPE(
+            "No VM bytecode found in packed PE (metadata stripped; pass --sidecar <path.knvmap>)"
+                .to_string(),
+        ));
+    };
+    let section = pe.get_section(".knvest")?;
+    let section_start = section.pointer_to_raw_data as usize;
+    let section_end = section_start + section.size_of_raw_data as usize;
+    if section_end > pe.data.len() {
+        return Err(PEError::InvalidPE("Section data out of bounds".to_string()));
+    }
+    let section_data = &pe.data[section_start..section_end];
+    let bc_start = (sc.vmbc_offset as usize).saturating_add(4);
+    let bc_end = bc_start.saturating_add(sc.bytecode_len as usize);
+    if bc_end > section_data.len() {
+        return Err(PEError::InvalidPE(
+            "Sidecar bytecode bounds exceed .knvest section".to_string(),
+        ));
+    }
+    Ok(section_data[bc_start..bc_end].to_vec())
+}
+
 pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
     let knvest_section = pe.get_section(".knvest");
     
@@ -4565,6 +4797,89 @@ mod tests {
                 "error must mention nested: {e}"
             ),
             Ok(_) => panic!("threaded+nested must fail"),
+        }
+    }
+
+    #[test]
+    fn test_l7_strip_meta_scrubs_knv_markers_and_sidecar_restores_ir() {
+        let pe_data = test_pe::create_minimal_pe64();
+        let mut pe = PEFile::from_bytes(pe_data).unwrap();
+        let packed = pack_function(
+            &mut pe,
+            None,
+            Some(0x2026_0701),
+            false,
+            DispatchMode::Table,
+            1,
+            IsaMode::Reg,
+            false,
+        )
+        .unwrap();
+
+        let sidecar = scrub_embedded_metadata_in_pe(&mut pe, packed.seed).unwrap();
+        let sc_bytes = sidecar.to_bytes();
+        let sc_roundtrip = SidecarMap::from_bytes(&sc_bytes).unwrap();
+        assert_eq!(sc_roundtrip.pack_meta.seed(), packed.seed);
+        assert!(sc_roundtrip.bytecode_len > 0);
+
+        // Verify .knvest section no longer contains plaintext KNV4, KNV5, KNV6, KNV7, or VMBC headers.
+        let section = pe.get_section(".knvest").unwrap();
+        let start = section.pointer_to_raw_data as usize;
+        let end = start + section.size_of_raw_data as usize;
+        let sec_bytes = &pe.data[start..end];
+        for magic in [b"KNV4", b"KNV5", b"KNV6", b"KNV7", b"VMBC"] {
+            assert!(
+                !sec_bytes.windows(4).any(|w| w == magic),
+                "scrubbed .knvest must not contain plaintext {:?} header",
+                std::str::from_utf8(magic).unwrap()
+            );
+        }
+        // Without sidecar, direct metadata extraction must fail on a stripped binary.
+        assert!(extract_pack_metadata_from_packed(&pe).is_err());
+        assert!(extract_bytecode_from_packed(&pe).is_err());
+
+        // With sidecar, bytecode and full IR disassembly are recovered losslessly.
+        let recovered_bc =
+            extract_bytecode_from_packed_with_sidecar(&pe, Some(&sc_roundtrip)).unwrap();
+        let insns = crate::ir::Instruction::disassemble_with_layout_and_isa(
+            &recovered_bc,
+            &sc_roundtrip.pack_meta.opcode_map,
+            Some(&sc_roundtrip.block_map_plan),
+            sc_roundtrip.pack_meta.dispatch_mode,
+            &sc_roundtrip.layout_plan,
+            sc_roundtrip.pack_meta.isa_mode,
+        );
+        assert_eq!(
+            crate::ir::Instruction::pretty_print(&insns),
+            ir_pretty(&packed)
+        );
+    }
+
+    #[test]
+    fn test_l7_bytecode_cipher_rolling_keystream_and_reg_permutation() {
+        use crate::vm::BytecodeCipher;
+
+        let c1 = BytecodeCipher::from_seed(0x1111_2222);
+        let c2 = BytecodeCipher::from_seed(0x3333_4444);
+        assert_ne!(c1.initial_state, c2.initial_state);
+
+        let sample = vec![0xFDu8, 0x00, 0x00, 0x01, 0x02, 0x03, 0xFD, 0x04, 0x05];
+        let enc1 = c1.encrypt(&sample);
+        let enc2 = c2.encrypt(&sample);
+        assert_ne!(enc1, sample);
+        assert_ne!(enc1, enc2);
+        assert_eq!(c1.decrypt(&enc1), sample);
+        assert_eq!(c2.decrypt(&enc2), sample);
+
+        // Verify ABI/scratch slots 0..16 are fixed and extended slots 16..32 form a bijection.
+        for r in 0..16u8 {
+            assert_eq!(c1.map_reg(r), r);
+            assert_eq!(c1.unmap_reg(r), r);
+        }
+        for r in 16..32u8 {
+            let mapped = c1.map_reg(r);
+            assert!((16..32).contains(&mapped));
+            assert_eq!(c1.unmap_reg(mapped), r);
         }
     }
 }

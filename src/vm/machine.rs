@@ -28,7 +28,7 @@ pub enum VMError {
 
 pub type VMResult<T> = Result<T, VMError>;
 
-const NUM_REGISTERS: usize = 16;
+pub const NUM_REGISTERS: usize = 32;
 const STACK_SIZE: usize = 4096;
 const MEMORY_SIZE: usize = 65536;
 
@@ -135,6 +135,27 @@ impl VirtualMachine {
             Ok(())
         } else {
             Err(VMError::InvalidRegister(reg))
+        }
+    }
+
+    pub fn write_memory_u64(&mut self, addr: usize, value: u64) -> VMResult<()> {
+        let off = if addr >= 0x10000 { addr - 0x10000 } else { addr };
+        if off + 8 <= self.memory.len() {
+            self.memory[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            Ok(())
+        } else {
+            Err(VMError::MemoryViolation(addr))
+        }
+    }
+
+    pub fn read_memory_u64(&self, addr: usize) -> VMResult<u64> {
+        let off = if addr >= 0x10000 { addr - 0x10000 } else { addr };
+        if off + 8 <= self.memory.len() {
+            Ok(u64::from_le_bytes(
+                self.memory[off..off + 8].try_into().unwrap(),
+            ))
+        } else {
+            Err(VMError::MemoryViolation(addr))
         }
     }
 
@@ -527,6 +548,8 @@ impl VirtualMachine {
                     self.data_section[addr]
                 } else if addr >= 0x10000 && addr < 0x10000 + self.memory.len() {
                     self.memory[addr - 0x10000]
+                } else if addr < self.memory.len() {
+                    self.memory[addr]
                 } else {
                     0
                 };

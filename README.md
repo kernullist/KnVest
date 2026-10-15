@@ -6,9 +6,9 @@ Educational x64 VM protector + IR viewer for Windows PE64 (`PE32+`) binaries.
 
 KnVest is an educational and research tool that demonstrates layered VM-based code virtualization and bytecode diversification for Windows x86-64 executables. It provides:
 
-1. A dual-mode virtual machine (`reg` 3-operand register ISA and `stack` push/pop ALU ISA) with 16 virtual registers, call stack, data stack, and x64 flags (`ZF`/`SF`/`CF`/`OF`)
-2. A PE64 packer that decodes x64 functions via [`iced-x86`](https://github.com/icedland/iced), lifts them into custom VM bytecode, and injects a standalone in-process x64 interpreter stub into a `.knvest` section
-3. An IR disassembler (`knvest ir`) that reconstructs per-seed wire mappings, transition tables, layout padding, MBA headers, and nested-VM tables to pretty-print embedded VM bytecode
+1. A dual-mode virtual machine (`reg` 3-operand register ISA and `stack` push/pop ALU ISA) with 32 virtual registers (`r0..r31`, with `r14..r15` strictly isolated as lifter/MBA scratch registers and `r10..r13`, `r16..r31` providing 20 dedicated local spill slots), call stack, data stack, and x64 flags (`ZF`/`SF`/`CF`/`OF`)
+2. A PE64 packer that decodes x64 functions via [`iced-x86`](https://github.com/icedland/iced), lifts them into custom VM bytecode, and injects a standalone in-process x64 interpreter stub into a `.knvest` section (with optional `--strip-meta` trailer scrubbing and `.knvmap` sidecar emission)
+3. An IR disassembler (`knvest ir`) that reconstructs per-seed wire mappings, transition tables, layout padding, MBA headers, and nested-VM tables from either embedded metadata or an out-of-band `.knvmap` sidecar to pretty-print VM bytecode
 
 **Language:** Rust  
 **Target:** Windows x86-64 PE (`PE32+`)
@@ -21,21 +21,22 @@ This is an educational project, not a commercial protector. It does NOT include:
 - Full x64 ISA / SIMD / floating-point coverage
 - Decompilation or LLVM/MLIR bitcode lifting
 
-## Architecture & Protection Layers (L1 – L6)
+## Architecture & Protection Layers (L1 – L7)
 
 | Layer | Feature | Trailer / Module | Summary |
 |-------|---------|------------------|---------|
-| **L1–L3** | PE64 parsing, CFG collection, IAT `native_call`, standalone x64 stub | `parser.rs`, `cfg.rs`, `imports.rs`, `lifter.rs`, `vm_stub.rs` | BFS over direct `call rel32` targets in `.text`; `call [rip+IAT]` resolved via PE import directory and invoked with Win64 ABI (`rcx`/`rdx`/`r8`/`r9` + shadow space) |
+| **L1–L3** | PE64 parsing, CFG collection, IAT `native_call`, standalone x64 stub | `parser.rs`, `cfg.rs`, `imports.rs`, `lifter.rs`, `vm_stub.rs` | BFS over direct `call rel32` targets in `.text`; `call [rip+IAT]` resolved via PE import directory and invoked with Win64 ABI (`rcx`/`rdx`/`r8`/`r9` + shadow space + `rax -> r0` return capture) |
 | **L4a** | Seeded wire-byte permutation & handler order shuffle | `opcode_map.rs` (`KNV4` v1–v5) | Permutes the 21 canonical opcode wire bytes across `0x00..=0xFF` (`0xFD` reserved for `SetBlockMap` meta-wire) and shuffles native handler emission order in `.knvest` |
 | **L4b / L5a / L6** | Handler polymorphism (n:1 native bodies) | `opcode_map.rs`, `vm_stub.rs`, `virt_isa.rs` | Seed-selected semantically equivalent x64 handler bodies for `Add` (3), `Sub` (2), `Xor` (2), `And` (2), `Mul` (2), and `Move` (2), plus virtual-ISA `sub` split (`neg` + `add`) |
 | **L4c** | Table vs. threaded dispatch | `dispatch.rs`, `threaded.rs` | `--dispatch table` (256-entry handler table) or `--dispatch threaded` (inline `rel32` handler offsets after each wire byte, direct handler-to-handler tail jump) |
-| **L4d** | Partial BB virtualization & native bail-out | `partial.rs` (`KNV5`) | `--partial` keeps selected straight-line basic blocks native via `run_native` / `bail_native` sleds while synchronizing VM spill registers (`r10..r15`) with the native `[rbp±disp]` frame |
+| **L4d** | Partial BB virtualization & native bail-out | `partial.rs` (`KNV5`) | `--partial` keeps selected straight-line basic blocks native via `run_native` / `bail_native` sleds while synchronizing VM spill registers with the native `[rbp±disp]` frame |
 | **L4e / L5d** | Transition-keyed per-edge opcode maps | `block_map.rs` (`KNV6` v1–v3) | Per-CFG-edge `(pred_bb, succ_bb) -> tx_id` 256-entry dispatch tables switched at basic-block boundaries and edge landing pads via `[0xFD][tx_id: u16]` (`set_block_map`) |
 | **L4f / L5b / L6** | Mixed Boolean-Arithmetic (MBA) & constant unfolding | `mba.rs` | `--mba 0\|1\|2` rewrites `Add`, `Sub`, `Xor`, `And`, and synthesized `Or` (`a \| b = (a ^ b) + (a & b)`) into multi-instruction boolean-arithmetic sequences; `emit_load_imm_unfolded` splits 64-bit immediates with seed-derived masks |
 | **L5c** | Bytecode layout diversification | `layout.rs`, `layout_pass.rs` (`KNV7`) | Inserts 0–3 bytes of seed-derived post-wire dead padding (`0xCC`) per opcode and relocates all branch, call, and string-pool offsets |
 | **L5e** | Dual virtual ISA (`reg` / `stack`) | `isa_mode.rs` | `--isa reg` (default 3-operand register ALU) or `--isa stack` (stack-machine ALU popping operands and pushing results on the VM data stack) |
 | **L5f** | Nested VM (two-layer dispatch) | `nested_vm.rs` (`KNV4` v5, `KNV6` v3) | `--nested` separates **outer decode** (per-transition `outer_decode[256]` wire translation) from **inner execute** (`dispatch_inner` handler table) |
 | **L6** | Extended x64 lifter & branch semantics | `lifter.rs`, `cfg.rs`, `machine.rs`, `vm_stub.rs` | Lifts bitwise/unary/shift ops (`AND`, `OR`, `XOR`, `NOT`, `NEG`, `SHL`, `TEST reg, imm`) across register, immediate, and `[rbp±disp]` stack slots, and supports signed, unsigned, and sign conditional jumps (`JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE`, `JA`, `JAE`, `JB`, `JBE`, `JS`, `JNS`) |
+| **L7** | Metadata scrubbing / `.knvmap` sidecar, 32-reg frame & scratch isolation, universal Win64 ABI & caller-return stub, rolling stream cipher | `packer.rs` (`KNVM`), `lifter.rs`, `vm_stub.rs`, `layout.rs` | `--strip-meta` scrubs `KNV4`..`KNV7` & `VMBC` headers and emits `.knvmap`; XOR-encodes all PEB/API strings in `vm_stub`; expands VM to 32 registers (`r14..r15` isolated for scratch, 20 local slots `r10..r13` & `r16..r31`); adds `shr`, `sar`, `idiv`, scaled `lea`, general pointer `[reg+disp]` load/store, and `LiftPolicy::Strict`; supports generic Win64 IAT calls with `rax -> r0` return capture and `StubExitMode::ReturnToCaller` (`leave; ret`); adds `BytecodeCipher` rolling SplitMix64 keystream & slot permutation |
 
 ## Build
 
@@ -67,6 +68,8 @@ knvest pack input.exe -o output.exe
 | `--mba [LEVEL]` | `0` (`off`) | MBA substitution depth: `0`/`off`, `1`/`on` (single catalog rewrite), or `2` (nested depth-limited rewrite) |
 | `--isa <MODE>` | `reg` | Virtual ISA operand model: `reg` (3-operand registers) or `stack` (push/pop stack ALU) |
 | `--nested` | `false` | Enable L5f nested VM (outer decode + inner execute; requires `--dispatch table`) |
+| `--strip-meta` | `false` | L7: Scrub embedded `KNV4`..`KNV7` & `VMBC` headers from `.knvest` and emit a `.knvmap` sidecar |
+| `--sidecar <PATH>` | `<output>.knvmap` | L7: Custom path for the `.knvmap` sidecar file (supported on both `knvest pack` and `knvest ir`) |
 
 Example invocations:
 
@@ -164,7 +167,7 @@ Eight MinGW-style C samples in `sample/`:
 cargo test
 ```
 
-The test suite (**255 tests**: 250 unit tests + 5 integration tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L6 lifting, MBA & constant unfolding, handler polymorphism, transition-keyed maps, layout padding, stack ISA, and nested VM execution.
+The test suite (**262 tests**: 257 unit tests + 5 integration tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L7 lifting, 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & constant unfolding, handler polymorphism, transition-keyed maps, layout padding, stack ISA, and nested VM execution.
 
 ## Project Structure
 

@@ -15,6 +15,12 @@ pub enum Commands {
     Ir {
         #[arg(help = "Input executable file")]
         input: PathBuf,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Optional .knvmap sidecar file (auto-detected as <input>.knvmap when embedded metadata is stripped)"
+        )]
+        sidecar: Option<PathBuf>,
     },
     
     #[command(about = "Pack an executable with VM protection")]
@@ -61,6 +67,17 @@ pub enum Commands {
             help = "Enable L5f nested VM (outer decode + inner execute; table dispatch only)"
         )]
         nested: bool,
+        #[arg(
+            long,
+            help = "L7: Strip/scrub embedded KNV4..KNV7 & VMBC headers from .knvest and emit a .knvmap sidecar"
+        )]
+        strip_meta: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "L7: Custom output path for the .knvmap sidecar file (defaults to <output>.knvmap when --strip-meta is set)"
+        )]
+        sidecar: Option<PathBuf>,
     },
 }
 

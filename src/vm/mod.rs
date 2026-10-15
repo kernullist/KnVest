@@ -29,6 +29,6 @@ pub use isa_mode::{
     clear_isa_mode, current_isa_mode, format_ir_header as isa_ir_header, is_stack_alu_op,
     operand_len_for, set_isa_mode, IsaMode,
 };
-pub use layout::{BytecodeLayout, KNV7_MAGIC, KNV7_HEADER_SIZE};
+pub use layout::{BytecodeCipher, BytecodeLayout, KNV7_MAGIC, KNV7_HEADER_SIZE};
 pub use nested_vm::{NestedVmPlan, OUTER_DECODE_TABLE_SIZE, collect_outer_maps};
 pub use machine::{VirtualMachine, VMError, VMResult};

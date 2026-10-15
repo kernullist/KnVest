@@ -5,12 +5,13 @@ use std::collections::HashSet;
 
 pub const KNV5_MAGIC: &[u8; 4] = b"KNV5";
 pub const KNV5_VERSION: u8 = 1;
+pub const KNV5_HEADER_SIZE: usize = 4 + 1 + 4 + 2 + 2;
 pub const KNV5_ENTRY_SIZE: usize = 2 + 4 + 4 + 1;
 
 const SELECT_SALT: u64 = 0x4C34_4400; // "L4D\0"
 const KEY_SALT: u64 = 0x4445_434B; // "DECK"
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PartialVirtPlan {
     pub decode_key: u32,
     pub blocks: Vec<PartialBlockInfo>,

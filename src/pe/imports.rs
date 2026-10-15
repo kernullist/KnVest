@@ -21,6 +21,8 @@ pub struct ImportTable {
 pub const NATIVE_CALL_IAT_TAG: u64 = 0x1_0000_0000;
 /// Bit 31 in the low dword marks IAT calls whose rcx (and rdx for printf) hold bytecode offsets.
 pub const NATIVE_CALL_IAT_PTR_FLAG: u64 = 0x8000_0000;
+/// Bit 30 in the low dword marks generic Win64 IAT calls (full 64-bit rcx=r0, rdx=r1, r8=r2, r9=r3, rax->r0).
+pub const NATIVE_CALL_IAT_GENERIC_FLAG: u64 = 0x4000_0000;
 
 pub fn native_call_iat_id(iat_rva: u32) -> u64 {
     NATIVE_CALL_IAT_TAG | (iat_rva as u64)
@@ -28,6 +30,10 @@ pub fn native_call_iat_id(iat_rva: u32) -> u64 {
 
 pub fn native_call_iat_ptr_id(iat_rva: u32) -> u64 {
     NATIVE_CALL_IAT_TAG | NATIVE_CALL_IAT_PTR_FLAG | (iat_rva as u64)
+}
+
+pub fn native_call_iat_generic_id(iat_rva: u32) -> u64 {
+    NATIVE_CALL_IAT_TAG | NATIVE_CALL_IAT_GENERIC_FLAG | (iat_rva as u64)
 }
 
 pub fn is_iat_native_call(func_id: u64) -> bool {
@@ -38,8 +44,12 @@ pub fn is_iat_ptr_native_call(func_id: u64) -> bool {
     func_id >= NATIVE_CALL_IAT_TAG && (func_id & NATIVE_CALL_IAT_PTR_FLAG) != 0
 }
 
+pub fn is_iat_generic_native_call(func_id: u64) -> bool {
+    func_id >= NATIVE_CALL_IAT_TAG && (func_id & NATIVE_CALL_IAT_GENERIC_FLAG) != 0
+}
+
 pub fn iat_rva_from_native_call(func_id: u64) -> u32 {
-    (func_id & 0x7FFF_FFFF) as u32
+    (func_id & 0x3FFF_FFFF) as u32
 }
 
 /// Collect every `native_call` func_id embedded in lifted VM bytecode.

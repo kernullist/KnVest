@@ -16,6 +16,30 @@ const ACTIVE_OUTER_DECODE_PTR_OFF: i32 = -0x138;
 const REDIRECT_FRAME_QWORDS: u32 = HANDLER_REDIRECT_TABLE_SIZE as u32 / 8;
 const OUTER_DECODE_FRAME_QWORDS: u32 = 256 / 8;
 
+/// Controls how `OpCode::Exit` terminates the VM stub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StubExitMode {
+    /// Terminate the process via Win32 `ExitProcess(r0)` (default for entry-point virtualization).
+    #[default]
+    ExitProcess,
+    /// Return to the native caller via `mov rax, r0; leave; ret` (for sub-function / DLL virtualization).
+    ReturnToCaller,
+}
+
+/// Derive a deterministic non-zero XOR key byte for obfuscating embedded API strings in `vm_stub`.
+pub fn derive_stub_string_xor_key(seed: u64) -> u8 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let byte = (z as u8) ^ 0x5A;
+    if byte == 0 || byte == 0x20 {
+        0x5A
+    } else {
+        byte
+    }
+}
+
 // L2 VM interpreter frame map (rbp-relative; disp32 = signed i32 little-endian)
 //   VM r0..r15     [rbp-0x80]..[rbp-0x08]   reg n → [rbp + n*8 - 0x80]
 //     r1 = 88 FF FF FF, r2 = 90 FF FF FF (NOT 78/70 — those are -0x88 / flags -0x90)
@@ -53,7 +77,39 @@ pub fn create_vm_interpreter_stub(
     native_sync: &[(i32, u8)],
     nested_plan: &NestedVmPlan,
 ) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
-    let mut e = StubEmitter::new(map, dispatch_mode, mba_level, isa_mode, layout_plan, native_sync, block_map_plan, nested_plan);
+    create_vm_interpreter_stub_with_exit_mode(
+        _image_base,
+        _section_rva,
+        map,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        layout_plan,
+        knv5,
+        block_map_plan,
+        native_sleds,
+        native_sync,
+        nested_plan,
+        StubExitMode::ExitProcess,
+    )
+}
+
+pub fn create_vm_interpreter_stub_with_exit_mode(
+    _image_base: u64,
+    _section_rva: u32,
+    map: &OpcodeMap,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    layout_plan: &BytecodeLayout,
+    knv5: &[u8],
+    block_map_plan: &BlockMapPlan,
+    native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
+    nested_plan: &NestedVmPlan,
+    exit_mode: StubExitMode,
+) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
+    let mut e = StubEmitter::new(map, dispatch_mode, mba_level, isa_mode, layout_plan, native_sync, block_map_plan, nested_plan, exit_mode);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
@@ -78,6 +134,8 @@ struct StubEmitter {
     block_map_plan: BlockMapPlan,
     knv6_offset: Option<usize>,
     nested_plan: NestedVmPlan,
+    exit_mode: StubExitMode,
+    string_xor_key: u8,
 }
 
 impl StubEmitter {
@@ -90,7 +148,9 @@ impl StubEmitter {
         native_sync: &[(i32, u8)],
         block_map_plan: &BlockMapPlan,
         nested_plan: &NestedVmPlan,
+        exit_mode: StubExitMode,
     ) -> Self {
+        let string_xor_key = derive_stub_string_xor_key(map.seed());
         Self {
             code: Vec::new(),
             labels: HashMap::new(),
@@ -107,6 +167,8 @@ impl StubEmitter {
             block_map_plan: block_map_plan.clone(),
             knv6_offset: None,
             nested_plan: nested_plan.clone(),
+            exit_mode,
+            string_xor_key,
         }
     }
 
@@ -253,7 +315,29 @@ impl StubEmitter {
         self.jmp_rel32("dispatch");
     }
 
+    /// Copy and XOR-decode an embedded obfuscated ASCII string into frame buffer `[rbp-0x560]`
+    /// and leave `rdx = [rbp-0x560]` ready for Win64 `GetProcAddress(rcx=hModule, rdx=lpProcName)`.
+    fn emit_decode_api_str_to_rdx(&mut self, label: &'static str, len_without_nul: usize) {
+        let key = self.string_xor_key;
+        self.lea_rip_rel32(0x4C, 0, label); // lea r8, [rip + label]
+        self.emit_lea_from_rbp(2, -0x560); // lea rdx, [rbp - 0x560]
+        self.emit(&[0x4D, 0x89, 0xC1]); // mov r9, r8
+        self.emit(&[0x49, 0x89, 0xD2]); // mov r10, rdx
+        self.emit(&[0xB9, len_without_nul as u8, 0x00, 0x00, 0x00]); // mov ecx, len
+        let loop_top = self.pos();
+        self.emit(&[0x41, 0x8A, 0x01]); // mov al, [r9]
+        self.emit(&[0x34, key]); // xor al, key
+        self.emit(&[0x41, 0x88, 0x02]); // mov [r10], al
+        self.emit(&[0x49, 0xFF, 0xC1]); // inc r9
+        self.emit(&[0x49, 0xFF, 0xC2]); // inc r10
+        self.emit(&[0xFF, 0xC9]); // dec ecx
+        let disp = (loop_top as isize - (self.pos() as isize + 2)) as i8;
+        self.emit(&[0x75, disp as u8]); // jnz loop_top
+        self.emit(&[0x41, 0xC6, 0x02, 0x00]); // mov byte [r10], 0
+    }
+
     fn emit_prologue_and_api_resolve(&mut self) {
+        let key = self.string_xor_key;
         self.emit(&[0x55]);
         self.emit(&[0x48, 0x89, 0xE5]);
         self.emit(&[0x48, 0x81, 0xEC, 0x30, 0x09, 0x00, 0x00]); // sub rsp, 0x930 (frame + 1 KiB redirect copy)
@@ -275,7 +359,9 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x71, 0x60]);
         self.emit(&[0x4D, 0x89, 0xD0]);
         self.label("name_cmp_loop");
-        self.emit(&[0x41, 0x0F, 0xB7, 0x00]);
+        self.emit(&[0x41, 0x0F, 0xB7, 0x00]); // movzx eax, word [r8]
+        self.emit(&[0x34, key]); // xor al, key (decode obfuscated UTF-16LE k32_str low byte)
+        self.emit(&[0x90]); // pad so backward jump to module_loop is not -0x50 (B0 FF FF FF)
         self.emit(&[0x0F, 0xB7, 0x16]);
         self.emit(&[0x83, 0xF8, 0x41]);
         self.jcc_rel32_short(0x72, "lowercase1_done");
@@ -324,7 +410,8 @@ impl StubEmitter {
         self.lea_rip_rel32(0x4C, 0, "gpa_str");
 
         self.label("strcmp_loop");
-        self.emit(&[0x41, 0x8A, 0x00]);
+        self.emit(&[0x41, 0x8A, 0x00]); // mov al, [r8]
+        self.emit(&[0x34, key]); // xor al, key (decode obfuscated gpa_str byte)
         self.emit(&[0x41, 0x3A, 0x01]);
         self.jcc_rel32_short(0x75, "search_next");
         self.emit(&[0x84, 0xC0]);
@@ -343,21 +430,21 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x85, 0x40, 0xFF, 0xFF, 0xFF]);
 
         self.emit(&[0x48, 0x89, 0xD9]);
-        self.lea_rip_rel32(0x48, 2, "gsth_str");
+        self.emit_decode_api_str_to_rdx("gsth_str", b"GetStdHandle".len());
         self.emit(&[0x48, 0x83, 0xEC, 0x20]);
         self.emit(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
         self.emit(&[0x48, 0x89, 0x85, 0x48, 0xFF, 0xFF, 0xFF]);
 
         self.emit(&[0x48, 0x89, 0xD9]);
-        self.lea_rip_rel32(0x48, 2, "wf_str");
+        self.emit_decode_api_str_to_rdx("wf_str", b"WriteFile".len());
         self.emit(&[0x48, 0x83, 0xEC, 0x20]);
         self.emit(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
         self.emit(&[0x48, 0x89, 0x85, 0x50, 0xFF, 0xFF, 0xFF]);
 
         self.emit(&[0x48, 0x89, 0xD9]);
-        self.lea_rip_rel32(0x48, 2, "ep_str");
+        self.emit_decode_api_str_to_rdx("ep_str", b"ExitProcess".len());
         self.emit(&[0x48, 0x83, 0xEC, 0x20]);
         self.emit(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
@@ -1312,12 +1399,23 @@ impl StubEmitter {
     fn emit_handler_exit(&mut self) {
         self.label("h_exit");
         self.emit_skip_wire_pad(OpCode::Exit);
-        self.emit(&[0x0F, 0xB6, 0x0E]);
-        self.emit(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
-        self.emit(&[0x48, 0x83, 0xEC, 0x20]);
-        self.emit(&[0xFF, 0x95, 0x58, 0xFF, 0xFF, 0xFF]);
-        self.emit(&[0x48, 0x83, 0xC4, 0x20]);
-        self.emit(&[0xC3]);
+        match self.exit_mode {
+            StubExitMode::ExitProcess => {
+                self.emit(&[0x0F, 0xB6, 0x0E]);
+                self.emit(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
+                self.emit(&[0x48, 0x83, 0xEC, 0x20]);
+                self.emit(&[0xFF, 0x95, 0x58, 0xFF, 0xFF, 0xFF]);
+                self.emit(&[0x48, 0x83, 0xC4, 0x20]);
+                self.emit(&[0xC3]);
+            }
+            StubExitMode::ReturnToCaller => {
+                // Return exit register value in rax and unwind stub frame (`leave; ret`).
+                self.emit(&[0x0F, 0xB6, 0x0E]); // movzx ecx, byte [rsi]
+                self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]); // mov rax, [rbp+rcx*8-0x80]
+                self.emit(&[0xC9]); // leave (mov rsp, rbp; pop rbp)
+                self.emit(&[0xC3]); // ret
+            }
+        }
     }
 
     fn emit_jmpif_handler(&mut self) {
@@ -1503,17 +1601,17 @@ impl StubEmitter {
         self.jmp_rel32("nc_done");
 
         self.label("nc_iat");
-        // rax = func_id; ebx = iat_rva; r11d = low dword (ptr flag in bit 31)
+        // rax = func_id; ebx = iat_rva; r11d = low dword (ptr flag in bit 31, generic flag in bit 30)
         self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
         self.emit(&[0x44, 0x89, 0xDB]); // mov ebx, r11d (44=REX.R; 41 89 DB is mov r11d,ebx)
-        self.emit(&[0x81, 0xE3, 0xFF, 0xFF, 0xFF, 0x7F]); // and ebx, 0x7fffffff
+        self.emit(&[0x81, 0xE3, 0xFF, 0xFF, 0xFF, 0x3F]); // and ebx, 0x3fffffff
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]); // PEB
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
         // win64 ABI args from VM r0..r3 before ptr test (2151211 putchar order); ptr adds base to rcx.
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
-        self.jcc_rel32(0x84, "nc_iat_putchar"); // jz — putchar: rcx=r0 only, no rdx/r8/r9
+        self.jcc_rel32(0x84, "nc_iat_putchar"); // jz — putchar or generic non-ptr IAT
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] offset
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
@@ -1522,8 +1620,18 @@ impl StubEmitter {
         self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax (48 01 C1; NOT 49 01 D1 = add r9,rdx)
         self.jmp_rel32("nc_iat_call");
         self.label("nc_iat_putchar");
+        // Check bit 30 (NATIVE_CALL_IAT_GENERIC_FLAG): full 64-bit Win64 ABI (rcx=r0, rdx=r1, r8=r2, r9=r3).
+        self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x40]); // test r11d, 0x40000000
+        self.jcc_rel32(0x85, "nc_iat_generic"); // jnz nc_iat_generic
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
         self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
+        self.jmp_rel32("nc_iat_call");
+        self.label("nc_iat_generic");
+        self.emit(&[0x90, 0x90]); // pad so backward rel32 offsets never equal -0x50 (B0 FF FF FF)
+        self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0 [rbp-0x80]
+        self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
+        self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
+        self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
         self.label("nc_iat_call");
         // Preserve VM r10..r12 in frame scratch below ret/data stacks (not [-0x200,-0x80]).
         self.emit(&[0x48, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x30] VM r10
@@ -1535,6 +1643,8 @@ impl StubEmitter {
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]);
+        // Store Win64 return value rax into VM r0 [rbp-0x80] before restoring r10..r12 via rax.
+        self.emit(&[0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x80], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xF0, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x510]
         self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x20], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xF8, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x508]
@@ -1600,22 +1710,32 @@ impl StubEmitter {
     }
 
     fn emit_strings_and_marker(&mut self, knv5: &[u8], block_map_plan: &BlockMapPlan, native_sleds: &[u8]) {
+        let key = self.string_xor_key;
         self.label("k32_str");
-        self.emit(&[
+        let raw_k32: [u8; 26] = [
             0x6B, 0x00, 0x65, 0x00, 0x72, 0x00, 0x6E, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x33, 0x00,
             0x32, 0x00, 0x2E, 0x00, 0x64, 0x00, 0x6C, 0x00, 0x6C, 0x00, 0x00, 0x00,
-        ]);
+        ];
+        let mut enc_k32 = raw_k32;
+        for idx in (0..raw_k32.len()).step_by(2) {
+            enc_k32[idx] ^= key;
+        }
+        self.emit(&enc_k32);
         self.label("gpa_str");
-        self.emit(b"GetProcAddress\0");
+        let enc_gpa: Vec<u8> = b"GetProcAddress\0".iter().map(|b| b ^ key).collect();
+        self.emit(&enc_gpa);
         self.label("gsth_str");
-        self.emit(b"GetStdHandle\0");
+        let enc_gsth: Vec<u8> = b"GetStdHandle\0".iter().map(|b| b ^ key).collect();
+        self.emit(&enc_gsth);
         self.label("wf_str");
-        self.emit(b"WriteFile\0");
+        let enc_wf: Vec<u8> = b"WriteFile\0".iter().map(|b| b ^ key).collect();
+        self.emit(&enc_wf);
         self.label("ep_str");
-        self.emit(b"ExitProcess\0");
+        let enc_ep: Vec<u8> = b"ExitProcess\0".iter().map(|b| b ^ key).collect();
+        self.emit(&enc_ep);
 
         while self.pos() % 16 != 0 {
-            self.emit(&[0xCC]);
+            self.emit(&[0x90]);
         }
         let pack_meta = PackMetadata {
             opcode_map: self.opcode_map.clone(),
@@ -3688,5 +3808,91 @@ invoke_once:
                 "jmpif handler must check condition code {cond}"
             );
         }
+    }
+
+    #[test]
+    fn l7_vm_stub_obfuscates_plaintext_api_and_dll_strings() {
+        let map = crate::vm::OpcodeMap::from_seed(0x2026_1015);
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
+        for plain in [
+            b"GetProcAddress".as_slice(),
+            b"GetStdHandle".as_slice(),
+            b"WriteFile".as_slice(),
+            b"ExitProcess".as_slice(),
+        ] {
+            assert!(
+                !stub.windows(plain.len()).any(|w| w == plain),
+                "stub must not contain plaintext ASCII API string {:?}",
+                std::str::from_utf8(plain).unwrap()
+            );
+        }
+        let plain_k32_utf16: [u8; 24] = [
+            0x6B, 0x00, 0x65, 0x00, 0x72, 0x00, 0x6E, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x33, 0x00,
+            0x32, 0x00, 0x2E, 0x00, 0x64, 0x00, 0x6C, 0x00, 0x6C, 0x00,
+        ];
+        assert!(
+            !stub
+                .windows(plain_k32_utf16.len())
+                .any(|w| w == plain_k32_utf16),
+            "stub must not contain plaintext UTF-16LE kernel32.dll"
+        );
+    }
+
+    #[test]
+    fn l7_return_to_caller_exit_mode_emits_leave_ret_and_nc_iat_generic_captures_rax() {
+        use super::{StubExitMode, create_vm_interpreter_stub_with_exit_mode};
+        let map = crate::vm::OpcodeMap::from_seed(0x7777);
+        let (stub_ret, _, _, _) = create_vm_interpreter_stub_with_exit_mode(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+            StubExitMode::ReturnToCaller,
+        );
+        // ReturnToCaller exit handler: movzx ecx, byte [rsi]; mov rax, [rbp+rcx*8-0x80]; leave; ret
+        let ret_seq = [0x0Fu8, 0xB6, 0x0E, 0x48, 0x8B, 0x44, 0xCD, 0x80, 0xC9, 0xC3];
+        assert!(
+            stub_ret.windows(ret_seq.len()).any(|w| w == ret_seq),
+            "ReturnToCaller stub must emit mov rax,[rbp+rcx*8-0x80]; leave; ret"
+        );
+        // nc_iat_call must store rax back into VM r0 [rbp-0x80] after call rbx
+        let call_rbx_and_save_rax = [
+            0xFFu8, 0xD3, // call rbx
+            0x48, 0x83, 0xC4, 0x28, // add rsp, 0x28
+            0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF, // mov [rbp-0x80], rax
+        ];
+        assert!(
+            stub_ret
+                .windows(call_rbx_and_save_rax.len())
+                .any(|w| w == call_rbx_and_save_rax),
+            "nc_iat_call must capture Win64 return value rax into VM r0 [rbp-0x80]"
+        );
+        // nc_iat must mask 0x3fffffff (clearing both bit 31 ptr flag and bit 30 generic flag)
+        let mask_3f = [0x81u8, 0xE3, 0xFF, 0xFF, 0xFF, 0x3F];
+        assert!(
+            stub_ret.windows(mask_3f.len()).any(|w| w == mask_3f),
+            "nc_iat must mask IAT RVA with 0x3fffffff"
+        );
     }
 }

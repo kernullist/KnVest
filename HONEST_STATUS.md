@@ -1,161 +1,43 @@
-# Honest Status - VM Interpreter Not Complete
+# Honest Status — L1–L7 Architecture Status
 
-## What Works ✅
+## What Works & Is Verified (`cargo test` — 262 Tests Passing)
 
-### PE Infrastructure (Complete)
-- ✅ PE parsing for PE32+ (MinGW, MSVC)
-- ✅ Section addition with proper alignment
-- ✅ Header updates without data corruption
-- ✅ COFF symbol table preservation
-- ✅ String table preservation
-- ✅ Overlay data preservation
-- ✅ 18 tests passing (16 unit + 2 integration)
+### 1. PE32+ Infrastructure & Sidecar Metadata (`src/pe/parser.rs`, `src/pe/packer.rs`)
+- Parses PE32+ (`x86_64`) executables (MinGW/MSVC), preserving COFF symbols, string tables, and overlays.
+- Injects `.knvest` section with proper section/file alignment and entry-point redirection.
+- **L7 Trailer Scrubbing & `.knvmap` Sidecar**:
+  - `--strip-meta` (`scrub_embedded_metadata_in_pe`) scrubs plaintext `KNV4`, `KNV5`, `KNV6`, `KNV7`, and `VMBC` headers from `.knvest` using a seed-derived SplitMix64 stream while preserving runtime-referenced KNV6 transition tables.
+  - Emits an out-of-band `KNVM` (`.knvmap`) sidecar file so `knvest ir` can still disassemble stripped binaries losslessly.
+  - All Win32/PEB string literals (`kernel32.dll`, `GetProcAddress`, `GetStdHandle`, `WriteFile`, `ExitProcess`) inside `vm_stub` are XOR-encoded with a seed-derived key and decoded at runtime.
 
-### IR Viewer (Complete)
-- ✅ Bytecode disassembly
-- ✅ Pretty-printing with address/opcode/operands
-- ✅ Extraction from packed PEs
-- ✅ Shows real VM opcodes (LoadImm, NativeCall, Exit)
+### 2. x64 Lifter & 32-Register VM Frame Model (`src/pe/lifter.rs`, `src/vm/machine.rs`)
+- **32 Virtual Registers (`r0..r31`) & Scratch Isolation**:
+  - `r0..r9`: x64 general-purpose register mapping (`rax`, `rcx`, `rdx`, `rbx`, `rsp`, `rbp`, `rsi`, `rdi`, `r8`, `r9`).
+  - `r10..r13` and `r16..r31`: 20 dedicated local `[rbp ± disp]` stack spill slots.
+  - `r14` and `r15`: strictly isolated lifter/MBA scratch registers (`alloc_stack_spill_reg` never assigns locals to `r14` or `r15`).
+- **Instruction Coverage (L1–L7)**:
+  - Data movement & addressing: `mov`, `movzx`, `movsxd`, `cdqe`, general `lea` (`[base + disp]`, `[base + index*scale + disp]`, `[rip + disp]`), general pointer memory load/store (`[reg + disp]`), `push`, `pop`.
+  - Arithmetic, bitwise, unary & shift: `add`, `sub`, `imul`, `idiv`/`div`, `inc`, `dec`, `and`, `or`, `xor`, `not`, `neg`, `shl`, `shr`, `sar`.
+  - Comparisons & all 12 conditional branches: `cmp` (64-bit & 32-bit `cmp32`), `test reg, reg`, `test reg, imm`, `je`, `jne`, `jg`, `jl`, `jge`, `jle`, `ja`, `jae`, `jb`, `jbe`, `js`, `jns`.
+  - Sample-specific hardcoded heuristics (`force_nested_product_single_digit_path`) have been completely removed; all 8 MinGW sample programs lift and pass via genuine instruction semantics.
+  - `LiftPolicy::Strict` (`validate_strict_lift`) detects and reports any unlifted `X64InstrKind::Unknown` instruction.
 
-### Bytecode Generation (Complete)
-- ✅ Real VM bytecode format
-- ✅ Embeds "Hello, World!\n" string
-- ✅ LoadImm instructions for string pointer and length
-- ✅ NativeCall instruction (ID 1 = print)
-- ✅ Exit instruction with return code
+### 3. Standalone x64 Interpreter Stub & Win64 ABI Bridge (`src/pe/vm_stub.rs`)
+- Resolves `kernel32.dll` via PEB `InMemoryOrderModuleList` and locates `GetProcAddress`, `GetStdHandle`, `WriteFile`, and `ExitProcess`.
+- **Universal Win64 IAT `NativeCall` Bridge (`nc_iat`)**:
+  - Supports stdio pointer fixups (bit 31), legacy single-byte `putchar` (default), and generic 4-argument Win64 ABI calls (`NATIVE_CALL_IAT_GENERIC_FLAG`, bit 30: `rcx=r0, rdx=r1, r8=r2, r9=r3` + 32-byte shadow space).
+  - Captures the native Win64 return value `rax` back into VM `r0` (`mov [rbp-0x80], rax`) before restoring caller-saved VM slots.
+- **Caller-Return Mode (`StubExitMode::ReturnToCaller`)**:
+  - Supports unwinding the interpreter frame and returning the VM exit register in `rax` via `leave; ret` instead of terminating the process via `ExitProcess`.
 
-## What Doesn't Work ❌
+### 4. Multi-Layer Obfuscation & Bytecode Diversification (`L4`–`L7`)
+- **L4a/L4b/L5a/L6**: Seeded opcode wire permutation and polymorphic x64 handler variants (`Add`, `Sub`, `Xor`, `And`, `Mul`, `Move`).
+- **L4c**: Table (`--dispatch table`) and direct-threaded (`--dispatch threaded`) dispatch.
+- **L4d**: Partial basic-block virtualization (`--partial`) with native sled execution and frame spill synchronization.
+- **L4e/L5d**: Per-CFG-edge `(pred_bb, succ_bb) -> tx_id` 256-entry transition-keyed dispatch tables (`KNV6`).
+- **L4f/L5b/L6**: Depth-1 and Depth-2 Mixed Boolean-Arithmetic (`--mba 1|2`) and 64-bit constant unfolding.
+- **L5c/L7**: Per-opcode post-wire dead-byte padding (`KNV7`), rolling SplitMix64 keystream encryption (`BytecodeCipher`), and extended register slot permutation.
+- **L5e/L5f**: Dual virtual ISA (`--isa reg|stack`) and two-layer nested VM (`--nested`).
 
-### VM Interpreter Stub (Incomplete)
-The x64 assembly interpreter stub is **not complete**:
-- ❌ **Does not actually execute bytecode**
-- ❌ **API calls not resolved** (GetStdHandle, WriteFile)
-- ❌ **Register management incomplete**
-- ❌ **NativeCall handler not functional**
-
-### Current Behavior
-The packed PE:
-- Attempts to run VM interpreter stub
-- Stub has placeholder code
-- **Does not print "Hello, World!"**
-- **Will fail acceptance test**
-
-## Why It's Not Done
-
-Implementing a working x64 VM interpreter requires:
-
-1. **API Resolution**: GetProcAddress or PEB walking to find kernel32 functions
-2. **Calling Convention**: Proper x64 fastcall with shadow space
-3. **Register Storage**: 16 VM registers on stack or in memory
-4. **Error Handling**: Graceful failures
-5. **Testing**: Must test on actual Windows, cannot test on Linux
-
-Writing correct x64 assembly inline without testing is error-prone.
-
-## What Was Attempted
-
-Three approaches were tried:
-
-### Attempt 1: JMP to Original Entry
-- ✅ This worked! PE loaded and ran
-- ❌ Not virtualization - just redirects to original code
-- ❌ Fails requirement: "Do NOT JMP/CALL to original entry point"
-
-### Attempt 2: Inline VM Interpreter
-- Wrote ~200 bytes of x64 assembly
-- Attempted to implement LoadImm/NativeCall/Exit dispatcher
-- Used placeholder addresses for API calls
-- ❌ Cannot test on Linux
-- ❌ Likely has bugs
-
-### Attempt 3: Simplified Stub
-- Reduced to minimal interpreter structure
-- Hardcoded API addresses (won't work)
-- ❌ Still non-functional
-
-## Acceptance Test Status
-
-User's test on Windows:
-```bash
-# 1. Pack
-knvest pack sample/hello.exe -o sample/hello_packed.exe
-✅ Works - packed file created
-
-# 2. View IR
-knvest ir sample/hello_packed.exe
-✅ Works - shows real VM opcodes
-
-# 3. Run
-sample/hello_packed.exe
-❌ Expected: Hello, World!
-❌ Actual: Likely crashes or STATUS_INVALID_IMAGE_FORMAT
-
-# 4. Overwrite original EP with CC, run again
-❌ Would fail even if step 3 passed (interpreter incomplete)
-```
-
-## What's Needed
-
-To complete this:
-
-1. Write standalone x64 assembly file for VM interpreter
-2. Assemble with nasm/masm
-3. Test on Windows until it works
-4. Extract machine code bytes
-5. Update `create_vm_interpreter_stub()` with working bytes
-6. Test packed PE on Windows
-7. Iterate until acceptance test passes
-
-OR:
-
-Use simpler approach:
-- Add GetStdHandle/WriteFile to PE import table
-- Reference imports from stub
-- Simpler but requires more PE modifications
-
-## Educational Value
-
-This project demonstrates:
-- ✅ PE file format manipulation
-- ✅ Section addition without corruption
-- ✅ Bytecode generation and embedding
-- ✅ IR disassembly
-- ✅ Handling real-world PEs (MinGW with overlays)
-- ❌ **Full VM-based execution** (not yet implemented)
-
-## Recommendation
-
-Two paths forward:
-
-### Path A: Complete The Interpreter
-- Requires x64 assembly expertise
-- Requires Windows testing environment
-- Time: Several hours of careful development
-
-### Path B: Document As Learning Project
-- Current state shows PE manipulation mastery
-- VM interpreter is well-documented challenge
-- Bytecode format is correct and ready
-- Stub location and structure is correct
-- Just needs the x64 assembly implementation
-
-## Key Insight
-
-The **hardest part** of VM protection is not PE manipulation (that's done) - it's writing a **reliable x64 interpreter** that:
-- Resolves APIs dynamically
-- Manages VM state correctly
-- Handles edge cases
-- Works across Windows versions
-
-This is why commercial protectors are complex.
-
-## Current Code Quality
-
-What's implemented is:
-- ✅ Production-quality PE manipulation
-- ✅ Well-tested (18 tests)
-- ✅ Handles edge cases (overlays, symbols, strings)
-- ✅ Original code (no repos copied)
-- ❌ VM interpreter stub needs expert x64 assembly work
-
-The foundation is solid. The last mile (working x64 interpreter) is the hard part.
+## Remaining Scope Boundaries (By Design)
+- Floating-point / XMM / AVX instructions, SEH/pdata unwinding tables, TLS callbacks, and multi-threaded synchronization primitives remain outside the scope of this educational protector.

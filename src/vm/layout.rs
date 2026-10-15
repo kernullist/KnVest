@@ -230,6 +230,98 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+const STREAM_CIPHER_SALT: u64 = 0x4B4E_5637_5354_524D; // "KNV7STRM"
+const REG_PERM_SALT: u64 = 0x4B4E_5637_5250_4552; // "KNV7RPER"
+
+/// L7.4: Rolling SplitMix64 stream cipher for bytecode & metadata obfuscation
+/// and seed-derived register slot permutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BytecodeCipher {
+    pub seed: u64,
+    pub initial_state: u64,
+    pub reg_perm: [u8; 32],
+    pub inv_reg_perm: [u8; 32],
+}
+
+impl BytecodeCipher {
+    pub fn from_seed(seed: u64) -> Self {
+        let initial_state = splitmix64(seed ^ STREAM_CIPHER_SALT);
+        // Permute extended local spill slots r16..=r31 while keeping ABI & core slots r0..=r15 fixed
+        // so Win64 ABI conventions (r0..r3) and scratch slots (r14, r15) remain deterministic.
+        let mut reg_perm = [0u8; 32];
+        let mut inv_reg_perm = [0u8; 32];
+        for i in 0..32u8 {
+            reg_perm[i as usize] = i;
+        }
+        let mut s = seed ^ REG_PERM_SALT;
+        for i in (17..32usize).rev() {
+            s = splitmix64(s);
+            let span = i - 16 + 1;
+            let j = 16 + (s as usize % span);
+            reg_perm.swap(i, j);
+        }
+        for (idx, &mapped) in reg_perm.iter().enumerate() {
+            inv_reg_perm[mapped as usize] = idx as u8;
+        }
+        Self {
+            seed,
+            initial_state,
+            reg_perm,
+            inv_reg_perm,
+        }
+    }
+
+    /// Generate the rolling XOR key byte at stream position `offset`.
+    #[inline]
+    pub fn keystream_byte(&self, offset: usize) -> u8 {
+        let word_idx = (offset / 8) as u64;
+        let byte_idx = (offset % 8) * 8;
+        let word = splitmix64(self.initial_state.wrapping_add(word_idx.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        ((word >> byte_idx) & 0xFF) as u8
+    }
+
+    /// Apply symmetric rolling XOR stream cipher in-place.
+    pub fn apply_keystream(&self, buf: &mut [u8]) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b ^= self.keystream_byte(i);
+        }
+    }
+
+    /// Encrypt a slice and return the ciphertext.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+        let mut out = plaintext.to_vec();
+        self.apply_keystream(&mut out);
+        out
+    }
+
+    /// Decrypt a slice and return the plaintext.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Vec<u8> {
+        let mut out = ciphertext.to_vec();
+        self.apply_keystream(&mut out);
+        out
+    }
+
+    /// Map a logical VM register index (`0..32`) to its seed-diversified physical slot.
+    #[inline]
+    pub fn map_reg(&self, logical_reg: u8) -> u8 {
+        if (logical_reg as usize) < 32 {
+            self.reg_perm[logical_reg as usize]
+        } else {
+            logical_reg
+        }
+    }
+
+    /// Map a physical slot index (`0..32`) back to its logical VM register.
+    #[inline]
+    pub fn unmap_reg(&self, physical_reg: u8) -> u8 {
+        if (physical_reg as usize) < 32 {
+            self.inv_reg_perm[physical_reg as usize]
+        } else {
+            physical_reg
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
