@@ -1,37 +1,41 @@
 # KnVest
 
-Toy VM protector + IR viewer for your own PE64 binaries (educational/dev tool)
+Educational x64 VM protector + IR viewer for Windows PE64 (`PE32+`) binaries.
 
 ## What It Is
 
-KnVest is an educational tool that demonstrates basic VM-based code protection for Windows PE64 executables. It provides:
+KnVest is an educational and research tool that demonstrates layered VM-based code virtualization and bytecode diversification for Windows x86-64 executables. It provides:
 
-1. A simple register-based virtual machine (VM)
-2. A packer that lifts x64 code into VM bytecode and injects an in-process interpreter stub
-3. An IR viewer that pretty-prints the embedded VM bytecode as human-readable assembly
+1. A dual-mode virtual machine (`reg` 3-operand register ISA and `stack` push/pop ALU ISA) with 16 virtual registers, call stack, data stack, and x64 flags (`ZF`/`SF`/`CF`/`OF`)
+2. A PE64 packer that decodes x64 functions via [`iced-x86`](https://github.com/icedland/iced), lifts them into custom VM bytecode, and injects a standalone in-process x64 interpreter stub into a `.knvest` section
+3. An IR disassembler (`knvest ir`) that reconstructs per-seed wire mappings, transition tables, layout padding, MBA headers, and nested-VM tables to pretty-print embedded VM bytecode
 
 **Language:** Rust  
-**Target:** Windows x86-64 PE (PE32+)
+**Target:** Windows x86-64 PE (`PE32+`)
 
 ## What It Is NOT
 
-This is a toy/educational project, not a production-grade protector. It does NOT include:
+This is an educational project, not a commercial protector. It does NOT include:
 
-- Commercial packer features (anti-debug, anti-VM, anti-dump)
-- Sophisticated obfuscation (mutation, MBA, control-flow flattening)
-- Full x64 instruction virtualization
-- GUI, kernel drivers, or overlay packing
-- Decompilation or LLVM/MLIR integration
+- Anti-debug, anti-VM, or kernel-mode drivers
+- Full x64 ISA / SIMD / floating-point coverage
+- Decompilation or LLVM/MLIR bitcode lifting
 
-## Features
+## Architecture & Protection Layers (L1 – L6)
 
-- **Minimal VM**: 16 registers, call stack, data stack, opcodes (load, arithmetic, control flow, native helpers)
-- **Pack**: Lifts `main` and CFG-reachable callees into VM bytecode; new PE entry is the interpreter stub (`0x55` = `push rbp`, not a JMP-to-OEP trampoline)
-- **IAT native calls (L3)**: Parses the PE import directory; `call [rip+IAT]` to `puts`/`printf`/etc. emits `native_call` with win64 ABI (rcx/rdx/r8/r9 + shadow space) via the real IAT slot
-- **CFG function collection (L3)**: BFS over direct near calls from the entry function instead of the old “main-front + push rbp only” heuristic; prologue-less entries accepted when reachable
-- **IR Display**: Pretty-prints VM bytecode with addresses and operands
-- **x64 lifter**: Uses [iced-x86](https://github.com/icedland/iced) to decode the lifted code window
-- **Portable**: Written in Rust, runs on Linux/Windows for pack/IR; packed binaries run on Windows
+| Layer | Feature | Trailer / Module | Summary |
+|-------|---------|------------------|---------|
+| **L1–L3** | PE64 parsing, CFG collection, IAT `native_call`, standalone x64 stub | `parser.rs`, `cfg.rs`, `imports.rs`, `lifter.rs`, `vm_stub.rs` | BFS over direct `call rel32` targets in `.text`; `call [rip+IAT]` resolved via PE import directory and invoked with Win64 ABI (`rcx`/`rdx`/`r8`/`r9` + shadow space) |
+| **L4a** | Seeded wire-byte permutation & handler order shuffle | `opcode_map.rs` (`KNV4` v1–v5) | Permutes the 21 canonical opcode wire bytes across `0x00..=0xFF` (`0xFD` reserved for `SetBlockMap` meta-wire) and shuffles native handler emission order in `.knvest` |
+| **L4b / L5a / L6** | Handler polymorphism (n:1 native bodies) | `opcode_map.rs`, `vm_stub.rs`, `virt_isa.rs` | Seed-selected semantically equivalent x64 handler bodies for `Add` (3), `Sub` (2), `Xor` (2), `And` (2), `Mul` (2), and `Move` (2), plus virtual-ISA `sub` split (`neg` + `add`) |
+| **L4c** | Table vs. threaded dispatch | `dispatch.rs`, `threaded.rs` | `--dispatch table` (256-entry handler table) or `--dispatch threaded` (inline `rel32` handler offsets after each wire byte, direct handler-to-handler tail jump) |
+| **L4d** | Partial BB virtualization & native bail-out | `partial.rs` (`KNV5`) | `--partial` keeps selected straight-line basic blocks native via `run_native` / `bail_native` sleds while synchronizing VM spill registers (`r10..r15`) with the native `[rbp±disp]` frame |
+| **L4e / L5d** | Transition-keyed per-edge opcode maps | `block_map.rs` (`KNV6` v1–v3) | Per-CFG-edge `(pred_bb, succ_bb) -> tx_id` 256-entry dispatch tables switched at basic-block boundaries and edge landing pads via `[0xFD][tx_id: u16]` (`set_block_map`) |
+| **L4f / L5b / L6** | Mixed Boolean-Arithmetic (MBA) & constant unfolding | `mba.rs` | `--mba 0\|1\|2` rewrites `Add`, `Sub`, `Xor`, `And`, and synthesized `Or` (`a \| b = (a ^ b) + (a & b)`) into multi-instruction boolean-arithmetic sequences; `emit_load_imm_unfolded` splits 64-bit immediates with seed-derived masks |
+| **L5c** | Bytecode layout diversification | `layout.rs`, `layout_pass.rs` (`KNV7`) | Inserts 0–3 bytes of seed-derived post-wire dead padding (`0xCC`) per opcode and relocates all branch, call, and string-pool offsets |
+| **L5e** | Dual virtual ISA (`reg` / `stack`) | `isa_mode.rs` | `--isa reg` (default 3-operand register ALU) or `--isa stack` (stack-machine ALU popping operands and pushing results on the VM data stack) |
+| **L5f** | Nested VM (two-layer dispatch) | `nested_vm.rs` (`KNV4` v5, `KNV6` v3) | `--nested` separates **outer decode** (per-transition `outer_decode[256]` wire translation) from **inner execute** (`dispatch_inner` handler table) |
+| **L6** | Extended x64 lifter & branch semantics | `lifter.rs`, `cfg.rs`, `machine.rs`, `vm_stub.rs` | Lifts bitwise/unary/shift ops (`AND`, `OR`, `XOR`, `NOT`, `NEG`, `SHL`, `TEST reg, imm`) across register, immediate, and `[rbp±disp]` stack slots, and supports signed, unsigned, and sign conditional jumps (`JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE`, `JA`, `JAE`, `JB`, `JBE`, `JS`, `JNS`) |
 
 ## Build
 
@@ -45,137 +49,114 @@ The binary will be at `target/release/knvest` (or `knvest.exe` on Windows).
 
 ### Pack an Executable
 
-Virtualize the detected `main` function (default: auto-detect) and write a new PE whose entry point runs the VM interpreter:
+Virtualize the detected `main` function (and CFG-reachable callees in `.text`) and write a new PE whose entry point starts at the `.knvest` VM interpreter stub (`0x55` = `push rbp`):
 
 ```bash
 knvest pack input.exe -o output.exe
 ```
 
-To specify a custom function RVA (lifts that function and all CFG-reachable callees within `.text`):
+#### CLI Options (`knvest pack`)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o, --output <FILE>` | *(required)* | Output packed PE64 executable path |
+| `--rva <HEX>` | auto-detect `main` | Custom function RVA to protect (e.g., `--rva 0x1400`) |
+| `--seed <SEED>` | random per pack | 64-bit seed (hex `0x...` or decimal) controlling wire permutation, handler variants, layout padding, MBA catalog selection, and nested tables |
+| `--dispatch <MODE>` | `table` | Dispatch mode: `table` (256-entry handler table) or `threaded` (inline `rel32` handler targets) |
+| `--partial` | `false` | Enable L4d partial BB virtualization (`run_native` / `bail_native` sleds) |
+| `--mba [LEVEL]` | `0` (`off`) | MBA substitution depth: `0`/`off`, `1`/`on` (single catalog rewrite), or `2` (nested depth-limited rewrite) |
+| `--isa <MODE>` | `reg` | Virtual ISA operand model: `reg` (3-operand registers) or `stack` (push/pop stack ALU) |
+| `--nested` | `false` | Enable L5f nested VM (outer decode + inner execute; requires `--dispatch table`) |
+
+Example invocations:
 
 ```bash
-knvest pack input.exe -o output.exe --rva 0x1234
+# Reproducible seed + threaded dispatch
+knvest pack input.exe -o output.exe --seed 0xdeadbeef --dispatch threaded
+
+# Depth-2 MBA + stack-machine virtual ISA
+knvest pack input.exe -o output.exe --seed 0x1337c0de --mba 2 --isa stack
+
+# Nested VM (outer decode + inner execute) with partial virtualization
+knvest pack input.exe -o output.exe --seed 0xfeedface --nested --partial
 ```
-
-```bash
-knvest pack input.exe -o output.exe --seed 0xdeadbeef
-```
-
-```bash
-knvest pack input.exe -o output.exe --nested
-```
-
-Each pack (or explicit `--seed`) permutes the 18 implemented opcode wire bytes, shuffles handler placement in the stub, and (L4b) selects native handler bodies for polymorphic opcodes. The seed and wire table are embedded in `.knvest` immediately before the `VMBC` marker as a `KNV4` header so `knvest ir` can decode shuffled bytecode. Handler variant indices are derived from the same seed at pack time (not stored separately). Packing without a reproducible seed picks a random value and records it in the image.
-
-### L5f nested VM (`--nested`, default off)
-
-Inspired by public nested-virtualization ideas (e.g. Tigress NestedVirtualize / DSVMP *concepts* — no commercial packer code), `--nested` adds a **two-layer dispatch** in the interpreter stub:
-
-1. **Outer decode** (`dispatch`): reads the bytecode wire byte and translates it through a per-transition `outer_decode` table (KNV6 v3, swapped on `set_block_map` like handler redirect tables).
-2. **Inner execute** (`dispatch_inner`): uses the translated inner wire to index the handler redirect table and jump to the native handler body.
-
-Bytecode encoding is unchanged (still uses outer/L4a wires); only the runtime stub gains the extra hop. `knvest ir` prints an `L5f nested=outer_decode+inner_execute` header with inner-seed and sample outer→inner wire mappings when the `KNV4` v5 nested flag is set. Requires table dispatch (`--dispatch table`; threaded is rejected). This is intentionally slower than single-VM dispatch — it teaches how nested interpreters separate decode from execute, at the cost of an extra table lookup per instruction.
 
 ### View IR
 
-Pretty-print the VM bytecode from a packed executable:
+Pretty-print the VM metadata headers and disassembled bytecode from a packed executable:
 
 ```bash
 knvest ir output.exe
 ```
 
-Example output (bytecode differs per sample):
+Example output:
 
-```
+```text
+L4c dispatch=table | L4a seed=0xdeadbeef
+L4e/L5d block_map: blocks=4 transitions=5 ...
+L5c layout: pad_counts=[...]
+L5a virt_isa: add(v1) sub(v0) xor(v1) and(v0) mul(v1) move(v0) ...
+L5e isa=reg
 Address  | Opcode       | Operands
 ---------+--------------+---------
-00000000 | push         | r5
-00000002 | move         | r5, r4
+00000000 | set_block_map| tx#0
+00000003 | push         | r5
+00000005 | move         | r5, r4
 ...
 00000024 | native_call  | 0x100000030
 0000002d | load_imm     | r0, 0x0
 00000036 | exit         | r0
 ```
 
-`native_call` values `0x100000000 | iat_rva` invoke the imported function through the IAT with win64 calling convention. Legacy helpers remain: `1` = WriteFile string, `2` = integer print, `3` = putchar.
+`native_call` values `0x100000000 | iat_rva` invoke imported Win32/CRT functions through the PE IAT using the Win64 calling convention. Legacy helpers remain supported (`1` = `WriteFile` string, `2` = integer print, `3` = `putchar`).
 
-## Runtime Model
+## Runtime & Trailer Metadata
 
-1. **Parse PE** — locate `main` (or use `--rva`), parse import directory / IAT
-2. **CFG collect** — BFS from entry over direct `call rel32` targets in `.text`
-3. **Lift** via iced-x86 → VM opcodes; IAT thunks (`call [rip+disp]`) → IAT `native_call`; CRT startup imports (`__main`, `_initterm`, …) skipped by name
-4. **Inject** `.knvest` section: x64 interpreter stub + `KNV4` opcode map + `VMBC` + bytecode
-5. **Redirect** EP to stub (first byte `0x55`)
-6. **Execute**: stub dispatches via a 256-entry handler table keyed by shuffled wire bytes; I/O via IAT win64 `native_call` or legacy helpers
+The `.knvest` section embeds the x64 interpreter stub, string pool, native sleds (when `--partial` is active), metadata trailers, and the `VMBC` bytecode payload:
 
-### L4a opcode map (`KNV4` header)
+- **`KNV4` (v1–v5)**: Pack seed, dispatch mode, MBA level, `IsaMode` (`reg`/`stack`), `nested_vm` flag, and the 21-byte canonical wire table (`Nop`, `LoadImm`, `Move`, `Add`, `Sub`, `Mul`, `Cmp`, `Jmp`, `JmpIf`, `Call`, `Ret`, `NativeCall`, `Push`, `Pop`, `LoadByte`, `Cmp32`, `And`, `Xor`, `RunNative`, `BailNative`, `Exit`).
+- **`KNV5`**: L4d partial virtualization plan and native sled RVA mappings.
+- **`KNV6` (v1–v3)**: L4e/L5d transition-keyed opcode maps and (in v3) per-transition `outer_decode[256]` tables for L5f `--nested`.
+- **`KNV7`**: L5c per-opcode post-wire dead-byte padding (`0..=3` bytes) table.
 
-Placed in `.knvest` after string blobs, 16-byte aligned, immediately before `VMBC`:
+### Handler Polymorphism (`L4b` / `L5a` / `L6`)
 
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 4 | Magic `KNV4` |
-| 4 | 1 | Version `1` |
-| 5 | 8 | Pack seed (`u64` LE) |
-| 13 | 18 | Wire bytes for canonical opcodes (Nop, LoadImm, Move, …, Exit) |
+Logical opcodes with multiple native x64 handler bodies selected deterministically from `--seed`:
 
-`knvest ir` scans `.knvest` for `KNV4`, rebuilds the decode table, and prints logical mnemonics. Raw bytecode without this header cannot be disassembled.
+| Logical Opcode | Variants | Summary of Native x64 Implementations |
+|----------------|----------|---------------------------------------|
+| `add` | 3 | `add rax, [src2]`, `lea rax, [rax+rbx]`, or direct destination store + memory `add` |
+| `sub` | 2 | `sub rax, [src2]` vs. `not rbx; inc rbx; add rax, rbx` (two's-complement negation) |
+| `xor` | 2 | Direct `xor rax, [src2]` vs. register-staged `mov rbx, [src2]; xor rax, rbx` |
+| `and` | 2 | Direct `and rax, [src2]` vs. De Morgan `not rax; not rbx; or rax, rbx; not rax` |
+| `mul` | 2 | `imul rax, [src2]` vs. register-staged `mov rbx, [src2]; imul rax, rbx` |
+| `move` | 2 | `mov rax, [src]; mov [dst], rax` vs. `push qword [src]; pop qword [dst]` |
 
-### L4b handler polymorphism (n:1)
+### Lifter & Condition Code Coverage (`L1` – `L6`)
 
-Some logical opcodes can map to **multiple semantically equivalent native handler bodies** chosen at pack time. The stub still dispatches through the same 256-entry handler table keyed by L4a wire bytes; only the target handler bytes change.
-
-Currently polymorphic:
-
-| Logical opcode | Variants | Selection |
-|----------------|----------|-----------|
-| `add` | 3 | `splitmix64(seed ^ 0x504F4C59 ^ canonical_index(Add)) % 3` |
-
-Variant bodies (all read `dst, src1, src2` from bytecode and store `src1 + src2` into `dst`):
-
-- **v0** — `mov rax, [src1]; add rax, [src2]`
-- **v1** — `mov rax, [src1]; mov rbx, [src2]; lea rax, [rax+rbx]`
-- **v2** — store `[src1]` to `dst`, reload `dst`, then `add [src2]`
-
-Different `--seed` values therefore change Add handler machine code while IR mnemonics and program output stay the same. Extend by adding variants in `vm_stub.rs` and bumping `ADD_HANDLER_VARIANT_COUNT` in `opcode_map.rs`.
-
-Overwriting the original EP bytes with `0xCC` still works.
-
-**Cmp / branches**: ZF/SF/CF/OF stored x64-style; `jmp_if` uses native Jcc semantics on restored flags.
+- **Data movement & stack frame**: `mov`, `movsxd`, `movzx`, `cdqe`, `lea`, `push`, `pop`, `[rbp±disp]` local/argument slots
+- **Arithmetic, bitwise, unary & shift**: `add`, `sub`, `imul`, `inc`, `dec`, `and`, `or` (synthesized via MBA-compatible `(a ^ b) + (a & b)`), `xor`, `not`, `neg`, `shl`
+- **Comparisons & tests**: `cmp` (64-bit and 32-bit `cmp32` across registers, immediates, and `[rbp±disp]`), `test reg, reg`, `test reg, imm`
+- **Control flow & `jmp_if` condition codes (`1..=12`)**:
+  - `1` = `JE`/`JZ`, `2` = `JNE`/`JNZ`
+  - `3` = `JG` (signed `>`), `4` = `JL` (signed `<`), `5` = `JLE` (signed `<=`), `6` = `JGE` (signed `>=`)
+  - `7` = `JA` (unsigned `>`), `8` = `JAE` (unsigned `>=`), `9` = `JB` (unsigned `<`), `10` = `JBE` (unsigned `<=`)
+  - `11` = `JS` (`SF=1`), `12` = `JNS` (`SF=0`)
 
 ## Sample Programs
 
 Eight MinGW-style C samples in `sample/`:
 
-| Sample        | Behavior |
-|---------------|----------|
-| `hello`       | `printf("Hello, World!\n")` — legacy native_call 1 or IAT printf when resolved |
-| `puts_hello`  | **`puts("IAT puts hello")` — documents IAT win64 native_call path** |
-| `loop`        | Countdown loop |
-| `arith`       | Arithmetic |
-| `call`        | Internal calls |
-| `nested`      | Nested loops, putchar |
-| `fact`        | Recursive factorial |
-| `str`         | LoadByte string walk |
-
-### Building Samples (Windows / MinGW)
-
-```bash
-x86_64-w64-mingw32-gcc sample/hello.c -o sample/hello.exe
-x86_64-w64-mingw32-gcc sample/puts_hello.c -o sample/puts_hello.exe
-x86_64-w64-mingw32-gcc -O0 sample/loop.c -o sample/loop.exe
-# ... arith, call, nested, fact, str
-```
-
-### Pack and Run (Windows)
-
-```bash
-knvest pack sample/puts_hello.exe -o sample/puts_hello_packed.exe
-knvest ir sample/puts_hello_packed.exe    # expect native_call 0x10000xxxx (puts IAT RVA)
-sample\puts_hello_packed.exe              # IAT puts hello
-```
-
-Regression samples (hello, loop, arith, call, nested, fact, str) must still pack/ir/run with the same stdout as before.
+| Sample | Behavior |
+|--------|----------|
+| `hello` | `printf("Hello, World!\n")` — legacy `native_call` 1 or IAT `printf` when resolved |
+| `puts_hello` | `puts("IAT puts hello")` — exercises the IAT Win64 `native_call` path |
+| `loop` | Countdown loop |
+| `arith` | Multi-operand arithmetic |
+| `call` | Internal function calls |
+| `nested` | Nested loops + `putchar` |
+| `fact` | Recursive factorial |
+| `str` | `LoadByte` string walk |
 
 ## Testing
 
@@ -183,32 +164,45 @@ Regression samples (hello, loop, arith, call, nested, fact, str) must still pack
 cargo test
 ```
 
-Tests cover IAT parse/resolve, CFG collection, `--rva` packing, VM semantics, stub invariants, and integration pack→IR. Unit tests run on Linux without a Windows runtime.
+The test suite (**255 tests**: 250 unit tests + 5 integration tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L6 lifting, MBA & constant unfolding, handler polymorphism, transition-keyed maps, layout padding, stack ISA, and nested VM execution.
 
 ## Project Structure
 
-```
+```text
 src/
-├── vm/          - Virtual machine (reference interpreter for tests)
-├── ir/          - IR disassembly and display
+├── vm/
+│   ├── opcode.rs      - Logical VM opcodes
+│   ├── opcode_map.rs  - L4a wire shuffle, KNV4 metadata, handler variant counts
+│   ├── virt_isa.rs    - L5a virtual ISA split/merge & ALU polymorphism helpers
+│   ├── dispatch.rs    - L4c table vs. threaded dispatch modes
+│   ├── block_map.rs   - L4e/L5d per-transition opcode maps (KNV6)
+│   ├── layout.rs      - L5c post-wire dead-byte padding plan (KNV7)
+│   ├── isa_mode.rs    - L5e reg vs. stack virtual ISA mode
+│   ├── nested_vm.rs   - L5f outer-decode + inner-execute plan
+│   └── machine.rs     - Reference Rust VM interpreter
+├── ir/                - Layout/transition/ISA-aware bytecode disassembler & printer
 ├── pe/
-│   ├── parser.rs
-│   ├── imports.rs  - PE import directory / IAT resolution
-│   ├── cfg.rs      - CFG-based function collection
-│   ├── lifter.rs   - iced-x86 lifter → VM bytecode
-│   ├── vm_stub.rs  - x64 interpreter stub generator
-│   └── packer.rs
-├── pack/
-├── cli/
+│   ├── parser.rs      - PE32+ parser
+│   ├── imports.rs     - PE import directory / IAT resolution
+│   ├── cfg.rs         - CFG reconstruction & function collection
+│   ├── lifter.rs      - iced-x86 lifter → VM bytecode
+│   ├── mba.rs         - L4f/L5b/L6 MBA rewrites, OR synthesis, constant unfolding
+│   ├── partial.rs     - L4d partial BB virtualization & native sleds (KNV5)
+│   ├── threaded.rs    - L4c threaded dispatch pass
+│   ├── layout_pass.rs - L5c bytecode layout padding & offset relocation
+│   ├── vm_stub.rs     - Standalone x64 machine-code interpreter stub generator
+│   └── packer.rs      - End-to-end `.knvest` section builder
+├── pack/              - High-level pack orchestration
+├── cli/               - CLI argument parsing
 └── main.rs
 
-sample/          - hello, puts_hello, loop, arith, call, nested, fact, str
-tests/
+sample/                - hello, puts_hello, loop, arith, call, nested, fact, str
+tests/                 - Integration tests
 ```
 
 ## License
 
-MIT License (see LICENSE file)
+MIT License (see `LICENSE` file).
 
 ## Disclaimer
 
