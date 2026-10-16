@@ -45,6 +45,18 @@ pub const XMM_MOVAPS_XM: u8 = 22;
 pub const XMM_MOVAPS_MX: u8 = 23;
 pub const XMM_MOVUPS_XM: u8 = 24;
 pub const XMM_MOVUPS_MX: u8 = 25;
+pub const XMM_MOVQ_XX: u8 = 26;
+pub const XMM_MOVD_XX: u8 = 27;
+pub const XMM_COMISS: u8 = 28;
+pub const XMM_COMISD: u8 = 29;
+pub const XMM_CVTSI2SS: u8 = 30;
+pub const XMM_CVTTSS2SI: u8 = 31;
+pub const XMM_CVTSS2SD: u8 = 32;
+pub const XMM_CVTSD2SS: u8 = 33;
+pub const XMM_MOVQ_XM: u8 = 34;
+pub const XMM_MOVQ_MX: u8 = 35;
+pub const XMM_MOVD_XM: u8 = 36;
+pub const XMM_MOVD_MX: u8 = 37;
 
 pub const XMM_SLOT_COUNT: usize = 16;
 
@@ -132,14 +144,24 @@ pub fn xmm_mnemonic(subop: u8) -> &'static str {
         XMM_CVTTSD2SI => "xmm_cvttsd2si",
         XMM_XORPS => "xmm_xorps",
         XMM_XORPD => "xmm_xorpd",
+        XMM_MOVQ_XX | XMM_MOVQ_XM | XMM_MOVQ_MX => "xmm_movq",
+        XMM_MOVD_XX | XMM_MOVD_XM | XMM_MOVD_MX => "xmm_movd",
+        XMM_COMISS => "xmm_comiss",
+        XMM_COMISD => "xmm_comisd",
+        XMM_CVTSI2SS => "xmm_cvtsi2ss",
+        XMM_CVTTSS2SI => "xmm_cvttss2si",
+        XMM_CVTSS2SD => "xmm_cvtss2sd",
+        XMM_CVTSD2SS => "xmm_cvtsd2ss",
         _ => "xmm_op",
     }
 }
 
 fn operand_name(subop: u8, idx: u8, is_dst: bool) -> String {
     let gp = match subop {
-        XMM_MOVSS_XM | XMM_MOVSD_XM | XMM_MOVAPS_XM | XMM_MOVUPS_XM | XMM_CVTSI2SD => !is_dst,
-        XMM_MOVSS_MX | XMM_MOVSD_MX | XMM_MOVAPS_MX | XMM_MOVUPS_MX | XMM_CVTTSD2SI => is_dst,
+        XMM_MOVSS_XM | XMM_MOVSD_XM | XMM_MOVAPS_XM | XMM_MOVUPS_XM | XMM_MOVQ_XM
+        | XMM_MOVD_XM | XMM_CVTSI2SD | XMM_CVTSI2SS => !is_dst,
+        XMM_MOVSS_MX | XMM_MOVSD_MX | XMM_MOVAPS_MX | XMM_MOVUPS_MX | XMM_MOVQ_MX
+        | XMM_MOVD_MX | XMM_CVTTSD2SI | XMM_CVTTSS2SI => is_dst,
         _ => false,
     };
     if gp {
@@ -219,6 +241,10 @@ pub fn compare_f32_flags(dest: f32, src: f32) -> u64 {
     }
 }
 
+pub fn cvttss2si_bits(bits: u32) -> u64 {
+    cvttsd2si_bits((f32::from_bits(bits) as f64).to_bits())
+}
+
 pub fn cvttsd2si_bits(bits: u64) -> u64 {
     let f = f64::from_bits(bits);
     if !f.is_finite() || f >= (i64::MAX as f64) || f < (i64::MIN as f64) {
@@ -270,19 +296,21 @@ pub fn exec_xmm(
                 xmm[di] = xmm[si];
             }
         }
-        XMM_MOVSS_XM => {
+        XMM_MOVSS_XM | XMM_MOVD_XM => {
             let bits = gp_read(gp, src)?;
             xmm[di] = bits & 0xFFFF_FFFF;
         }
-        XMM_MOVSD_XM => {
+        XMM_MOVSD_XM | XMM_MOVQ_XM => {
             xmm[di] = gp_read(gp, src)?;
         }
-        XMM_MOVSS_MX => {
+        XMM_MOVSS_MX | XMM_MOVD_MX => {
             gp_write(gp, dst, xmm[si] & 0xFFFF_FFFF)?;
         }
-        XMM_MOVSD_MX | XMM_MOVAPS_MX | XMM_MOVUPS_MX => {
+        XMM_MOVSD_MX | XMM_MOVAPS_MX | XMM_MOVUPS_MX | XMM_MOVQ_MX => {
             gp_write(gp, dst, xmm[si])?;
         }
+        XMM_MOVQ_XX => xmm[di] = xmm[si],
+        XMM_MOVD_XX => xmm[di] = xmm[si] & 0xFFFF_FFFF,
         XMM_ADDSS => xmm[di] = f32_binop(xmm[di], xmm[si], |a, b| a + b),
         XMM_SUBSS => xmm[di] = f32_binop(xmm[di], xmm[si], |a, b| a - b),
         XMM_MULSS => xmm[di] = f32_binop(xmm[di], xmm[si], |a, b| a * b),
@@ -292,11 +320,11 @@ pub fn exec_xmm(
         XMM_MULSD => xmm[di] = f64_binop(xmm[di], xmm[si], |a, b| a * b),
         XMM_DIVSD => xmm[di] = f64_binop(xmm[di], xmm[si], |a, b| a / b),
         XMM_XORPS | XMM_XORPD => xmm[di] ^= xmm[si],
-        XMM_UCOMISS => {
+        XMM_UCOMISS | XMM_COMISS => {
             let flags = compare_f32_flags(f32::from_bits(xmm[di] as u32), f32::from_bits(xmm[si] as u32));
             return Ok(Some(flags));
         }
-        XMM_UCOMISD => {
+        XMM_UCOMISD | XMM_COMISD => {
             let flags = compare_f64_flags(f64::from_bits(xmm[di]), f64::from_bits(xmm[si]));
             return Ok(Some(flags));
         }
@@ -304,8 +332,22 @@ pub fn exec_xmm(
             let bits = gp_read(gp, src)? as i64 as f64;
             xmm[di] = bits.to_bits();
         }
+        XMM_CVTSI2SS => {
+            let low = (gp_read(gp, src)? as i64 as f32).to_bits() as u64;
+            xmm[di] = (xmm[di] & !0xFFFF_FFFF) | low;
+        }
         XMM_CVTTSD2SI => {
             gp_write(gp, dst, cvttsd2si_bits(xmm[si]))?;
+        }
+        XMM_CVTTSS2SI => {
+            gp_write(gp, dst, cvttss2si_bits(xmm[si] as u32))?;
+        }
+        XMM_CVTSS2SD => {
+            xmm[di] = (f32::from_bits(xmm[si] as u32) as f64).to_bits();
+        }
+        XMM_CVTSD2SS => {
+            let low = (f64::from_bits(xmm[si]) as f32).to_bits() as u64;
+            xmm[di] = (xmm[di] & !0xFFFF_FFFF) | low;
         }
         _ => return Err(()),
     }
@@ -371,6 +413,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(flags & 0x40, 0x40);
+    }
+
+    #[test]
+    fn remaining_xmm_moves_compares_and_converts() {
+        let mut xmm = [0u64; XMM_SLOT_COUNT];
+        let mut gp = [0u64; 8];
+        xmm[1] = 0xAAAA_AAAA_FFFF_FFFFu64;
+        exec_xmm(XMM_MOVD_XX, 0, 1, &mut xmm, &mut gp).unwrap();
+        assert_eq!(xmm[0], 0xFFFF_FFFF);
+        exec_xmm(XMM_MOVQ_XX, 2, 1, &mut xmm, &mut gp).unwrap();
+        assert_eq!(xmm[2], xmm[1]);
+
+        gp[3] = 0x1122_3344_5566_7788;
+        exec_xmm(XMM_MOVD_XM, 4, 3, &mut xmm, &mut gp).unwrap();
+        assert_eq!(xmm[4], 0x5566_7788);
+        exec_xmm(XMM_MOVQ_XM, 5, 3, &mut xmm, &mut gp).unwrap();
+        assert_eq!(xmm[5], gp[3]);
+        exec_xmm(XMM_MOVD_MX, 6, 4, &mut xmm, &mut gp).unwrap();
+        assert_eq!(gp[6], 0x5566_7788);
+
+        xmm[0] = 1.0f32.to_bits() as u64;
+        xmm[1] = 2.0f32.to_bits() as u64;
+        let flags = exec_xmm(XMM_COMISS, 0, 1, &mut xmm, &mut gp).unwrap().unwrap();
+        assert_eq!(flags & 0x41, 0x01);
+        xmm[0] = f32::NAN.to_bits() as u64;
+        let flags = exec_xmm(XMM_COMISS, 0, 1, &mut xmm, &mut gp).unwrap().unwrap();
+        assert_eq!(flags & 0x41, 0x41);
+        xmm[0] = 1.25f64.to_bits();
+        xmm[1] = 1.25f64.to_bits();
+        let flags = exec_xmm(XMM_COMISD, 0, 1, &mut xmm, &mut gp).unwrap().unwrap();
+        assert_eq!(flags & 0x40, 0x40);
+
+        gp[2] = 7;
+        xmm[3] = 0x1111_1111_0000_0000;
+        exec_xmm(XMM_CVTSI2SS, 3, 2, &mut xmm, &mut gp).unwrap();
+        assert_eq!(f32::from_bits(xmm[3] as u32), 7.0);
+        assert_eq!(xmm[3] >> 32, 0x1111_1111);
+        xmm[4] = 9.75f32.to_bits() as u64;
+        exec_xmm(XMM_CVTTSS2SI, 1, 4, &mut xmm, &mut gp).unwrap();
+        assert_eq!(gp[1], 9);
+        exec_xmm(XMM_CVTSS2SD, 5, 4, &mut xmm, &mut gp).unwrap();
+        assert_eq!(f64::from_bits(xmm[5]), 9.75);
+        xmm[6] = 0x2222_2222_0000_0000;
+        xmm[7] = 3.5f64.to_bits();
+        exec_xmm(XMM_CVTSD2SS, 6, 7, &mut xmm, &mut gp).unwrap();
+        assert_eq!(f32::from_bits(xmm[6] as u32), 3.5);
+        assert_eq!(xmm[6] >> 32, 0x2222_2222);
+        assert!(format_native_micro(encode_xmm(XMM_COMISS, 0, 1))
+            .unwrap()
+            .contains("xmm_comiss xmm0, xmm1"));
+        assert!(format_native_micro(encode_xmm(XMM_CVTSI2SS, 0, 2))
+            .unwrap()
+            .contains("xmm_cvtsi2ss xmm0, r2"));
+        assert!(format_native_micro(encode_xmm(XMM_CVTTSS2SI, 1, 4))
+            .unwrap()
+            .contains("xmm_cvttss2si r1, xmm4"));
     }
 
     #[test]

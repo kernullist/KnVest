@@ -1920,6 +1920,18 @@ impl StubEmitter {
             (XMM_MOVAPS_MX, "xmm_movaps_mx"),
             (XMM_MOVUPS_XM, "xmm_movups_xm"),
             (XMM_MOVUPS_MX, "xmm_movups_mx"),
+            (XMM_MOVQ_XX, "xmm_movq_xx"),
+            (XMM_MOVD_XX, "xmm_movd_xx"),
+            (XMM_COMISS, "xmm_comiss"),
+            (XMM_COMISD, "xmm_comisd"),
+            (XMM_CVTSI2SS, "xmm_cvtsi2ss"),
+            (XMM_CVTTSS2SI, "xmm_cvttss2si"),
+            (XMM_CVTSS2SD, "xmm_cvtss2sd"),
+            (XMM_CVTSD2SS, "xmm_cvtsd2ss"),
+            (XMM_MOVQ_XM, "xmm_movq_xm"),
+            (XMM_MOVQ_MX, "xmm_movq_mx"),
+            (XMM_MOVD_XM, "xmm_movd_xm"),
+            (XMM_MOVD_MX, "xmm_movd_mx"),
         ];
         for (sub, label) in ops {
             self.emit_xmm_je(*sub, label);
@@ -1940,10 +1952,15 @@ impl StubEmitter {
         self.emit_xmm_binop("xmm_divsd", &[0xF2, 0x0F, 0x5E, 0xC8]);
         self.emit_xmm_binop("xmm_xorps", &[0x0F, 0x57, 0xC8]);
         self.emit_xmm_binop("xmm_xorpd", &[0x66, 0x0F, 0x57, 0xC8]);
-        self.emit_xmm_ucomi("xmm_ucomiss", &[0x0F, 0x2E, 0xC1]);
-        self.emit_xmm_ucomi("xmm_ucomisd", &[0x66, 0x0F, 0x2E, 0xC1]);
+        self.emit_xmm_ucomi("xmm_ucomiss", false, false);
+        self.emit_xmm_ucomi("xmm_ucomisd", true, false);
+        self.emit_xmm_ucomi("xmm_comiss", false, true);
+        self.emit_xmm_ucomi("xmm_comisd", true, true);
         self.emit_xmm_cvtsi2sd();
         self.emit_xmm_cvttsd2si();
+        self.emit_xmm_cvtsi2ss();
+        self.emit_xmm_cvttss2si();
+        self.emit_xmm_cvt_ss_sd();
         self.emit_xmm_gp_load("xmm_movss_xm", true);
         self.emit_xmm_gp_store("xmm_movss_mx", true);
         self.emit_xmm_gp_load("xmm_movsd_xm", false);
@@ -1952,6 +1969,12 @@ impl StubEmitter {
         self.emit_xmm_gp_store("xmm_movaps_mx", false);
         self.emit_xmm_gp_load("xmm_movups_xm", false);
         self.emit_xmm_gp_store("xmm_movups_mx", false);
+        self.emit_xmm_movq_xx();
+        self.emit_xmm_movd_xx();
+        self.emit_xmm_gp_load("xmm_movq_xm", false);
+        self.emit_xmm_gp_store_bits("xmm_movq_mx", false, false);
+        self.emit_xmm_gp_load("xmm_movd_xm", true);
+        self.emit_xmm_gp_store_bits("xmm_movd_mx", true, false);
     }
 
     /// lea r11, xmm_slot[index]; index reg is r8 (src) or rdx (dst).
@@ -2006,17 +2029,16 @@ impl StubEmitter {
         self.emit_xmm_xx_body(label, op_xmm1_xmm0);
     }
 
-    fn emit_xmm_ucomi(&mut self, label: &'static str, op: &[u8]) {
+    fn emit_xmm_ucomi(&mut self, label: &'static str, scalar_double: bool, ordered: bool) {
         self.label(label);
         self.emit_load_dst_xmm1();
         self.emit_load_src_xmm0();
-        // ucomi xmm1, xmm0 — the byte sequence is written for xmm0, xmm1. Rebuild for xmm1, xmm0.
-        // Callers pass `ucomi xmm0, xmm1` encoding; swap to `ucomi xmm1, xmm0` (reg field 1, rm 0).
-        let _ = op;
-        if op[0] == 0x66 {
-            self.emit(&[0x66, 0x0F, 0x2E, 0xC8]); // ucomisd xmm1, xmm0
+        // comi/ucomi xmm1, xmm0. Ordered forms use opcode 0x2F; unordered uses 0x2E.
+        let opc = if ordered { 0x2F } else { 0x2E };
+        if scalar_double {
+            self.emit(&[0x66, 0x0F, opc, 0xC8]);
         } else {
-            self.emit(&[0x0F, 0x2E, 0xC8]); // ucomiss xmm1, xmm0
+            self.emit(&[0x0F, opc, 0xC8]);
         }
         // setb cl; setz dl; zero flags qword; merge CF and ZF<<6
         self.emit(&[0x0F, 0x92, 0xC1]);
@@ -2055,6 +2077,51 @@ impl StubEmitter {
         self.jmp_rel32("nc_done");
     }
 
+    fn emit_xmm_cvtsi2ss(&mut self) {
+        self.label("xmm_cvtsi2ss");
+        self.emit_load_dst_xmm1();
+        self.emit_gp_from_r8();
+        self.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC8]); // cvtsi2ss xmm1, rax
+        self.emit_store_dst_xmm1();
+    }
+
+    fn emit_xmm_cvttss2si(&mut self) {
+        self.label("xmm_cvttss2si");
+        self.emit_load_src_xmm0();
+        self.emit(&[0xF3, 0x48, 0x0F, 0x2C, 0xC0]); // cvttss2si rax, xmm0
+        self.emit_gp_to_rdx();
+        self.jmp_rel32("nc_done");
+    }
+
+    fn emit_xmm_cvt_ss_sd(&mut self) {
+        self.label("xmm_cvtss2sd");
+        self.emit_load_src_xmm0();
+        self.emit_load_dst_xmm1();
+        self.emit(&[0xF3, 0x0F, 0x5A, 0xC8]); // cvtss2sd xmm1, xmm0
+        self.emit_store_dst_xmm1();
+
+        self.label("xmm_cvtsd2ss");
+        self.emit_load_src_xmm0();
+        self.emit_load_dst_xmm1();
+        self.emit(&[0xF2, 0x0F, 0x5A, 0xC8]); // cvtsd2ss xmm1, xmm0
+        self.emit_store_dst_xmm1();
+    }
+
+    fn emit_xmm_movq_xx(&mut self) {
+        self.label("xmm_movq_xx");
+        self.emit_load_src_xmm0();
+        self.emit(&[0xF3, 0x0F, 0x7E, 0xC8]); // movq xmm1, xmm0 (zeros upper 64)
+        self.emit_store_dst_xmm1();
+    }
+
+    fn emit_xmm_movd_xx(&mut self) {
+        self.label("xmm_movd_xx");
+        self.emit_load_src_xmm0();
+        self.emit(&[0x66, 0x0F, 0x7E, 0xC0]); // movd eax, xmm0
+        self.emit(&[0x66, 0x0F, 0x6E, 0xC8]); // movd xmm1, eax (zeros bits 32..127)
+        self.emit_store_dst_xmm1();
+    }
+
     fn emit_xmm_gp_load(&mut self, label: &'static str, low32_only: bool) {
         self.label(label);
         self.emit_gp_from_r8();
@@ -2072,13 +2139,19 @@ impl StubEmitter {
     }
 
     fn emit_xmm_gp_store(&mut self, label: &'static str, low32_only: bool) {
+        self.emit_xmm_gp_store_bits(label, low32_only, low32_only);
+    }
+
+    fn emit_xmm_gp_store_bits(&mut self, label: &'static str, low32_only: bool, sign_extend32: bool) {
         self.label(label);
         self.emit_load_src_xmm0();
         self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
         if low32_only {
             self.emit(&[0xF3, 0x41, 0x0F, 0x11, 0x03]); // movss [r11], xmm0
-            self.emit(&[0x8B, 0x85, 0x40, 0xFB, 0xFF, 0xFF]); // mov eax, [rbp-0x4C0]
-            self.emit(&[0x48, 0x98]); // cdqe
+            self.emit(&[0x8B, 0x85, 0x40, 0xFB, 0xFF, 0xFF]); // mov eax, [rbp-0x4C0] (zero-extends)
+            if sign_extend32 {
+                self.emit(&[0x48, 0x98]); // cdqe — movss bit pattern kept its historical sign extension
+            }
         } else {
             self.emit(&[0xF2, 0x41, 0x0F, 0x11, 0x03]); // movsd [r11], xmm0
             self.emit(&[0x48, 0x8B, 0x85, 0x40, 0xFB, 0xFF, 0xFF]); // mov rax, [rbp-0x4C0]

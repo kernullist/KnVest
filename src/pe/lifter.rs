@@ -406,8 +406,16 @@ fn classify_instruction(instr: &Instruction) -> X64InstrKind {
         | Mnemonic::Ucomisd
         | Mnemonic::Cvtsi2sd
         | Mnemonic::Cvttsd2si
+        | Mnemonic::Cvtsi2ss
+        | Mnemonic::Cvttss2si
+        | Mnemonic::Cvtss2sd
+        | Mnemonic::Cvtsd2ss
         | Mnemonic::Xorps
-        | Mnemonic::Xorpd => classify_sse(instr),
+        | Mnemonic::Xorpd
+        | Mnemonic::Movq
+        | Mnemonic::Movd
+        | Mnemonic::Comiss
+        | Mnemonic::Comisd => classify_sse(instr),
 
         _ => X64InstrKind::Unknown,
     }
@@ -523,8 +531,16 @@ fn classify_sse(instr: &Instruction) -> X64InstrKind {
         Mnemonic::Ucomisd => XMM_UCOMISD,
         Mnemonic::Cvtsi2sd => XMM_CVTSI2SD,
         Mnemonic::Cvttsd2si => XMM_CVTTSD2SI,
+        Mnemonic::Cvtsi2ss => XMM_CVTSI2SS,
+        Mnemonic::Cvttss2si => XMM_CVTTSS2SI,
+        Mnemonic::Cvtss2sd => XMM_CVTSS2SD,
+        Mnemonic::Cvtsd2ss => XMM_CVTSD2SS,
         Mnemonic::Xorps => XMM_XORPS,
         Mnemonic::Xorpd => XMM_XORPD,
+        Mnemonic::Movq => XMM_MOVQ_XX,
+        Mnemonic::Movd => XMM_MOVD_XX,
+        Mnemonic::Comiss => XMM_COMISS,
+        Mnemonic::Comisd => XMM_COMISD,
         _ => return X64InstrKind::Unknown,
     };
     match (xmm_operand(instr, 0), xmm_operand(instr, 1)) {
@@ -2829,8 +2845,14 @@ fn emit_xmm_kind(
         XMM_MOVAPS_XX if !dst_mem && src_mem => XMM_MOVAPS_XM,
         XMM_MOVUPS_XX if dst_mem && !src_mem => XMM_MOVUPS_MX,
         XMM_MOVUPS_XX if !dst_mem && src_mem => XMM_MOVUPS_XM,
+        XMM_MOVQ_XX if dst_mem && !src_mem => XMM_MOVQ_MX,
+        XMM_MOVQ_XX if !dst_mem && src_mem => XMM_MOVQ_XM,
+        XMM_MOVD_XX if dst_mem && !src_mem => XMM_MOVD_MX,
+        XMM_MOVD_XX if !dst_mem && src_mem => XMM_MOVD_XM,
         XMM_CVTSI2SD => XMM_CVTSI2SD,
         XMM_CVTTSD2SI => XMM_CVTTSD2SI,
+        XMM_CVTSI2SS => XMM_CVTSI2SS,
+        XMM_CVTTSS2SI => XMM_CVTTSS2SI,
         other => other,
     };
     emit_native_micro(bytecode, encode_xmm(encoded_sub, dst_i, src_i));

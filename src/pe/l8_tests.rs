@@ -220,6 +220,14 @@ fn l8_stub_emits_rolling_decrypt_and_sse_opcodes() {
     assert!(plain.windows(4).any(|w| w == [0xF2, 0x0F, 0x58, 0xC8]), "addsd");
     assert!(plain.windows(5).any(|w| w == [0xF2, 0x48, 0x0F, 0x2A, 0xC8]), "cvtsi2sd");
     assert!(plain.windows(5).any(|w| w == [0xF2, 0x48, 0x0F, 0x2C, 0xC0]), "cvttsd2si");
+    assert!(plain.windows(4).any(|w| w == [0xF3, 0x0F, 0x7E, 0xC8]), "movq");
+    assert!(plain.windows(4).any(|w| w == [0x66, 0x0F, 0x6E, 0xC8]), "movd");
+    assert!(plain.windows(3).any(|w| w == [0x0F, 0x2F, 0xC8]), "comiss");
+    assert!(plain.windows(4).any(|w| w == [0x66, 0x0F, 0x2F, 0xC8]), "comisd");
+    assert!(plain.windows(5).any(|w| w == [0xF3, 0x48, 0x0F, 0x2A, 0xC8]), "cvtsi2ss");
+    assert!(plain.windows(5).any(|w| w == [0xF3, 0x48, 0x0F, 0x2C, 0xC0]), "cvttss2si");
+    assert!(plain.windows(4).any(|w| w == [0xF3, 0x0F, 0x5A, 0xC8]), "cvtss2sd");
+    assert!(plain.windows(4).any(|w| w == [0xF2, 0x0F, 0x5A, 0xC8]), "cvtsd2ss");
 }
 
 #[test]
@@ -243,6 +251,31 @@ fn l8_lifter_jmp_reg_and_sse_and_switch_cfg() {
     assert!(matches!(cvt[0].kind, X64InstrKind::Xmm { .. }));
     let ucomi = disassemble_x64_simple(&[0x0F, 0x2E, 0xC1], 2);
     assert!(matches!(ucomi[0].kind, X64InstrKind::Xmm { .. }));
+
+    let samples: &[(&[u8], u8, u8, u8)] = &[
+        (&[0xF3, 0x0F, 0x7E, 0xC1], crate::vm::l8::XMM_MOVQ_XX, 0, 1),
+        (&[0x66, 0x0F, 0x6E, 0xC0], crate::vm::l8::XMM_MOVD_XM, 0, 0),
+        (&[0x0F, 0x2F, 0xC1], crate::vm::l8::XMM_COMISS, 0, 1),
+        (&[0x66, 0x0F, 0x2F, 0xC1], crate::vm::l8::XMM_COMISD, 0, 1),
+        (&[0xF3, 0x48, 0x0F, 0x2A, 0xC0], crate::vm::l8::XMM_CVTSI2SS, 0, 0),
+        (&[0xF3, 0x48, 0x0F, 0x2C, 0xC0], crate::vm::l8::XMM_CVTTSS2SI, 0, 0),
+        (&[0xF3, 0x0F, 0x5A, 0xC1], crate::vm::l8::XMM_CVTSS2SD, 0, 1),
+        (&[0xF2, 0x0F, 0x5A, 0xC1], crate::vm::l8::XMM_CVTSD2SS, 0, 1),
+    ];
+    for (bytes, subop, dst, src) in samples {
+        let decoded = disassemble_x64_simple(bytes, 2);
+        assert!(
+            matches!(decoded[0].kind, X64InstrKind::Xmm { .. }),
+            "classify {:?}",
+            decoded[0].kind
+        );
+        let lifted = lift_to_vm_bytecode(&decoded, 0);
+        let id = encode_xmm(*subop, *dst, *src);
+        assert!(
+            lifted.windows(8).any(|w| w == id.to_le_bytes()),
+            "lift {bytes:02x?} missing {id:#x}"
+        );
+    }
 
     let instrs = vec![
         insn(0, 2, X64InstrKind::Ja { target_offset: 100 }),
