@@ -85,6 +85,29 @@ impl Instruction {
         layout: &BytecodeLayout,
         isa_mode: IsaMode,
     ) -> Vec<Self> {
+        Self::disassemble_with_rolling(
+            bytecode,
+            base_map,
+            block_plan,
+            dispatch_mode,
+            layout,
+            isa_mode,
+            false,
+            0,
+        )
+    }
+
+    /// Like [`disassemble_with_layout_and_isa`], decrypting each wire byte when `rolling` is set.
+    pub fn disassemble_with_rolling(
+        bytecode: &[u8],
+        base_map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
+        dispatch_mode: DispatchMode,
+        layout: &BytecodeLayout,
+        isa_mode: IsaMode,
+        rolling: bool,
+        seed: u64,
+    ) -> Vec<Self> {
         let mut instructions = Vec::new();
         let mut offset = 0;
         let mut consecutive_invalid = 0;
@@ -92,7 +115,10 @@ impl Instruction {
 
         while offset < bytecode.len() {
             let start_offset = offset;
-            let opcode_byte = bytecode[offset];
+            let mut opcode_byte = bytecode[offset];
+            if rolling {
+                opcode_byte ^= crate::vm::l8::rolling_wire_mask(seed, start_offset);
+            }
             offset += 1;
             if dispatch_mode == DispatchMode::Threaded {
                 offset += THREAD_TARGET_SIZE;
@@ -336,6 +362,16 @@ impl Instruction {
                     && is_stack_alu_op(instr.opcode)
                 {
                     output.push_str("<stack>");
+                } else if instr.opcode == OpCode::NativeCall {
+                    if let Operand::Immediate(imm) = operand {
+                        if let Some(text) = crate::vm::l8::format_native_micro(*imm) {
+                            output.push_str(&text);
+                        } else {
+                            output.push_str(&operand.to_string());
+                        }
+                    } else {
+                        output.push_str(&operand.to_string());
+                    }
                 } else {
                     output.push_str(&operand.to_string());
                 }

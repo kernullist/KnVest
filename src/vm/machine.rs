@@ -52,6 +52,13 @@ pub struct VirtualMachine {
     /// VM data-stack depth for stack-ISA ALU (mirrors stub [rbp-0xE8]).
     data_stack_depth: usize,
     data_stack: Vec<u64>,
+    /// L8 XMM/SSE scalar file (low 64 bits; high 64 of a 128-bit slot is implicit zero).
+    xmm_registers: [u64; crate::vm::l8::XMM_SLOT_COUNT],
+    /// When set, the opcode wire byte is XOR-decrypted with `rolling_wire_mask(seed, pc)`.
+    rolling_cipher: bool,
+    rolling_seed: u64,
+    /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
+    pub direct_calls: Vec<u32>,
 }
 
 impl VirtualMachine {
@@ -74,6 +81,34 @@ impl VirtualMachine {
             isa_mode: IsaMode::Reg,
             data_stack_depth: 0,
             data_stack: Vec::with_capacity(STACK_SIZE),
+            xmm_registers: [0; crate::vm::l8::XMM_SLOT_COUNT],
+            rolling_cipher: false,
+            rolling_seed: 0,
+            direct_calls: Vec::new(),
+        }
+    }
+
+    /// Fetch-time idempotent rolling decryption. The bytecode image stays ciphertext.
+    pub fn with_rolling_cipher(mut self, seed: u64) -> Self {
+        self.rolling_cipher = true;
+        self.rolling_seed = seed;
+        self
+    }
+
+    pub fn get_xmm(&self, index: u8) -> VMResult<u64> {
+        if (index as usize) < self.xmm_registers.len() {
+            Ok(self.xmm_registers[index as usize])
+        } else {
+            Err(VMError::InvalidRegister(index))
+        }
+    }
+
+    pub fn set_xmm(&mut self, index: u8, value: u64) -> VMResult<()> {
+        if (index as usize) < self.xmm_registers.len() {
+            self.xmm_registers[index as usize] = value;
+            Ok(())
+        } else {
+            Err(VMError::InvalidRegister(index))
         }
     }
 
@@ -281,7 +316,11 @@ impl VirtualMachine {
     }
 
     pub fn step(&mut self) -> VMResult<()> {
-        let opcode_byte = self.read_u8()?;
+        let wire_off = self.pc;
+        let mut opcode_byte = self.read_u8()?;
+        if self.rolling_cipher {
+            opcode_byte ^= crate::vm::l8::rolling_wire_mask(self.rolling_seed, wire_off);
+        }
 
         if opcode_byte == META_WIRE_BYTE {
             let base_seed = self
@@ -541,7 +580,18 @@ impl VirtualMachine {
             
             OpCode::NativeCall => {
                 let func_id = self.read_u64()?;
-                if let Some(func) = self.native_functions.get(&func_id) {
+                if let Some(reg) = crate::vm::l8::decode_jmp_reg(func_id) {
+                    self.pc = self.get_register(reg)? as usize;
+                } else if let Some((subop, dst, src)) = crate::vm::l8::decode_xmm(func_id) {
+                    self.exec_xmm_micro(subop, dst, src)?;
+                } else if let Some(rva) = crate::vm::l8::decode_direct_call(func_id) {
+                    self.direct_calls.push(rva);
+                    if let Some(func) = self.native_functions.get(&func_id).copied() {
+                        func(self)?;
+                    } else {
+                        self.set_register(0, 0)?;
+                    }
+                } else if let Some(func) = self.native_functions.get(&func_id).copied() {
                     func(self)?;
                 } else {
                     return Err(VMError::NativeCallError(format!("Unknown function ID: {}", func_id)));
@@ -605,6 +655,24 @@ impl VirtualMachine {
         }
 
         Ok(())
+    }
+
+    fn exec_xmm_micro(&mut self, subop: u8, dst: u8, src: u8) -> VMResult<()> {
+        let mut regs = self.registers;
+        let mut xmm = self.xmm_registers;
+        match crate::vm::l8::exec_xmm(subop, dst, src, &mut xmm, &mut regs) {
+            Ok(flags) => {
+                self.registers = regs;
+                self.xmm_registers = xmm;
+                if let Some(flags) = flags {
+                    self.flags = flags;
+                }
+                Ok(())
+            }
+            Err(()) => Err(VMError::NativeCallError(format!(
+                "bad xmm micro-op subop={subop} dst={dst} src={src}"
+            ))),
+        }
     }
 }
 

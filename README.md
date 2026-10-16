@@ -18,10 +18,10 @@ KnVest is an educational and research tool that demonstrates layered VM-based co
 This is an educational project, not a commercial protector. It does NOT include:
 
 - Anti-debug, anti-VM, or kernel-mode drivers
-- Full x64 ISA / SIMD / floating-point coverage
+- Full x64 ISA or packed SIMD coverage (L8 adds scalar SSE/SSE2 only: `movss`/`movsd`, `movaps`/`movups`, scalar add/sub/mul/div, `ucomi`, `cvtsi2sd`/`cvttsd2si`, `xorps`/`xorpd`)
 - Decompilation or LLVM/MLIR bitcode lifting
 
-## Architecture & Protection Layers (L1 – L7)
+## Architecture & Protection Layers (L1 – L8)
 
 | Layer | Feature | Trailer / Module | Summary |
 |-------|---------|------------------|---------|
@@ -37,6 +37,7 @@ This is an educational project, not a commercial protector. It does NOT include:
 | **L5f** | Nested VM (two-layer dispatch) | `nested_vm.rs` (`KNV4` v5, `KNV6` v3) | `--nested` separates **outer decode** (per-transition `outer_decode[256]` wire translation) from **inner execute** (`dispatch_inner` handler table) |
 | **L6** | Extended x64 lifter & branch semantics | `lifter.rs`, `cfg.rs`, `machine.rs`, `vm_stub.rs` | Lifts bitwise/unary/shift ops (`AND`, `OR`, `XOR`, `NOT`, `NEG`, `SHL`, `TEST reg, imm`) and register extension moves (`MOVZX`, `MOVSX`, `MOVSXD`, `CDQE`, plus 32-bit zero-extension `emit_u32_zext`) across register, immediate, and `[rbp±disp]` stack slots, and supports signed, unsigned, and sign conditional jumps (`JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE`, `JA`, `JAE`, `JB`, `JBE`, `JS`, `JNS`) |
 | **L7** | Metadata scrubbing / `.knvmap` sidecar, 32-reg frame & scratch isolation, universal Win64 ABI & caller-return stub, rolling stream cipher | `packer.rs` (`KNVM`), `lifter.rs`, `vm_stub.rs`, `layout.rs` | `--strip-meta` and `--sidecar <PATH>` scrub `KNV4`..`KNV7` & `VMBC` headers and emit `.knvmap`; XOR-encodes all PEB/API strings in `vm_stub` and immediately zero-wipes the stack buffer after `GetProcAddress`; expands VM to 32 registers (`r14..r15` isolated for scratch, 20 local slots `r10..r13` & `r16..r31`); adds `shr`, `sar`, `idiv`, scaled `lea`, general pointer `[reg+disp]` load/store, and `--strict` (`validate_strict_lift`); supports generic Win64 IAT calls (`rcx, rdx, r8, r9` + 5th/6th stack args `[rsp+0x20]=r4`, `[rsp+0x28]=r5` + `rax -> r0`) and `--return-mode` (`StubExitMode::ReturnToCaller`); integrates `BytecodeCipher` rolling SplitMix64 keystream & register slot permutation (`VirtualMachine::with_cipher_decrypted`, `alloc_stack_spill_reg_seeded`) |
+| **L8** | Fetch-time rolling wire decrypt, `jmp reg` / switch tables, scalar XMM, multi-function packing | `l8.rs`, `vm_stub.rs`, `lifter.rs`, `cfg.rs`, `machine.rs`, `packer.rs`, `ir` | `--rolling-cipher` XORs each instruction-start wire with `rolling_wire_mask(seed, offset)` (`KNV4` v5 flag `0x02`) and decrypts it in the three native dispatch loops, the Rust VM, and `knvest ir`. `jmp reg` and compiler switch tables lift to a `Cmp`/`JmpIf` chain plus `native_call` `jmp_reg`. Scalar SSE rides on `native_call` immediates (`xmm_addsd`, `ucomiss`, `cvtsi2sd`, …) with a 16-slot XMM file at `[rbp-0x4B0]`. Repeated `--rva` / `--rvas` pack several functions: each gets a stub and bytecode entry, non-primary stubs `leave; ret`, and a 5-byte `E9` trampoline is written only when more than one RVA is packed |
 
 ## Build
 
@@ -61,7 +62,9 @@ knvest pack input.exe -o output.exe
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-o, --output <FILE>` | *(required)* | Output packed PE64 executable path |
-| `--rva <HEX>` | auto-detect `main` | Custom function RVA to protect (e.g., `--rva 0x1400`) |
+| `--rva <HEX>` | auto-detect `main` | Function RVA to protect. Repeat the flag or pass a comma-separated list (`--rva 0x1000,0x1030`) |
+| `--rvas <HEX>` | *(none)* | Comma-separated RVAs, combined with `--rva` |
+| `--rolling-cipher` | `false` | L8: encrypt each bytecode wire with a position/seed key and decrypt it at fetch time |
 | `--seed <SEED>` | random per pack | 64-bit seed (hex `0x...` or decimal) controlling wire permutation, handler variants, layout padding, MBA catalog selection, and nested tables |
 | `--dispatch <MODE>` | `table` | Dispatch mode: `table` (256-entry handler table) or `threaded` (inline `rel32` handler targets) |
 | `--partial` | `false` | Enable L4d partial BB virtualization (`run_native` / `bail_native` sleds) |
@@ -84,6 +87,9 @@ knvest pack input.exe -o output.exe --seed 0x1337c0de --mba 2 --isa stack
 
 # Nested VM (outer decode + inner execute) with partial virtualization
 knvest pack input.exe -o output.exe --seed 0xfeedface --nested --partial
+
+# L8: two functions, rolling wire cipher, caller-return on the non-primary stub
+knvest pack input.exe -o output.exe --seed 0x4c380001 --rva 0x1000,0x1030 --rolling-cipher
 ```
 
 ### View IR
@@ -171,7 +177,7 @@ Eight MinGW-style C samples in `sample/`:
 cargo test
 ```
 
-The test suite (**263 tests**: 257 unit tests + 6 integration tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L7 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `shr`, `sar`, `idiv`, scaled `lea`, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, and `BytecodeCipher` end-to-end execution.
+The test suite (**273 tests**: 267 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L8 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `shr`, `sar`, `idiv`, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, and multi-RVA trampolines.
 
 ## Project Structure
 

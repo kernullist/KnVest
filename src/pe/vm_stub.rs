@@ -95,6 +95,40 @@ pub fn create_vm_interpreter_stub(
 }
 
 pub fn create_vm_interpreter_stub_with_exit_mode(
+    image_base: u64,
+    section_rva: u32,
+    map: &OpcodeMap,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    layout_plan: &BytecodeLayout,
+    knv5: &[u8],
+    block_map_plan: &BlockMapPlan,
+    native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
+    nested_plan: &NestedVmPlan,
+    exit_mode: StubExitMode,
+) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
+    create_vm_interpreter_stub_l8(
+        image_base,
+        section_rva,
+        map,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        layout_plan,
+        knv5,
+        block_map_plan,
+        native_sleds,
+        native_sync,
+        nested_plan,
+        exit_mode,
+        false,
+    )
+}
+
+/// Same as [`create_vm_interpreter_stub_with_exit_mode`], plus L8 rolling wire decryption.
+pub fn create_vm_interpreter_stub_l8(
     _image_base: u64,
     _section_rva: u32,
     map: &OpcodeMap,
@@ -108,8 +142,10 @@ pub fn create_vm_interpreter_stub_with_exit_mode(
     native_sync: &[(i32, u8)],
     nested_plan: &NestedVmPlan,
     exit_mode: StubExitMode,
+    rolling_cipher: bool,
 ) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
     let mut e = StubEmitter::new(map, dispatch_mode, mba_level, isa_mode, layout_plan, native_sync, block_map_plan, nested_plan, exit_mode);
+    e.set_rolling_cipher(rolling_cipher, map.seed());
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
@@ -136,6 +172,9 @@ struct StubEmitter {
     nested_plan: NestedVmPlan,
     exit_mode: StubExitMode,
     string_xor_key: u8,
+    /// L8: decrypt the fetched wire byte with `rolling_wire_mask(seed, rsi-bytecode)`.
+    rolling_cipher: bool,
+    rolling_key32: u32,
 }
 
 impl StubEmitter {
@@ -169,7 +208,18 @@ impl StubEmitter {
             nested_plan: nested_plan.clone(),
             exit_mode,
             string_xor_key,
+            rolling_cipher: false,
+            rolling_key32: 0,
         }
+    }
+
+    fn set_rolling_cipher(&mut self, enabled: bool, seed: u64) {
+        self.rolling_cipher = enabled;
+        self.rolling_key32 = if enabled {
+            crate::vm::l8::rolling_wire_key32(seed)
+        } else {
+            0
+        };
     }
 
     fn knv6_entry_stride(&self) -> u32 {
@@ -525,9 +575,31 @@ impl StubEmitter {
     }
 
     /// L5f nested VM: outer layer decodes bytecode wire → inner layer dispatches handlers.
+    /// After `movzx eax, byte [rsi]` and before `inc rsi`: `al ^= rolling_wire_mask(seed, rsi-base)`.
+    fn emit_rolling_wire_decrypt(&mut self) {
+        if !self.rolling_cipher {
+            return;
+        }
+        // mov rcx, rsi
+        self.emit(&[0x48, 0x89, 0xF1]);
+        // lea r11, [rip+bytecode]
+        self.lea_rip_rel32(0x4C, 3, "bytecode");
+        // sub rcx, r11
+        self.emit(&[0x4C, 0x29, 0xD9]);
+        // imul ecx, ecx, 0x9E3779B9
+        self.emit(&[0x69, 0xC9]);
+        self.emit(&crate::vm::l8::ROLLING_WIRE_GOLDEN.to_le_bytes());
+        // xor ecx, key32
+        self.emit(&[0x81, 0xF1]);
+        self.emit(&self.rolling_key32.to_le_bytes());
+        // mov edx, ecx; shr edx, 16; xor ecx, edx; xor al, cl
+        self.emit(&[0x89, 0xCA, 0xC1, 0xEA, 0x10, 0x31, 0xD1, 0x30, 0xC8]);
+    }
+
     fn emit_nested_table_dispatch_loop(&mut self) {
         // dispatch_outer (label "dispatch"): read outer wire, check exit, translate via table.
         self.emit(&[0x0F, 0xB6, 0x06]); // movzx eax, byte [rsi]
+        self.emit_rolling_wire_decrypt();
         self.emit(&[0x48, 0xFF, 0xC6]); // inc rsi
         self.emit(&[0x3A, 0x05, 0, 0, 0, 0]); // cmp al, byte [rip+exit_wire_cmp_slot]
         self.exit_cmp_patch_pos = Some(self.pos() - 4);
@@ -549,6 +621,7 @@ impl StubEmitter {
     /// L4 default: opcode-indexed handler offset table + central dispatch.
     fn emit_table_dispatch_loop(&mut self) {
         self.emit(&[0x0F, 0xB6, 0x06]);
+        self.emit_rolling_wire_decrypt();
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x3A, 0x05, 0, 0, 0, 0]); // cmp al, byte [rip+exit_wire_cmp_slot]
         self.exit_cmp_patch_pos = Some(self.pos() - 4);
@@ -565,6 +638,7 @@ impl StubEmitter {
     /// L4c threaded: per-instruction handler rel32 in bytecode stream (no opcode-indexed lookup).
     fn emit_threaded_dispatch_loop(&mut self) {
         self.emit(&[0x0F, 0xB6, 0x06]); // movzx eax, byte [rsi]
+        self.emit_rolling_wire_decrypt();
         self.emit(&[0x3A, 0x05, 0, 0, 0, 0]); // cmp al, byte [rip+exit_wire_cmp_slot]
         self.exit_cmp_patch_pos = Some(self.pos() - 4);
         self.lea_rip.push((self.pos() - 4, "exit_wire_cmp_slot"));
@@ -1599,6 +1673,19 @@ impl StubEmitter {
         // Save bytecode pointer past func id at L2 rsi slot [rbp-0x98].
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
 
+        // L8 direct call: func_id >= 0x4_0000_0000
+        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]);
+        self.emit(&[0x48, 0x39, 0xC8]);
+        self.jcc_rel32(0x83, "nc_direct");
+        // L8 jmp reg: func_id >= 0x3_0000_0000
+        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00]);
+        self.emit(&[0x48, 0x39, 0xC8]);
+        self.jcc_rel32(0x83, "nc_jmp_reg");
+        // L8 XMM: func_id >= 0x2_0000_0000
+        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]);
+        self.emit(&[0x48, 0x39, 0xC8]);
+        self.jcc_rel32(0x83, "nc_xmm");
+
         // IAT win64 ABI path when func_id >= 0x100000000
         self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]); // mov rcx, 0x100000000
         self.emit(&[0x48, 0x39, 0xC8]); // cmp rax, rcx
@@ -1752,8 +1839,252 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x30], rax
         self.jmp_rel32("nc_done");
 
+        self.emit_l8_native_micro_handlers();
+
         self.label("nc_done");
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
+    }
+
+    /// XMM slots live at `[rbp-0x4B0 + n*16]` (8×16 bytes), clear of the redirect image and IAT spills.
+    const XMM_FRAME_BASE: i32 = -0x4B0;
+    const XMM_SCRATCH: i32 = -0x4C0;
+
+    fn emit_l8_native_micro_handlers(&mut self) {
+        self.label("nc_direct");
+        // rva = low 32 bits; callee = ImageBase + rva; reuse the generic Win64 marshal.
+        self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
+        self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
+        self.emit(&[0x48, 0x8B, 0x40, 0x10]);
+        self.emit(&[0x4C, 0x01, 0xD8]); // add rax, r11
+        self.emit(&[0x48, 0x89, 0xC3]); // mov rbx, rax
+        self.jmp_rel32("nc_iat_generic");
+
+        self.label("nc_jmp_reg");
+        // rsi = bytecode_base + VM[reg]
+        self.emit(&[0x0F, 0xB6, 0xC8]); // movzx ecx, al
+        self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]); // mov rax, [rbp+rcx*8-0x80]
+        self.lea_rip_rel32(0x48, 6, "bytecode");
+        self.emit(&[0x48, 0x01, 0xC6]); // add rsi, rax
+        self.jmp_to_dispatch();
+
+        self.label("nc_xmm");
+        // Preserve func id, then split subop/dst/src.
+        self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
+        // src = r10b, dst = (r10 >> 8) & 0xff, subop = (r10 >> 16) & 0xff
+        self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
+        self.emit(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
+        self.emit(&[0x41, 0x89, 0xC0]); // mov r8d, eax  (src)
+        self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
+        self.emit(&[0xC1, 0xE8, 0x08]); // shr eax, 8
+        self.emit(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
+        self.emit(&[0x89, 0xC2]); // mov edx, eax (dst)
+        self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
+        self.emit(&[0xC1, 0xE8, 0x10]); // shr eax, 16
+        self.emit(&[0x0F, 0xB6, 0xC0]); // movzx eax, al (subop)
+
+        self.emit_xmm_dispatch_chain();
+        self.jmp_rel32("nc_done");
+    }
+
+    fn emit_xmm_je(&mut self, subop: u8, label: &'static str) {
+        self.emit(&[0x83, 0xF8, subop]);
+        self.jcc_rel32(0x84, label);
+    }
+
+    fn emit_xmm_dispatch_chain(&mut self) {
+        use crate::vm::l8::*;
+        let ops: &[(u8, &'static str)] = &[
+            (XMM_MOVSS_XX, "xmm_movss_xx"),
+            (XMM_MOVSD_XX, "xmm_movsd_xx"),
+            (XMM_MOVAPS_XX, "xmm_movaps_xx"),
+            (XMM_MOVUPS_XX, "xmm_movups_xx"),
+            (XMM_ADDSS, "xmm_addss"),
+            (XMM_ADDSD, "xmm_addsd"),
+            (XMM_SUBSS, "xmm_subss"),
+            (XMM_SUBSD, "xmm_subsd"),
+            (XMM_MULSS, "xmm_mulss"),
+            (XMM_MULSD, "xmm_mulsd"),
+            (XMM_DIVSS, "xmm_divss"),
+            (XMM_DIVSD, "xmm_divsd"),
+            (XMM_UCOMISS, "xmm_ucomiss"),
+            (XMM_UCOMISD, "xmm_ucomisd"),
+            (XMM_CVTSI2SD, "xmm_cvtsi2sd"),
+            (XMM_CVTTSD2SI, "xmm_cvttsd2si"),
+            (XMM_XORPS, "xmm_xorps"),
+            (XMM_XORPD, "xmm_xorpd"),
+            (XMM_MOVSS_XM, "xmm_movss_xm"),
+            (XMM_MOVSS_MX, "xmm_movss_mx"),
+            (XMM_MOVSD_XM, "xmm_movsd_xm"),
+            (XMM_MOVSD_MX, "xmm_movsd_mx"),
+            (XMM_MOVAPS_XM, "xmm_movaps_xm"),
+            (XMM_MOVAPS_MX, "xmm_movaps_mx"),
+            (XMM_MOVUPS_XM, "xmm_movups_xm"),
+            (XMM_MOVUPS_MX, "xmm_movups_mx"),
+        ];
+        for (sub, label) in ops {
+            self.emit_xmm_je(*sub, label);
+        }
+        self.jmp_rel32("nc_done");
+
+        self.emit_xmm_xx_body("xmm_movss_xx", &[0xF3, 0x0F, 0x10, 0xC8]);
+        self.emit_xmm_xx_body("xmm_movsd_xx", &[0xF2, 0x0F, 0x10, 0xC8]);
+        self.emit_xmm_xx_body("xmm_movaps_xx", &[0x0F, 0x28, 0xC8]);
+        self.emit_xmm_xx_body("xmm_movups_xx", &[0x0F, 0x10, 0xC8]);
+        self.emit_xmm_binop("xmm_addss", &[0xF3, 0x0F, 0x58, 0xC8]);
+        self.emit_xmm_binop("xmm_addsd", &[0xF2, 0x0F, 0x58, 0xC8]);
+        self.emit_xmm_binop("xmm_subss", &[0xF3, 0x0F, 0x5C, 0xC8]);
+        self.emit_xmm_binop("xmm_subsd", &[0xF2, 0x0F, 0x5C, 0xC8]);
+        self.emit_xmm_binop("xmm_mulss", &[0xF3, 0x0F, 0x59, 0xC8]);
+        self.emit_xmm_binop("xmm_mulsd", &[0xF2, 0x0F, 0x59, 0xC8]);
+        self.emit_xmm_binop("xmm_divss", &[0xF3, 0x0F, 0x5E, 0xC8]);
+        self.emit_xmm_binop("xmm_divsd", &[0xF2, 0x0F, 0x5E, 0xC8]);
+        self.emit_xmm_binop("xmm_xorps", &[0x0F, 0x57, 0xC8]);
+        self.emit_xmm_binop("xmm_xorpd", &[0x66, 0x0F, 0x57, 0xC8]);
+        self.emit_xmm_ucomi("xmm_ucomiss", &[0x0F, 0x2E, 0xC1]);
+        self.emit_xmm_ucomi("xmm_ucomisd", &[0x66, 0x0F, 0x2E, 0xC1]);
+        self.emit_xmm_cvtsi2sd();
+        self.emit_xmm_cvttsd2si();
+        self.emit_xmm_gp_load("xmm_movss_xm", true);
+        self.emit_xmm_gp_store("xmm_movss_mx", true);
+        self.emit_xmm_gp_load("xmm_movsd_xm", false);
+        self.emit_xmm_gp_store("xmm_movsd_mx", false);
+        self.emit_xmm_gp_load("xmm_movaps_xm", false);
+        self.emit_xmm_gp_store("xmm_movaps_mx", false);
+        self.emit_xmm_gp_load("xmm_movups_xm", false);
+        self.emit_xmm_gp_store("xmm_movups_mx", false);
+    }
+
+    /// lea r11, xmm_slot[index]; index reg is r8 (src) or rdx (dst).
+    fn emit_lea_xmm_slot(&mut self, src_index: bool) {
+        self.emit_lea_from_rbp(11, Self::XMM_FRAME_BASE);
+        if src_index {
+            self.emit(&[0x4C, 0x89, 0xC1]); // mov rcx, r8
+        } else {
+            self.emit(&[0x48, 0x89, 0xD1]); // mov rcx, rdx
+        }
+        self.emit(&[0x48, 0xC1, 0xE1, 0x04]); // shl rcx, 4
+        self.emit(&[0x49, 0x01, 0xCB]); // add r11, rcx
+    }
+
+    fn emit_movups_xmm0_from_r11(&mut self) {
+        self.emit(&[0x41, 0x0F, 0x10, 0x03]); // movups xmm0, [r11]
+    }
+
+    fn emit_movups_xmm1_from_r11(&mut self) {
+        self.emit(&[0x41, 0x0F, 0x10, 0x0B]); // movups xmm1, [r11]
+    }
+
+    fn emit_movups_xmm1_to_r11(&mut self) {
+        self.emit(&[0x41, 0x0F, 0x11, 0x0B]); // movups [r11], xmm1
+    }
+
+    fn emit_load_src_xmm0(&mut self) {
+        self.emit_lea_xmm_slot(true);
+        self.emit_movups_xmm0_from_r11();
+    }
+
+    fn emit_load_dst_xmm1(&mut self) {
+        self.emit_lea_xmm_slot(false);
+        self.emit_movups_xmm1_from_r11();
+    }
+
+    fn emit_store_dst_xmm1(&mut self) {
+        self.emit_lea_xmm_slot(false);
+        self.emit_movups_xmm1_to_r11();
+        self.jmp_rel32("nc_done");
+    }
+
+    fn emit_xmm_xx_body(&mut self, label: &'static str, op_xmm1_xmm0: &[u8]) {
+        self.label(label);
+        self.emit_load_src_xmm0();
+        self.emit_load_dst_xmm1();
+        self.emit(op_xmm1_xmm0);
+        self.emit_store_dst_xmm1();
+    }
+
+    fn emit_xmm_binop(&mut self, label: &'static str, op_xmm1_xmm0: &[u8]) {
+        self.emit_xmm_xx_body(label, op_xmm1_xmm0);
+    }
+
+    fn emit_xmm_ucomi(&mut self, label: &'static str, op: &[u8]) {
+        self.label(label);
+        self.emit_load_dst_xmm1();
+        self.emit_load_src_xmm0();
+        // ucomi xmm1, xmm0 — the byte sequence is written for xmm0, xmm1. Rebuild for xmm1, xmm0.
+        // Callers pass `ucomi xmm0, xmm1` encoding; swap to `ucomi xmm1, xmm0` (reg field 1, rm 0).
+        let _ = op;
+        if op[0] == 0x66 {
+            self.emit(&[0x66, 0x0F, 0x2E, 0xC8]); // ucomisd xmm1, xmm0
+        } else {
+            self.emit(&[0x0F, 0x2E, 0xC8]); // ucomiss xmm1, xmm0
+        }
+        // setb cl; setz dl; zero flags qword; merge CF and ZF<<6
+        self.emit(&[0x0F, 0x92, 0xC1]);
+        self.emit(&[0x0F, 0x94, 0xC2]);
+        self.emit(&[0x48, 0x31, 0xC0]);
+        self.emit(&[0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
+        self.emit(&[0x88, 0x8D, 0x70, 0xFF, 0xFF, 0xFF]);
+        self.emit(&[0xC0, 0xE2, 0x06]);
+        self.emit(&[0x08, 0x95, 0x70, 0xFF, 0xFF, 0xFF]);
+        self.jmp_rel32("nc_done");
+    }
+
+    fn emit_gp_from_r8(&mut self) {
+        // mov rax, [rbp+r8*8-0x80]
+        self.emit(&[0x4A, 0x8B, 0x44, 0xC5, 0x80]);
+    }
+
+    fn emit_gp_to_rdx(&mut self) {
+        // mov [rbp+rdx*8-0x80], rax
+        self.emit(&[0x48, 0x89, 0x44, 0xD5, 0x80]);
+    }
+
+    fn emit_xmm_cvtsi2sd(&mut self) {
+        self.label("xmm_cvtsi2sd");
+        self.emit_load_dst_xmm1();
+        self.emit_gp_from_r8();
+        self.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC8]); // cvtsi2sd xmm1, rax
+        self.emit_store_dst_xmm1();
+    }
+
+    fn emit_xmm_cvttsd2si(&mut self) {
+        self.label("xmm_cvttsd2si");
+        self.emit_load_src_xmm0();
+        self.emit(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]); // cvttsd2si rax, xmm0
+        self.emit_gp_to_rdx();
+        self.jmp_rel32("nc_done");
+    }
+
+    fn emit_xmm_gp_load(&mut self, label: &'static str, low32_only: bool) {
+        self.label(label);
+        self.emit_gp_from_r8();
+        self.emit_mov_qword_to_rbp_from_reg(0, Self::XMM_SCRATCH);
+        if low32_only {
+            self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
+            self.emit(&[0xF3, 0x41, 0x0F, 0x10, 0x03]); // movss xmm0, [r11] (zeros upper)
+            // move into xmm1 then store full slot (upper zero)
+            self.emit(&[0x0F, 0x28, 0xC8]); // movaps xmm1, xmm0
+        } else {
+            self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
+            self.emit(&[0xF2, 0x41, 0x0F, 0x10, 0x0B]); // movsd xmm1, [r11]
+        }
+        self.emit_store_dst_xmm1();
+    }
+
+    fn emit_xmm_gp_store(&mut self, label: &'static str, low32_only: bool) {
+        self.label(label);
+        self.emit_load_src_xmm0();
+        self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
+        if low32_only {
+            self.emit(&[0xF3, 0x41, 0x0F, 0x11, 0x03]); // movss [r11], xmm0
+            self.emit(&[0x8B, 0x85, 0x40, 0xFB, 0xFF, 0xFF]); // mov eax, [rbp-0x4C0]
+            self.emit(&[0x48, 0x98]); // cdqe
+        } else {
+            self.emit(&[0xF2, 0x41, 0x0F, 0x11, 0x03]); // movsd [r11], xmm0
+            self.emit(&[0x48, 0x8B, 0x85, 0x40, 0xFB, 0xFF, 0xFF]); // mov rax, [rbp-0x4C0]
+        }
+        self.emit_gp_to_rdx();
+        self.jmp_rel32("nc_done");
     }
 
     fn any_handler_offset_collides(&self, candidate_table_base: usize) -> bool {
@@ -1870,6 +2201,7 @@ impl StubEmitter {
             mba_level: self.mba_level,
             isa_mode: self.isa_mode,
             nested_vm: self.nested_plan.enabled,
+            rolling_cipher: self.rolling_cipher,
         };
         self.emit(&pack_meta.to_embedded_bytes());
         self.emit(knv5);

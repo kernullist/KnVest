@@ -171,6 +171,15 @@ pub struct BasicBlock {
 
 /// Split a linear instruction list into basic blocks from `entry` until the first `ret`.
 pub fn build_basic_blocks(instrs: &[X64Instruction], entry: usize) -> Vec<BasicBlock> {
+    build_basic_blocks_with_image(instrs, entry, None)
+}
+
+/// Like [`build_basic_blocks`], also promoting resolved switch case targets to leaders.
+pub fn build_basic_blocks_with_image(
+    instrs: &[X64Instruction],
+    entry: usize,
+    image: Option<&[u8]>,
+) -> Vec<BasicBlock> {
     if instrs.is_empty() {
         return Vec::new();
     }
@@ -199,6 +208,20 @@ pub fn build_basic_blocks(instrs: &[X64Instruction], entry: usize) -> Vec<BasicB
         if is_block_end(&instr.kind) {
             if idx + 1 < instrs.len() && instrs[idx + 1].offset >= entry {
                 leaders.insert(idx + 1);
+            }
+        }
+        if let (Some(image), X64InstrKind::JmpReg { .. }) = (image, &instr.kind) {
+            if let Some(sw) = resolve_switch_at(instrs, idx, image) {
+                for target in sw
+                    .case_targets
+                    .iter()
+                    .copied()
+                    .chain(sw.default_target)
+                {
+                    if instrs.iter().any(|i| i.offset == target) {
+                        leaders.insert(idx_for_offset(instrs, target));
+                    }
+                }
             }
         }
     }
@@ -309,6 +332,7 @@ fn is_block_end(kind: &X64InstrKind) -> bool {
     matches!(
         kind,
         X64InstrKind::Jmp { .. }
+            | X64InstrKind::JmpReg { .. }
             | X64InstrKind::Je { .. }
             | X64InstrKind::Jne { .. }
             | X64InstrKind::Jl { .. }
@@ -336,6 +360,7 @@ fn is_native_eligible(instrs: &[X64Instruction], leader_idx: usize, tail_idx: us
     match &instrs[tail_idx].kind {
         X64InstrKind::Ret => true,
         X64InstrKind::Call { .. } | X64InstrKind::CallIndRip { .. } => false,
+        X64InstrKind::JmpReg { .. } => false,
         X64InstrKind::Jmp { .. }
         | X64InstrKind::Je { .. }
         | X64InstrKind::Jne { .. }
@@ -415,6 +440,15 @@ fn resolve_callee_entry(
 
 /// Control-transfer edge `(pred_bb_id, succ_bb_id)` within one lifted function window.
 pub fn collect_cfg_edges(blocks: &[BasicBlock], instrs: &[X64Instruction]) -> Vec<(u16, u16)> {
+    collect_cfg_edges_with_image(blocks, instrs, None)
+}
+
+/// Like [`collect_cfg_edges`], adding edges for resolved `switch` jump tables.
+pub fn collect_cfg_edges_with_image(
+    blocks: &[BasicBlock],
+    instrs: &[X64Instruction],
+    image: Option<&[u8]>,
+) -> Vec<(u16, u16)> {
     if blocks.is_empty() {
         return Vec::new();
     }
@@ -445,6 +479,24 @@ pub fn collect_cfg_edges(blocks: &[BasicBlock], instrs: &[X64Instruction]) -> Ve
                 let target = branch_target_abs(tail, *target_offset);
                 if let Some(&succ) = block_by_start.get(&target) {
                     edges.push((bb.id as u16, succ as u16));
+                }
+            }
+            X64InstrKind::JmpReg { .. } => {
+                if let Some(image) = image {
+                    if let Some(pos) = instrs.iter().position(|i| i.offset == tail.offset) {
+                        if let Some(sw) = resolve_switch_at(instrs, pos, image) {
+                            for target in sw
+                                .case_targets
+                                .iter()
+                                .copied()
+                                .chain(sw.default_target)
+                            {
+                                if let Some(&succ) = block_by_start.get(&target) {
+                                    edges.push((bb.id as u16, succ as u16));
+                                }
+                            }
+                        }
+                    }
                 }
             }
             X64InstrKind::Je { target_offset }
@@ -492,6 +544,124 @@ pub fn incoming_edge_counts(edges: &[(u16, u16)]) -> std::collections::HashMap<u
 
 fn branch_target_abs(instr: &X64Instruction, rel: i32) -> usize {
     (instr.offset as i64 + instr.bytes.len() as i64 + rel as i64) as usize
+}
+
+/// Statically resolved compiler `switch` (cmp/ja + rip table + scaled load + jmp reg).
+#[derive(Debug, Clone)]
+pub struct ResolvedSwitch {
+    pub jmp_offset: usize,
+    pub index_reg: super::lifter::X64Reg,
+    pub jmp_reg: super::lifter::X64Reg,
+    pub case_targets: Vec<usize>,
+    pub default_target: Option<usize>,
+    /// Address-calculation instructions that the lifter should not emit.
+    pub skip_offsets: Vec<usize>,
+}
+
+pub fn resolve_switches(instrs: &[X64Instruction], image: &[u8]) -> Vec<ResolvedSwitch> {
+    let mut out = Vec::new();
+    for idx in 0..instrs.len() {
+        if let Some(sw) = resolve_switch_at(instrs, idx, image) {
+            out.push(sw);
+        }
+    }
+    out
+}
+
+pub fn resolve_switch_at(instrs: &[X64Instruction], idx: usize, image: &[u8]) -> Option<ResolvedSwitch> {
+    use super::lifter::X64InstrKind;
+    let jmp_reg = match instrs.get(idx).map(|i| &i.kind) {
+        Some(X64InstrKind::JmpReg { reg }) => *reg,
+        _ => return None,
+    };
+    let jmp_offset = instrs[idx].offset;
+    let mut cursor = idx;
+    let mut skip = Vec::new();
+    let mut table_base_reg = None;
+    if cursor > 0 {
+        if let X64InstrKind::AddRegReg { dst, src } = instrs[cursor - 1].kind {
+            if dst == jmp_reg {
+                table_base_reg = Some(src);
+                skip.push(instrs[cursor - 1].offset);
+                cursor -= 1;
+            }
+        }
+    }
+    if cursor == 0 {
+        return None;
+    }
+    let (index_reg, scale, load_base) = match instrs[cursor - 1].kind {
+        X64InstrKind::MovRegScaledMem {
+            dst,
+            base,
+            index,
+            scale,
+            sign_extend32,
+            ..
+        } if dst == jmp_reg && matches!(scale, 4 | 8) => {
+            skip.push(instrs[cursor - 1].offset);
+            cursor -= 1;
+            let _ = sign_extend32;
+            (index, scale, base)
+        }
+        _ => return None,
+    };
+    if cursor == 0 {
+        return None;
+    }
+    let table = match instrs[cursor - 1].kind {
+        X64InstrKind::LeaRipRel { dst, offset } => {
+            if load_base.is_some() && load_base != Some(dst) {
+                return None;
+            }
+            if let Some(base_reg) = table_base_reg {
+                if base_reg != dst && load_base != Some(dst) {
+                    return None;
+                }
+            }
+            let lea = &instrs[cursor - 1];
+            skip.push(lea.offset);
+            (lea.offset as i64 + lea.bytes.len() as i64 + offset as i64) as usize
+        }
+        _ => return None,
+    };
+    let mut default_target = None;
+    let mut max_imm = None;
+    let scan_from = cursor.saturating_sub(8);
+    for j in (scan_from..cursor).rev() {
+        match instrs[j].kind {
+            X64InstrKind::Ja { target_offset } | X64InstrKind::Jae { target_offset } => {
+                default_target = Some(branch_target_abs(&instrs[j], target_offset));
+            }
+            X64InstrKind::CmpRegImm { reg, imm } if reg == index_reg => {
+                max_imm = Some(imm);
+            }
+            _ => {}
+        }
+    }
+    let max_imm = max_imm?;
+    let count = (max_imm as usize).saturating_add(1).min(64);
+    let mut case_targets = Vec::with_capacity(count);
+    for n in 0..count {
+        if scale == 4 {
+            let off = table + n * 4;
+            let bytes = image.get(off..off + 4)?;
+            let rel = i32::from_le_bytes(bytes.try_into().ok()?);
+            case_targets.push((table as i64 + rel as i64) as usize);
+        } else {
+            let off = table + n * 8;
+            let bytes = image.get(off..off + 8)?;
+            case_targets.push(u64::from_le_bytes(bytes.try_into().ok()?) as usize);
+        }
+    }
+    Some(ResolvedSwitch {
+        jmp_offset,
+        index_reg,
+        jmp_reg,
+        case_targets,
+        default_target,
+        skip_offsets: skip,
+    })
 }
 
 fn is_prologue_start(pe_data: &[u8], off: usize) -> bool {

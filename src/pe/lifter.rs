@@ -20,7 +20,32 @@ use super::mba::{
 use crate::vm::virt_isa::emit_sub_three;
 use super::thunk::{iat_rva_for_call_target, is_non_liftable_target};
 use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+use std::cell::RefCell;
 use std::collections::HashSet;
+
+thread_local! {
+    static PROTECTED_RVAS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+}
+
+/// RVAs of functions packed together. Direct calls to them become L8 `direct_call` micro-ops.
+pub fn set_protected_rvas(rvas: &[u32]) {
+    PROTECTED_RVAS.with(|cell| *cell.borrow_mut() = rvas.to_vec());
+}
+
+pub fn clear_protected_rvas() {
+    PROTECTED_RVAS.with(|cell| cell.borrow_mut().clear());
+}
+
+fn protected_rva_for_offset(pe: &PEFile, file_off: usize) -> Option<u32> {
+    let rva = pe.file_offset_to_rva(file_off).ok()?;
+    PROTECTED_RVAS.with(|cell| {
+        if cell.borrow().iter().any(|&r| r == rva) {
+            Some(rva)
+        } else {
+            None
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct X64Instruction {
@@ -97,6 +122,34 @@ pub enum X64InstrKind {
     Movsxd { dst: X64Reg, src: X64Reg },
     Nop,
     Unknown,
+    /// `jmp reg` — dynamic VM-offset indirect branch.
+    JmpReg { reg: X64Reg },
+    /// `mov`/`movsxd reg, [base + index*scale + disp]`.
+    MovRegScaledMem {
+        dst: X64Reg,
+        base: Option<X64Reg>,
+        index: X64Reg,
+        scale: u8,
+        disp: i32,
+        sign_extend32: bool,
+    },
+    /// SSE/SSE2 scalar or xmm move. Operands are resolved to xmm indices or GP/memory.
+    Xmm {
+        subop: u8,
+        dst: XmmOperand,
+        src: XmmOperand,
+    },
+}
+
+/// Operand of an L8 XMM lift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XmmOperand {
+    Xmm(u8),
+    Gp(X64Reg),
+    /// `[base+disp]`, typically `rbp`.
+    Mem(X64Reg, i32),
+    /// `[rip+disp]` with `disp` relative to the next instruction.
+    Rip(i32),
 }
 
 /// Policy for handling unsupported (`X64InstrKind::Unknown`) x64 instructions during lifting.
@@ -254,6 +307,12 @@ fn classify_instruction(instr: &Instruction) -> X64InstrKind {
         Mnemonic::Jmp => {
             if let Some(rel) = branch_offset(instr) {
                 X64InstrKind::Jmp { target_offset: rel }
+            } else if instr.op0_kind() == OpKind::Register {
+                if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
+                    X64InstrKind::JmpReg { reg }
+                } else {
+                    X64InstrKind::Unknown
+                }
             } else {
                 X64InstrKind::Unknown
             }
@@ -331,6 +390,25 @@ fn classify_instruction(instr: &Instruction) -> X64InstrKind {
         Mnemonic::Idiv | Mnemonic::Div => classify_idiv(instr),
         Mnemonic::Cdq | Mnemonic::Cqo => X64InstrKind::Nop,
 
+        Mnemonic::Movss
+        | Mnemonic::Movsd
+        | Mnemonic::Movaps
+        | Mnemonic::Movups
+        | Mnemonic::Addss
+        | Mnemonic::Addsd
+        | Mnemonic::Subss
+        | Mnemonic::Subsd
+        | Mnemonic::Mulss
+        | Mnemonic::Mulsd
+        | Mnemonic::Divss
+        | Mnemonic::Divsd
+        | Mnemonic::Ucomiss
+        | Mnemonic::Ucomisd
+        | Mnemonic::Cvtsi2sd
+        | Mnemonic::Cvttsd2si
+        | Mnemonic::Xorps
+        | Mnemonic::Xorpd => classify_sse(instr),
+
         _ => X64InstrKind::Unknown,
     }
 }
@@ -353,7 +431,112 @@ where
     branch_offset(instr).map(mk).unwrap_or(X64InstrKind::Unknown)
 }
 
+fn memory_index_reg(instr: &Instruction) -> Option<X64Reg> {
+    let idx = instr.memory_index();
+    if idx == Register::None {
+        None
+    } else {
+        iced_reg_to_x64(idx)
+    }
+}
+
+fn classify_scaled_load(instr: &Instruction, sign_extend32: bool) -> Option<X64InstrKind> {
+    if instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Memory {
+        return None;
+    }
+    let index = memory_index_reg(instr)?;
+    let dst = iced_reg_to_x64(instr.op0_register())?;
+    let base = {
+        let b = instr.memory_base();
+        if b == Register::None || b == Register::RIP {
+            None
+        } else {
+            iced_reg_to_x64(b)
+        }
+    };
+    let scale = instr.memory_index_scale() as u8;
+    if !matches!(scale, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    Some(X64InstrKind::MovRegScaledMem {
+        dst,
+        base,
+        index,
+        scale,
+        disp: instr.memory_displacement32() as i32,
+        sign_extend32,
+    })
+}
+
+fn iced_xmm(reg: Register) -> Option<u8> {
+    Some(match reg {
+        Register::XMM0 => 0,
+        Register::XMM1 => 1,
+        Register::XMM2 => 2,
+        Register::XMM3 => 3,
+        Register::XMM4 => 4,
+        Register::XMM5 => 5,
+        Register::XMM6 => 6,
+        Register::XMM7 => 7,
+        _ => return None,
+    })
+}
+
+fn xmm_operand(instr: &Instruction, index: u32) -> Option<XmmOperand> {
+    let kind = instr.op_kind(index);
+    match kind {
+        OpKind::Register => {
+            let reg = instr.op_register(index);
+            if let Some(xmm) = iced_xmm(reg) {
+                Some(XmmOperand::Xmm(xmm))
+            } else {
+                iced_reg_to_x64(reg).map(XmmOperand::Gp)
+            }
+        }
+        OpKind::Memory => {
+            if instr.memory_base() == Register::RIP {
+                Some(XmmOperand::Rip(rip_relative_disp32(instr)))
+            } else {
+                mem_base_offset(instr).map(|(b, o)| XmmOperand::Mem(b, o))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn classify_sse(instr: &Instruction) -> X64InstrKind {
+    use crate::vm::l8::*;
+    let subop = match instr.mnemonic() {
+        Mnemonic::Movss => XMM_MOVSS_XX,
+        Mnemonic::Movsd => XMM_MOVSD_XX,
+        Mnemonic::Movaps => XMM_MOVAPS_XX,
+        Mnemonic::Movups => XMM_MOVUPS_XX,
+        Mnemonic::Addss => XMM_ADDSS,
+        Mnemonic::Addsd => XMM_ADDSD,
+        Mnemonic::Subss => XMM_SUBSS,
+        Mnemonic::Subsd => XMM_SUBSD,
+        Mnemonic::Mulss => XMM_MULSS,
+        Mnemonic::Mulsd => XMM_MULSD,
+        Mnemonic::Divss => XMM_DIVSS,
+        Mnemonic::Divsd => XMM_DIVSD,
+        Mnemonic::Ucomiss => XMM_UCOMISS,
+        Mnemonic::Ucomisd => XMM_UCOMISD,
+        Mnemonic::Cvtsi2sd => XMM_CVTSI2SD,
+        Mnemonic::Cvttsd2si => XMM_CVTTSD2SI,
+        Mnemonic::Xorps => XMM_XORPS,
+        Mnemonic::Xorpd => XMM_XORPD,
+        _ => return X64InstrKind::Unknown,
+    };
+    match (xmm_operand(instr, 0), xmm_operand(instr, 1)) {
+        (Some(dst), Some(src)) => X64InstrKind::Xmm { subop, dst, src },
+        _ => X64InstrKind::Unknown,
+    }
+}
+
 fn classify_mov(instr: &Instruction) -> X64InstrKind {
+    if let Some(kind) = classify_scaled_load(instr, false) {
+        return kind;
+    }
     let op0 = instr.op0_kind();
     let op1 = instr.op1_kind();
 
@@ -581,6 +764,11 @@ fn classify_movzx(instr: &Instruction) -> X64InstrKind {
 }
 
 fn classify_movsx(instr: &Instruction) -> X64InstrKind {
+    if instr.mnemonic() == Mnemonic::Movsxd {
+        if let Some(kind) = classify_scaled_load(instr, true) {
+            return kind;
+        }
+    }
     if instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Memory {
         if let (Some(dst), Some((base, offset))) = (
             iced_reg_to_x64(instr.op0_register()),
@@ -2571,11 +2759,193 @@ fn emit_extended_alu_or_test(
     }
 }
 
+fn emit_native_micro(bytecode: &mut Vec<u8>, func_id: u64) {
+    bytecode.push(active_encode(OpCode::NativeCall));
+    bytecode.extend_from_slice(&func_id.to_le_bytes());
+}
+
+fn spill_mem_reg(
+    base: X64Reg,
+    offset: i32,
+    stack_map: &mut std::collections::HashMap<i32, u8>,
+    next_stack_reg: &mut u8,
+) -> Option<u8> {
+    if matches!(base, X64Reg::Rbp | X64Reg::Ebp) {
+        Some(*stack_map.entry(offset).or_insert_with(|| alloc_stack_spill_reg(next_stack_reg)))
+    } else {
+        None
+    }
+}
+
+fn emit_xmm_kind(
+    bytecode: &mut Vec<u8>,
+    subop: u8,
+    dst: &XmmOperand,
+    src: &XmmOperand,
+    stack_map: &mut std::collections::HashMap<i32, u8>,
+    next_stack_reg: &mut u8,
+    image: Option<&[u8]>,
+    insn_off: usize,
+    insn_len: usize,
+) {
+    use crate::vm::l8::*;
+    let resolve_rip = |disp: i32| -> u64 {
+        let abs = (insn_off as i64 + insn_len as i64 + disp as i64) as usize;
+        image
+            .and_then(|img| img.get(abs..abs + 8))
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0)
+    };
+    let mut as_index = |op: &XmmOperand, xmm_side: bool| -> Option<u8> {
+        match op {
+            XmmOperand::Xmm(i) => Some(*i),
+            XmmOperand::Gp(reg) => Some(reg.to_vm_reg()),
+            XmmOperand::Mem(base, off) => spill_mem_reg(*base, *off, stack_map, next_stack_reg),
+            XmmOperand::Rip(disp) => {
+                bytecode.push(active_encode(OpCode::LoadImm));
+                bytecode.push(15);
+                let bits = if xmm_side { resolve_rip(*disp) } else { resolve_rip(*disp) };
+                bytecode.extend_from_slice(&bits.to_le_bytes());
+                Some(15)
+            }
+        }
+    };
+    let dst_mem = matches!(dst, XmmOperand::Mem(_, _) | XmmOperand::Gp(_) | XmmOperand::Rip(_));
+    let src_mem = matches!(src, XmmOperand::Mem(_, _) | XmmOperand::Gp(_) | XmmOperand::Rip(_));
+    let dst_i = match as_index(dst, true) {
+        Some(d) => d,
+        None => return,
+    };
+    let src_i = match as_index(src, false) {
+        Some(s) => s,
+        None => return,
+    };
+    let encoded_sub = match subop {
+        XMM_MOVSS_XX if dst_mem && !src_mem => XMM_MOVSS_MX,
+        XMM_MOVSS_XX if !dst_mem && src_mem => XMM_MOVSS_XM,
+        XMM_MOVSD_XX if dst_mem && !src_mem => XMM_MOVSD_MX,
+        XMM_MOVSD_XX if !dst_mem && src_mem => XMM_MOVSD_XM,
+        XMM_MOVAPS_XX if dst_mem && !src_mem => XMM_MOVAPS_MX,
+        XMM_MOVAPS_XX if !dst_mem && src_mem => XMM_MOVAPS_XM,
+        XMM_MOVUPS_XX if dst_mem && !src_mem => XMM_MOVUPS_MX,
+        XMM_MOVUPS_XX if !dst_mem && src_mem => XMM_MOVUPS_XM,
+        XMM_CVTSI2SD => XMM_CVTSI2SD,
+        XMM_CVTTSD2SI => XMM_CVTTSD2SI,
+        other => other,
+    };
+    emit_native_micro(bytecode, encode_xmm(encoded_sub, dst_i, src_i));
+}
+
+fn emit_scaled_mem(bytecode: &mut Vec<u8>, kind: &X64InstrKind, pack_seed: u64) {
+    let X64InstrKind::MovRegScaledMem {
+        dst,
+        base,
+        index,
+        scale,
+        disp,
+        sign_extend32,
+    } = kind
+    else {
+        return;
+    };
+    let dst_vm = dst.to_vm_reg();
+    // r14 = index * scale
+    bytecode.push(active_encode(OpCode::Move));
+    bytecode.push(14);
+    bytecode.push(index.to_vm_reg());
+    if *scale > 1 {
+        bytecode.push(active_encode(OpCode::LoadImm));
+        bytecode.push(15);
+        bytecode.extend_from_slice(&(*scale as u64).to_le_bytes());
+        emit_mul_three(bytecode, 14, 14, 15);
+    }
+    if let Some(base) = base {
+        emit_add_reg_reg_x64(bytecode, &X64Reg::R14, base);
+    }
+    if *disp > 0 {
+        emit_add_reg_imm(bytecode, 14, *disp as u64);
+    } else if *disp < 0 {
+        bytecode.push(active_encode(OpCode::LoadImm));
+        bytecode.push(15);
+        bytecode.extend_from_slice(&((-*disp as i64) as u64).to_le_bytes());
+        emit_sub_three(bytecode, 14, 14, 15, pack_seed);
+    }
+    bytecode.push(active_encode(OpCode::LoadMem));
+    bytecode.push(dst_vm);
+    bytecode.push(14);
+    if *sign_extend32 {
+        bytecode.push(active_encode(OpCode::LoadImm));
+        bytecode.push(15);
+        bytecode.extend_from_slice(&0xFFFF_FFFFu64.to_le_bytes());
+        emit_and_three(bytecode, dst_vm, dst_vm, 15);
+        // If bit 31 is set, OR in the sign extension. Compare against 0x80000000.
+        bytecode.push(active_encode(OpCode::Move));
+        bytecode.push(14);
+        bytecode.push(dst_vm);
+        bytecode.push(active_encode(OpCode::LoadImm));
+        bytecode.push(15);
+        bytecode.extend_from_slice(&0x8000_0000u64.to_le_bytes());
+        emit_and_three(bytecode, 14, 14, 15);
+        emit_cmp_regs(bytecode, OpCode::Cmp, 14, 15);
+        bytecode.push(active_encode(OpCode::JmpIf));
+        bytecode.push(2); // JNE — skip the OR when bit 31 is clear
+        let skip_pos = bytecode.len();
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
+        bytecode.push(active_encode(OpCode::LoadImm));
+        bytecode.push(15);
+        bytecode.extend_from_slice(&0xFFFF_FFFF_0000_0000u64.to_le_bytes());
+        emit_or_three(bytecode, dst_vm, dst_vm, 15);
+        let after = bytecode.len() as u64;
+        bytecode[skip_pos..skip_pos + 8].copy_from_slice(&after.to_le_bytes());
+    }
+}
+
+fn emit_switch_chain(
+    bytecode: &mut Vec<u8>,
+    sw: &super::cfg::ResolvedSwitch,
+) -> Vec<(usize, usize, bool)> {
+    let mut pending = Vec::new();
+    for (i, &target) in sw.case_targets.iter().enumerate() {
+        bytecode.push(active_encode(OpCode::LoadImm));
+        bytecode.push(15);
+        bytecode.extend_from_slice(&(i as u64).to_le_bytes());
+        emit_cmp_regs(bytecode, OpCode::Cmp, sw.index_reg.to_vm_reg(), 15);
+        bytecode.push(active_encode(OpCode::JmpIf));
+        bytecode.push(1);
+        let pos = bytecode.len();
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
+        pending.push((pos, target, false));
+    }
+    if let Some(def) = sw.default_target {
+        bytecode.push(active_encode(OpCode::Jmp));
+        let pos = bytecode.len();
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
+        pending.push((pos, def, true));
+    }
+    emit_native_micro(bytecode, crate::vm::l8::encode_jmp_reg(sw.jmp_reg.to_vm_reg()));
+    pending
+}
+
 fn lift_to_vm_bytecode_internal(
     instrs: &[X64Instruction],
     _base_rva: u32,
     _is_main: bool,
     pack_seed: u64,
+) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
+    lift_to_vm_bytecode_internal_with_image(instrs, _base_rva, _is_main, pack_seed, None)
+}
+
+pub fn lift_to_vm_bytecode_with_image(instrs: &[X64Instruction], image: &[u8]) -> Vec<u8> {
+    let (bytecode, _) = lift_to_vm_bytecode_internal_with_image(instrs, 0, false, 0, Some(image));
+    bytecode
+}
+
+fn lift_to_vm_bytecode_internal_with_image(
+    instrs: &[X64Instruction],
+    _base_rva: u32,
+    _is_main: bool,
+    pack_seed: u64,
+    image: Option<&[u8]>,
 ) -> (Vec<u8>, std::collections::HashMap<usize, usize>) {
     let mut bytecode = Vec::new();
     let mut label_map = std::collections::HashMap::new();
@@ -2587,9 +2957,19 @@ fn lift_to_vm_bytecode_internal(
     let mut external_call_count = 0;
 
     let u32_semantics = false;
+    let switches = image
+        .map(|img| super::cfg::resolve_switches(instrs, img))
+        .unwrap_or_default();
+    let switch_skip: HashSet<usize> = switches
+        .iter()
+        .flat_map(|sw| sw.skip_offsets.iter().copied())
+        .collect();
 
     for instr in instrs {
         label_map.insert(instr.offset, bytecode.len());
+        if switch_skip.contains(&instr.offset) {
+            continue;
+        }
 
         match &instr.kind {
             X64InstrKind::MovRegImm { reg, imm } => {
@@ -3013,6 +3393,29 @@ fn lift_to_vm_bytecode_internal(
                     bytecode.push(src_vm);
                 }
             }
+            X64InstrKind::JmpReg { reg } => {
+                if let Some(sw) = switches.iter().find(|s| s.jmp_offset == instr.offset) {
+                    pending_jumps.extend(emit_switch_chain(&mut bytecode, sw));
+                } else {
+                    emit_native_micro(&mut bytecode, crate::vm::l8::encode_jmp_reg(reg.to_vm_reg()));
+                }
+            }
+            X64InstrKind::MovRegScaledMem { .. } => {
+                emit_scaled_mem(&mut bytecode, &instr.kind, pack_seed);
+            }
+            X64InstrKind::Xmm { subop, dst, src } => {
+                emit_xmm_kind(
+                    &mut bytecode,
+                    *subop,
+                    dst,
+                    src,
+                    &mut stack_map,
+                    &mut next_stack_reg,
+                    image,
+                    instr.offset,
+                    instr.bytes.len(),
+                );
+            }
             X64InstrKind::Nop
             | X64InstrKind::Unknown
             | X64InstrKind::Cdqe => {}
@@ -3108,8 +3511,13 @@ fn lift_to_vm_bytecode_internal_with_main(
         || printf_literal.is_some();
     let u32_semantics = has_putchar_callees;
 
-    let main_blocks = build_basic_blocks(instrs, main_x64_offset);
-    let cfg_edges = collect_cfg_edges(&main_blocks, instrs);
+    let main_blocks = super::cfg::build_basic_blocks_with_image(instrs, main_x64_offset, Some(&pe.data));
+    let cfg_edges = super::cfg::collect_cfg_edges_with_image(&main_blocks, instrs, Some(&pe.data));
+    let switches = super::cfg::resolve_switches(instrs, &pe.data);
+    let switch_skip: HashSet<usize> = switches
+        .iter()
+        .flat_map(|sw| sw.skip_offsets.iter().copied())
+        .collect();
     let incoming = incoming_edge_counts(&cfg_edges);
     let main_block_refs: Vec<&BasicBlock> = main_blocks.iter().collect();
     let use_partial = partial.map_or(false, |p| !p.full_virt);
@@ -3142,6 +3550,10 @@ fn lift_to_vm_bytecode_internal_with_main(
         label_map.insert(instr.offset, bytecode.len());
 
         label_map.insert(instr.offset, bytecode.len());
+
+        if switch_skip.contains(&instr.offset) {
+            continue;
+        }
 
         if instr.offset < main_x64_offset {
             let entry = callee_entry_for(instrs, instr.offset, main_x64_offset);
@@ -3582,7 +3994,12 @@ fn lift_to_vm_bytecode_internal_with_main(
                 let raw_target =
                     (instr.offset as i32 + instr.bytes.len() as i32 + target_offset) as usize;
 
-                if let Some(iat_rva) = iat_rva_for_call_target(pe, imports, raw_target) {
+                if let Some(rva) = protected_rva_for_offset(pe, raw_target) {
+                    emit_native_micro(
+                        &mut bytecode,
+                        crate::vm::l8::encode_direct_call(rva),
+                    );
+                } else if let Some(iat_rva) = iat_rva_for_call_target(pe, imports, raw_target) {
                     let entry = pe.resolve_iat_target(imports, iat_rva);
                     if entry.map(|e| imports.is_crt_startup(e)).unwrap_or(false) {
                         // CRT startup — skip
@@ -3865,6 +4282,34 @@ fn lift_to_vm_bytecode_internal_with_main(
                     bytecode.push(dst_vm);
                     bytecode.push(src_vm);
                 }
+            }
+            X64InstrKind::JmpReg { reg } => {
+                if let Some(sw) = switches.iter().find(|s| s.jmp_offset == instr.offset) {
+                    for (pos, target, uncond) in emit_switch_chain(&mut bytecode, sw) {
+                        pending_jumps.push((pos, target, uncond, instr.offset));
+                    }
+                } else {
+                    emit_native_micro(
+                        &mut bytecode,
+                        crate::vm::l8::encode_jmp_reg(reg.to_vm_reg()),
+                    );
+                }
+            }
+            X64InstrKind::MovRegScaledMem { .. } => {
+                emit_scaled_mem(&mut bytecode, &instr.kind, pack_seed);
+            }
+            X64InstrKind::Xmm { subop, dst, src } => {
+                emit_xmm_kind(
+                    &mut bytecode,
+                    *subop,
+                    dst,
+                    src,
+                    &mut stack_map,
+                    &mut next_stack_reg,
+                    Some(&pe.data),
+                    instr.offset,
+                    instr.bytes.len(),
+                );
             }
             X64InstrKind::Nop
             | X64InstrKind::Cdqe => {}

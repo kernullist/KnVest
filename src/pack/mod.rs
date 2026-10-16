@@ -74,12 +74,48 @@ pub fn pack_executable_with_full_options<P: AsRef<Path>, Q: AsRef<Path>>(
     strict: bool,
     return_mode: bool,
 ) -> Result<OpcodeMap> {
+    let rvas: Vec<u32> = function_rva.into_iter().collect();
+    pack_executable_l8(
+        input_path,
+        output_path,
+        &rvas,
+        seed,
+        partial,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+        strip_meta,
+        sidecar_path,
+        strict,
+        return_mode,
+        false,
+    )
+}
+
+/// Pack one or more RVAs. An empty slice auto-detects `main`.
+pub fn pack_executable_l8<P: AsRef<Path>, Q: AsRef<Path>>(
+    input_path: P,
+    output_path: Q,
+    rvas: &[u32],
+    seed: Option<u64>,
+    partial: bool,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_vm: bool,
+    strip_meta: bool,
+    sidecar_path: Option<&Path>,
+    strict: bool,
+    return_mode: bool,
+    rolling_cipher: bool,
+) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
 
-    let pack_result = packer::pack_function_with_options(
+    let pack_result = packer::pack_functions_l8(
         &mut pe,
-        function_rva,
+        rvas,
         seed,
         partial,
         dispatch_mode,
@@ -88,6 +124,7 @@ pub fn pack_executable_with_full_options<P: AsRef<Path>, Q: AsRef<Path>>(
         nested_vm,
         strict,
         return_mode,
+        rolling_cipher,
     )
         .context("Failed to pack function")?;
 

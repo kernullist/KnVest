@@ -11,6 +11,9 @@ pub mod threaded;
 pub mod layout_pass;
 pub mod mba;
 
+#[cfg(test)]
+mod l8_tests;
+
 pub use parser::{PEFile, PEError};
 pub use packer::{
     pack_function, scrub_embedded_metadata_in_pe, extract_bytecode_from_packed_with_sidecar,

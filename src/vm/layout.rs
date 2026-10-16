@@ -168,11 +168,36 @@ pub fn enumerate_raw_instructions(
     dispatch_mode: DispatchMode,
     isa_mode: IsaMode,
 ) -> Vec<RawInsn> {
+    enumerate_raw_instructions_masked(
+        bytecode,
+        base_map,
+        block_plan,
+        layout,
+        dispatch_mode,
+        isa_mode,
+        None,
+    )
+}
+
+/// Same walk as [`enumerate_raw_instructions`], but XOR each instruction-start
+/// wire with `rolling_wire_mask(seed, offset)` before decode when `rolling_seed` is set.
+pub fn enumerate_raw_instructions_masked(
+    bytecode: &[u8],
+    base_map: &OpcodeMap,
+    block_plan: &BlockMapPlan,
+    layout: &BytecodeLayout,
+    dispatch_mode: DispatchMode,
+    isa_mode: IsaMode,
+    rolling_seed: Option<u64>,
+) -> Vec<RawInsn> {
     let mut out = Vec::new();
     let mut offset = 0;
     let mut current_bb: Option<u16> = None;
     while offset < bytecode.len() {
-        let wire = bytecode[offset];
+        let mut wire = bytecode[offset];
+        if let Some(seed) = rolling_seed {
+            wire ^= super::l8::rolling_wire_mask(seed, offset);
+        }
         if wire == META_WIRE_BYTE {
             let total = layout.insn_len(
                 OpCode::SetBlockMap,

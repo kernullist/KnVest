@@ -29,13 +29,10 @@ fn main() -> Result<()> {
             sidecar,
             strict,
             return_mode,
+            rvas,
+            rolling_cipher,
         } => {
-            let rva_value = if let Some(rva_str) = rva {
-                let rva_str = rva_str.trim_start_matches("0x");
-                Some(u32::from_str_radix(rva_str, 16)?)
-            } else {
-                None
-            };
+            let rva_values = cli::parse_rva_list(&rva, rvas.as_deref())?;
             let seed_value = if let Some(seed_str) = seed {
                 Some(parse_seed(&seed_str)?)
             } else {
@@ -49,7 +46,7 @@ fn main() -> Result<()> {
             handle_pack_command(
                 input,
                 output,
-                rva_value,
+                &rva_values,
                 seed_value,
                 partial,
                 dispatch_mode,
@@ -60,6 +57,7 @@ fn main() -> Result<()> {
                 sidecar,
                 strict,
                 return_mode,
+                rolling_cipher,
             )?;
         }
     }
@@ -162,6 +160,13 @@ fn handle_ir_command(
         )
     );
 
+    if pack_meta.rolling_cipher {
+        println!(
+            "L8 rolling_cipher=on key32={:#x}",
+            crate::vm::rolling_wire_key32(pack_seed)
+        );
+    }
+
     if pack_meta.nested_vm {
         let nested_plan = crate::vm::NestedVmPlan::from_seed(
             pack_seed,
@@ -174,13 +179,15 @@ fn handle_ir_command(
         print!("{}", nested_plan.format_ir_header(&opcode_map));
     }
     
-    let instructions = ir::Instruction::disassemble_with_layout_and_isa(
+    let instructions = ir::Instruction::disassemble_with_rolling(
         &bytecode,
         &opcode_map,
         block_plan.as_ref(),
         dispatch_mode,
         &layout_plan,
         pack_meta.isa_mode,
+        pack_meta.rolling_cipher,
+        pack_seed,
     );
     let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
     
@@ -192,7 +199,7 @@ fn handle_ir_command(
 fn handle_pack_command(
     input: std::path::PathBuf,
     output: std::path::PathBuf,
-    rva: Option<u32>,
+    rvas: &[u32],
     seed: Option<u64>,
     partial: bool,
     dispatch_mode: crate::vm::DispatchMode,
@@ -203,11 +210,12 @@ fn handle_pack_command(
     sidecar: Option<std::path::PathBuf>,
     strict: bool,
     return_mode: bool,
+    rolling_cipher: bool,
 ) -> Result<()> {
-    pack::pack_executable_with_full_options(
+    pack::pack_executable_l8(
         &input,
         &output,
-        rva,
+        rvas,
         seed,
         partial,
         dispatch_mode,
@@ -218,6 +226,7 @@ fn handle_pack_command(
         sidecar.as_deref(),
         strict,
         return_mode,
+        rolling_cipher,
     )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())

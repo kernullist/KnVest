@@ -30,12 +30,22 @@ pub(crate) fn build_block_map_plan(
     main_instrs: &[super::lifter::X64Instruction],
     callee_entries: &[usize],
 ) -> BlockMapPlan {
+    build_block_map_plan_with_image(pack_seed, main_blocks, main_instrs, callee_entries, None)
+}
+
+pub(crate) fn build_block_map_plan_with_image(
+    pack_seed: u64,
+    main_blocks: &[super::cfg::BasicBlock],
+    main_instrs: &[super::lifter::X64Instruction],
+    callee_entries: &[usize],
+    image: Option<&[u8]>,
+) -> BlockMapPlan {
     let mut plan = BlockMapPlan {
         decode_key: BlockMapPlan::global_decode_key(pack_seed),
         entries: Vec::new(),
         ..Default::default()
     };
-    for (pred, succ) in collect_cfg_edges(main_blocks, main_instrs) {
+    for (pred, succ) in super::cfg::collect_cfg_edges_with_image(main_blocks, main_instrs, image) {
         plan.record_transition(pack_seed, succ, pred);
     }
     for bb in main_blocks {
@@ -52,6 +62,19 @@ pub(crate) fn build_block_map_plan(
     plan
 }
 
+/// One virtualized function inside a multi-function `.knvest` image.
+#[derive(Debug, Clone)]
+pub struct FunctionVmEntry {
+    pub rva: u32,
+    /// Offset of this function's stub inside the `.knvest` section.
+    pub stub_offset: u32,
+    /// Offset of this function's bytecode payload inside the `.knvest` section.
+    pub bytecode_offset: u32,
+    /// Bytecode PC where execution of this function begins (always 0 for a dedicated stub).
+    pub bytecode_entry: u32,
+    pub return_to_caller: bool,
+}
+
 pub struct PackResult {
     pub bytecode: Vec<u8>,
     pub opcode_map: OpcodeMap,
@@ -62,6 +85,10 @@ pub struct PackResult {
     pub block_map_plan: BlockMapPlan,
     pub native_sleds: Vec<u8>,
     pub native_sync: Vec<(i32, u8)>,
+    /// L8 multi-function entries. Empty when a single auto-detected function was packed
+    /// without trampolines; populated for every RVA when more than one was requested.
+    pub function_entries: Vec<FunctionVmEntry>,
+    pub rolling_cipher: bool,
 }
 
 pub fn pack_function(
@@ -100,79 +127,167 @@ pub fn pack_function_with_options(
     strict: bool,
     return_mode: bool,
 ) -> PEResult<PackResult> {
+    let rvas: Vec<u32> = function_rva.into_iter().collect();
+    pack_functions_l8(
+        pe,
+        &rvas,
+        seed,
+        partial_enabled,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+        strict,
+        return_mode,
+        false,
+    )
+}
+
+/// Pack one or more function RVAs. An empty `rvas` slice auto-detects `main`.
+/// When more than one RVA is given, each function gets its own stub and a 5-byte
+/// `jmp rel32` trampoline at its original `.text` RVA. Non-primary stubs return to the caller.
+pub fn pack_functions_l8(
+    pe: &mut PEFile,
+    rvas: &[u32],
+    seed: Option<u64>,
+    partial_enabled: bool,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_vm: bool,
+    strict: bool,
+    return_mode: bool,
+    rolling_cipher: bool,
+) -> PEResult<PackResult> {
     if nested_vm && dispatch_mode == DispatchMode::Threaded {
         return Err(PEError::InvalidPE(
             "L5f --nested requires table dispatch (not threaded)".to_string(),
         ));
     }
-    let explicit_rva = function_rva.is_some();
-    let target_rva = if let Some(rva) = function_rva {
-        rva
-    } else {
-        detect_main_rva(pe)?
-    };
+    let explicit = !rvas.is_empty();
+    let mut targets = rvas.to_vec();
+    if targets.is_empty() {
+        targets.push(detect_main_rva(pe)?);
+    }
     let original_entry_rva = pe.entry_point_rva;
-
     let pack_seed = seed.unwrap_or_else(random_seed);
     let opcode_map = OpcodeMap::from_seed(pack_seed);
-
-    let mut translated = translate_to_vm_bytecode_with_strict(
-        pe,
-        target_rva,
-        original_entry_rva,
-        explicit_rva,
-        &opcode_map,
-        pack_seed,
-        partial_enabled,
-        mba_level,
-        isa_mode,
-        strict,
-    )?;
-
     let layout_plan = BytecodeLayout::from_seed(pack_seed);
-    let outer_maps = collect_outer_maps(pack_seed, &opcode_map, &translated.block_map_plan);
-    let nested_plan = if nested_vm {
-        NestedVmPlan::from_seed(pack_seed, &outer_maps)
-    } else {
-        NestedVmPlan::disabled()
-    };
-    let exit_mode = if return_mode {
-        StubExitMode::ReturnToCaller
-    } else {
-        StubExitMode::ExitProcess
-    };
-    let section_bytecode = build_section_bytecode_with_exit_mode(
-        &translated.bytecode,
-        &opcode_map,
-        dispatch_mode,
-        &layout_plan,
-        &translated.partial_plan,
-        &mut translated.block_map_plan,
-        &translated.native_sleds,
-        &translated.native_sync,
-        mba_level,
-        isa_mode,
-        &nested_plan,
-        exit_mode,
-    )?;
 
-    add_vm_section(
-        pe,
-        section_bytecode.stub,
-        &section_bytecode.bytecode,
-    )?;
+    super::lifter::set_protected_rvas(&targets);
+    let mut images: Vec<(Vec<u8>, TranslateResult, bool)> = Vec::new();
+    let pack_result: Result<(), PEError> = (|| {
+        for (index, &target_rva) in targets.iter().enumerate() {
+            let mut translated = translate_to_vm_bytecode_with_strict(
+                pe,
+                target_rva,
+                original_entry_rva,
+                explicit,
+                &opcode_map,
+                pack_seed,
+                partial_enabled,
+                mba_level,
+                isa_mode,
+                strict,
+            )?;
+            let outer_maps = collect_outer_maps(pack_seed, &opcode_map, &translated.block_map_plan);
+            let nested_plan = if nested_vm {
+                NestedVmPlan::from_seed(pack_seed, &outer_maps)
+            } else {
+                NestedVmPlan::disabled()
+            };
+            let exit_mode = if index > 0 || return_mode {
+                StubExitMode::ReturnToCaller
+            } else {
+                StubExitMode::ExitProcess
+            };
+            let section_bytecode = build_section_bytecode_with_exit_mode(
+                &translated.bytecode,
+                &opcode_map,
+                dispatch_mode,
+                &layout_plan,
+                &translated.partial_plan,
+                &mut translated.block_map_plan,
+                &translated.native_sleds,
+                &translated.native_sync,
+                mba_level,
+                isa_mode,
+                &nested_plan,
+                exit_mode,
+                rolling_cipher,
+                pack_seed,
+            )?;
+            let mut image = section_bytecode.stub;
+            image.extend_from_slice(&section_bytecode.bytecode);
+            images.push((
+                image,
+                TranslateResult {
+                    bytecode: section_bytecode.bytecode,
+                    ..translated
+                },
+                exit_mode == StubExitMode::ReturnToCaller,
+            ));
+        }
+        Ok(())
+    })();
+    super::lifter::clear_protected_rvas();
+    pack_result?;
 
+    let mut blob = Vec::new();
+    let mut function_entries = Vec::new();
+    let multi = targets.len() > 1;
+    for (index, (image, _translated, ret)) in images.iter().enumerate() {
+        let stub_offset = blob.len() as u32;
+        // Bytecode begins immediately after the stub; the stub's `bytecode` label is its last address.
+        let vmbc_at = image
+            .windows(4)
+            .rposition(|w| w == b"VMBC")
+            .unwrap_or(image.len().saturating_sub(4));
+        let bytecode_offset = stub_offset + (vmbc_at as u32) + 4;
+        if multi {
+            function_entries.push(FunctionVmEntry {
+                rva: targets[index],
+                stub_offset,
+                bytecode_offset,
+                bytecode_entry: 0,
+                return_to_caller: *ret,
+            });
+        }
+        blob.extend_from_slice(image);
+    }
+    let section_rva = add_vm_section_image(pe, &blob)?;
+    if multi {
+        for entry in &function_entries {
+            patch_function_trampoline(pe, entry.rva, section_rva + entry.stub_offset)?;
+        }
+    }
+    let primary = images.remove(0).1;
     Ok(PackResult {
-        bytecode: section_bytecode.bytecode,
+        bytecode: primary.bytecode,
         opcode_map,
         dispatch_mode,
         seed: pack_seed,
         layout_plan,
-        partial_plan: translated.partial_plan,
-        block_map_plan: translated.block_map_plan,
-        native_sleds: translated.native_sleds,
-        native_sync: translated.native_sync,
+        partial_plan: primary.partial_plan,
+        block_map_plan: primary.block_map_plan,
+        native_sleds: primary.native_sleds,
+        native_sync: primary.native_sync,
+        function_entries,
+        rolling_cipher,
     })
+}
+
+fn patch_function_trampoline(pe: &mut PEFile, func_rva: u32, stub_rva: u32) -> PEResult<()> {
+    let off = pe.rva_to_file_offset(func_rva)?;
+    if off + 5 > pe.data.len() {
+        return Err(PEError::InvalidPE(format!(
+            "function RVA {func_rva:#x} is too small for a jmp rel32 trampoline"
+        )));
+    }
+    let rel = stub_rva.wrapping_sub(func_rva.wrapping_add(5)) as i32;
+    pe.data[off] = 0xE9;
+    pe.data[off + 1..off + 5].copy_from_slice(&rel.to_le_bytes());
+    Ok(())
 }
 
 struct SectionBytecode {
@@ -206,6 +321,8 @@ fn build_section_bytecode(
         isa_mode,
         nested_plan,
         StubExitMode::ExitProcess,
+        false,
+        0,
     )
 }
 
@@ -222,10 +339,12 @@ fn build_section_bytecode_with_exit_mode(
     isa_mode: IsaMode,
     nested_plan: &NestedVmPlan,
     exit_mode: StubExitMode,
+    rolling_cipher: bool,
+    rolling_seed: u64,
 ) -> PEResult<SectionBytecode> {
     let knv5 = partial_plan.to_embedded_bytes();
     // Pass 1: finalize stub and capture L4a redirect plan from emitter labels (not read-back).
-    let (_scratch_stub, _, _, handler_plan) = create_vm_interpreter_stub_with_exit_mode(
+    let (_scratch_stub, _, _, handler_plan) = crate::pe::vm_stub::create_vm_interpreter_stub_l8(
         0,
         0,
         opcode_map,
@@ -239,6 +358,7 @@ fn build_section_bytecode_with_exit_mode(
         native_sync,
         nested_plan,
         exit_mode,
+        rolling_cipher,
     );
     if nested_plan.enabled {
         block_map_plan.fill_nested_handler_tables(&handler_plan, &nested_plan.inner_map);
@@ -246,7 +366,7 @@ fn build_section_bytecode_with_exit_mode(
         block_map_plan.fill_handler_tables(&handler_plan);
     }
     // Pass 2: embed filled KNV6 at the labeled blob offset (not a magic scan).
-    let (mut vm_stub, _, knv6_offset, _) = create_vm_interpreter_stub_with_exit_mode(
+    let (mut vm_stub, _, knv6_offset, _) = crate::pe::vm_stub::create_vm_interpreter_stub_l8(
         0,
         0,
         opcode_map,
@@ -260,6 +380,7 @@ fn build_section_bytecode_with_exit_mode(
         native_sync,
         nested_plan,
         exit_mode,
+        rolling_cipher,
     );
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan, nested_plan.enabled);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
@@ -304,6 +425,21 @@ fn build_section_bytecode_with_exit_mode(
         laid_out
     };
     clear_isa_mode();
+    let mut section_bytecode = section_bytecode;
+    if rolling_cipher {
+        let starts = crate::vm::layout::enumerate_raw_instructions(
+            &section_bytecode,
+            opcode_map,
+            block_map_plan,
+            layout_plan,
+            dispatch_mode,
+            isa_mode,
+        )
+        .into_iter()
+        .map(|insn| insn.start)
+        .collect::<Vec<_>>();
+        crate::vm::l8::apply_rolling_wire_mask(&mut section_bytecode, rolling_seed, &starts);
+    }
     Ok(SectionBytecode {
         stub: vm_stub,
         bytecode: section_bytecode,
@@ -877,7 +1013,7 @@ fn translate_to_vm_bytecode_with_strict(
 
     let string_literal = find_string_literal_in_pe(pe);
 
-    let main_blocks = build_basic_blocks(&all_instrs, file_offset);
+    let main_blocks = super::cfg::build_basic_blocks_with_image(&all_instrs, file_offset, Some(&pe.data));
     let partial_plan = PartialVirtPlan::from_seed(
         pack_seed,
         &main_blocks,
@@ -895,11 +1031,12 @@ fn translate_to_vm_bytecode_with_strict(
         .copied()
         .filter(|&entry| entry < file_offset)
         .collect();
-    let block_map_plan = build_block_map_plan(
+    let block_map_plan = build_block_map_plan_with_image(
         pack_seed,
         &main_blocks,
         &all_instrs,
         &callee_entries,
+        Some(&pe.data),
     );
     let mut sled_builder = NativeSledBuilder::new();
 
@@ -958,11 +1095,7 @@ fn find_string_literal_in_pe(pe: &PEFile) -> Option<Vec<u8>> {
     None
 }
 
-fn add_vm_section(
-    pe: &mut PEFile,
-    vm_stub: Vec<u8>,
-    bytecode: &[u8],
-) -> PEResult<()> {
+fn add_vm_section_image(pe: &mut PEFile, image: &[u8]) -> PEResult<u32> {
     let _original_entry_rva = pe.entry_point_rva;
     
     let last_section = get_last_section(pe)?;
@@ -987,9 +1120,7 @@ fn add_vm_section(
     let image_base = 0x140000000u64;
     let _ = image_base;
     
-    let mut section_data = Vec::new();
-    section_data.extend_from_slice(&vm_stub);
-    section_data.extend_from_slice(bytecode);
+    let mut section_data = image.to_vec();
     
     let virtual_size = section_data.len() as u32;
     let size_of_raw_data = align_up(section_data.len() as u32, FILE_ALIGNMENT);
@@ -1039,7 +1170,7 @@ fn add_vm_section(
     
     pe.data.extend_from_slice(&section_data);
     
-    Ok(())
+    Ok(new_virtual_address)
 }
 
 fn get_last_section(pe: &PEFile) -> PEResult<LastSectionInfo> {
@@ -1408,13 +1539,19 @@ impl SidecarMap {
             .ok_or_else(|| PEError::InvalidPE("VMBC marker not found".to_string()))?
             as u32;
         let bc_start = vmbc_offset as usize + 4;
-        let insns = crate::vm::layout::enumerate_raw_instructions(
+        let rolling_seed = if pack_meta.rolling_cipher {
+            Some(pack_meta.seed())
+        } else {
+            None
+        };
+        let insns = crate::vm::layout::enumerate_raw_instructions_masked(
             &section_data[bc_start..],
             &pack_meta.opcode_map,
             &block_map_plan,
             &layout_plan,
             pack_meta.dispatch_mode,
             pack_meta.isa_mode,
+            rolling_seed,
         );
         let exact_bc_len = insns
             .last()
@@ -1607,6 +1744,47 @@ pub fn extract_bytecode_from_packed_with_sidecar(
     Ok(section_data[bc_start..bc_end].to_vec())
 }
 
+/// Trim a VMBC payload to the decoded instruction stream when rolling encryption
+/// or a second function image would make the padding scan run into the next stub.
+fn trim_bytecode_stream(pe: &PEFile, section_data: &[u8], found: &[u8]) -> Vec<u8> {
+    let Ok(meta) = extract_pack_metadata_from_packed(pe) else {
+        return found.to_vec();
+    };
+    let multi = section_data.windows(4).filter(|w| *w == b"VMBC").count() > 1;
+    if !meta.rolling_cipher && !multi {
+        return found.to_vec();
+    }
+    let Ok(layout) = extract_layout_from_packed(pe) else {
+        return found.to_vec();
+    };
+    let block = extract_block_map_from_packed(pe).unwrap_or_default();
+    let seed = if meta.rolling_cipher {
+        Some(meta.seed())
+    } else {
+        None
+    };
+    let insns = crate::vm::layout::enumerate_raw_instructions_masked(
+        found,
+        &meta.opcode_map,
+        &block,
+        &layout,
+        meta.dispatch_mode,
+        meta.isa_mode,
+        seed,
+    );
+    match insns.last() {
+        Some(last) => {
+            let end = last.start + last.raw_len;
+            if end > 0 && end <= found.len() {
+                found[..end].to_vec()
+            } else {
+                found.to_vec()
+            }
+        }
+        None => found.to_vec(),
+    }
+}
+
 pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
     let knvest_section = pe.get_section(".knvest");
     
@@ -1638,7 +1816,8 @@ pub fn extract_bytecode_from_packed(pe: &PEFile) -> PEResult<Vec<u8>> {
                 }
                 
                 if bytecode_end > bytecode_start {
-                    return Ok(section_data[bytecode_start..bytecode_end].to_vec());
+                    let found = &section_data[bytecode_start..bytecode_end];
+                    return Ok(trim_bytecode_stream(pe, section_data, found));
                 }
             }
         }
