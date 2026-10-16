@@ -80,13 +80,22 @@ pub fn format_ir_header(map: &OpcodeMap, dispatch_mode: DispatchMode) -> String 
             "direct"
         }
     ));
-    out.push_str("ALU handler variants (stub bodies, seed-derived):\n");
-    for &op in &[OpCode::Add, OpCode::Sub, OpCode::Xor, OpCode::And] {
+    out.push_str("ALU/core handler variants (stub bodies, seed-derived):\n");
+    for &op in &[
+        OpCode::Add,
+        OpCode::Sub,
+        OpCode::Xor,
+        OpCode::And,
+        OpCode::Mul,
+        OpCode::Move,
+        OpCode::LoadImm,
+        OpCode::Cmp,
+    ] {
         let count = handler_variant_count(op);
         let variant = map.handler_variant(op);
         let wire = map.encode(op);
         out.push_str(&format!(
-            "  {:<4} wire={:#04x} variant={}/{} ({} native bodies)\n",
+            "  {:<8} wire={:#04x} variant={}/{} ({} native bodies)\n",
             op.name(),
             wire,
             variant,
@@ -142,7 +151,15 @@ mod tests {
 
     #[test]
     fn alu_handler_variants_cover_multiple_indices() {
-        for &op in &[OpCode::Sub, OpCode::Xor, OpCode::And] {
+        for &op in &[
+            OpCode::Sub,
+            OpCode::Xor,
+            OpCode::And,
+            OpCode::Mul,
+            OpCode::Move,
+            OpCode::LoadImm,
+            OpCode::Cmp,
+        ] {
             let count = handler_variant_count(op) as usize;
             assert!(count >= 2, "{} needs >=2 variants", op.name());
             let mut seen = vec![false; count];

@@ -113,6 +113,35 @@ impl VirtualMachine {
         vm
     }
 
+    /// Construct a `VirtualMachine` by decrypting a `BytecodeCipher`-encrypted bytecode image.
+    pub fn with_cipher_decrypted(
+        ciphertext: &[u8],
+        cipher: &super::layout::BytecodeCipher,
+        opcode_map: OpcodeMap,
+    ) -> Self {
+        let plaintext = cipher.decrypt(ciphertext);
+        Self::with_opcode_map(plaintext, opcode_map)
+    }
+
+    /// Read a logical VM register (`0..32`) through its seed-permuted physical slot in `cipher`.
+    pub fn get_logical_register(
+        &self,
+        logical_reg: u8,
+        cipher: &super::layout::BytecodeCipher,
+    ) -> VMResult<u64> {
+        self.get_register(cipher.map_reg(logical_reg))
+    }
+
+    /// Write a logical VM register (`0..32`) through its seed-permuted physical slot in `cipher`.
+    pub fn set_logical_register(
+        &mut self,
+        logical_reg: u8,
+        value: u64,
+        cipher: &super::layout::BytecodeCipher,
+    ) -> VMResult<()> {
+        self.set_register(cipher.map_reg(logical_reg), value)
+    }
+
     pub fn set_opcode_map(&mut self, opcode_map: OpcodeMap) {
         self.opcode_map = Some(opcode_map);
     }

@@ -42,10 +42,42 @@ pub fn pack_executable_with_options<P: AsRef<Path>, Q: AsRef<Path>>(
     strip_meta: bool,
     sidecar_path: Option<&Path>,
 ) -> Result<OpcodeMap> {
+    pack_executable_with_full_options(
+        input_path,
+        output_path,
+        function_rva,
+        seed,
+        partial,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+        strip_meta,
+        sidecar_path,
+        false,
+        false,
+    )
+}
+
+pub fn pack_executable_with_full_options<P: AsRef<Path>, Q: AsRef<Path>>(
+    input_path: P,
+    output_path: Q,
+    function_rva: Option<u32>,
+    seed: Option<u64>,
+    partial: bool,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_vm: bool,
+    strip_meta: bool,
+    sidecar_path: Option<&Path>,
+    strict: bool,
+    return_mode: bool,
+) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
 
-    let pack_result = packer::pack_function(
+    let pack_result = packer::pack_function_with_options(
         &mut pe,
         function_rva,
         seed,
@@ -54,6 +86,8 @@ pub fn pack_executable_with_options<P: AsRef<Path>, Q: AsRef<Path>>(
         mba_level,
         isa_mode,
         nested_vm,
+        strict,
+        return_mode,
     )
         .context("Failed to pack function")?;
 

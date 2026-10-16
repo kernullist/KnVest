@@ -1,8 +1,11 @@
 use super::parser::{PEFile, PEResult, PEError};
 use super::lifter::{
     lift_to_vm_bytecode_for_main, native_stack_sync_pairs_from_map, prebuild_stack_map,
+    validate_strict_lift,
 };
-use super::vm_stub::create_vm_interpreter_stub;
+use super::vm_stub::{
+    create_vm_interpreter_stub, create_vm_interpreter_stub_with_exit_mode, StubExitMode,
+};
 use super::layout_pass::apply_layout_diversification;
 use super::threaded::{self, embed_thread_targets};
 use super::cfg::{
@@ -71,6 +74,32 @@ pub fn pack_function(
     isa_mode: IsaMode,
     nested_vm: bool,
 ) -> PEResult<PackResult> {
+    pack_function_with_options(
+        pe,
+        function_rva,
+        seed,
+        partial_enabled,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+        false,
+        false,
+    )
+}
+
+pub fn pack_function_with_options(
+    pe: &mut PEFile,
+    function_rva: Option<u32>,
+    seed: Option<u64>,
+    partial_enabled: bool,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_vm: bool,
+    strict: bool,
+    return_mode: bool,
+) -> PEResult<PackResult> {
     if nested_vm && dispatch_mode == DispatchMode::Threaded {
         return Err(PEError::InvalidPE(
             "L5f --nested requires table dispatch (not threaded)".to_string(),
@@ -87,7 +116,7 @@ pub fn pack_function(
     let pack_seed = seed.unwrap_or_else(random_seed);
     let opcode_map = OpcodeMap::from_seed(pack_seed);
 
-    let mut translated = translate_to_vm_bytecode(
+    let mut translated = translate_to_vm_bytecode_with_strict(
         pe,
         target_rva,
         original_entry_rva,
@@ -97,6 +126,7 @@ pub fn pack_function(
         partial_enabled,
         mba_level,
         isa_mode,
+        strict,
     )?;
 
     let layout_plan = BytecodeLayout::from_seed(pack_seed);
@@ -106,7 +136,12 @@ pub fn pack_function(
     } else {
         NestedVmPlan::disabled()
     };
-    let section_bytecode = build_section_bytecode(
+    let exit_mode = if return_mode {
+        StubExitMode::ReturnToCaller
+    } else {
+        StubExitMode::ExitProcess
+    };
+    let section_bytecode = build_section_bytecode_with_exit_mode(
         &translated.bytecode,
         &opcode_map,
         dispatch_mode,
@@ -118,6 +153,7 @@ pub fn pack_function(
         mba_level,
         isa_mode,
         &nested_plan,
+        exit_mode,
     )?;
 
     add_vm_section(
@@ -157,9 +193,39 @@ fn build_section_bytecode(
     isa_mode: IsaMode,
     nested_plan: &NestedVmPlan,
 ) -> PEResult<SectionBytecode> {
+    build_section_bytecode_with_exit_mode(
+        bytecode,
+        opcode_map,
+        dispatch_mode,
+        layout_plan,
+        partial_plan,
+        block_map_plan,
+        native_sleds,
+        native_sync,
+        mba_level,
+        isa_mode,
+        nested_plan,
+        StubExitMode::ExitProcess,
+    )
+}
+
+fn build_section_bytecode_with_exit_mode(
+    bytecode: &[u8],
+    opcode_map: &OpcodeMap,
+    dispatch_mode: DispatchMode,
+    layout_plan: &BytecodeLayout,
+    partial_plan: &PartialVirtPlan,
+    block_map_plan: &mut BlockMapPlan,
+    native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_plan: &NestedVmPlan,
+    exit_mode: StubExitMode,
+) -> PEResult<SectionBytecode> {
     let knv5 = partial_plan.to_embedded_bytes();
     // Pass 1: finalize stub and capture L4a redirect plan from emitter labels (not read-back).
-    let (_scratch_stub, _, _, handler_plan) = create_vm_interpreter_stub(
+    let (_scratch_stub, _, _, handler_plan) = create_vm_interpreter_stub_with_exit_mode(
         0,
         0,
         opcode_map,
@@ -172,6 +238,7 @@ fn build_section_bytecode(
         native_sleds,
         native_sync,
         nested_plan,
+        exit_mode,
     );
     if nested_plan.enabled {
         block_map_plan.fill_nested_handler_tables(&handler_plan, &nested_plan.inner_map);
@@ -179,7 +246,7 @@ fn build_section_bytecode(
         block_map_plan.fill_handler_tables(&handler_plan);
     }
     // Pass 2: embed filled KNV6 at the labeled blob offset (not a magic scan).
-    let (mut vm_stub, _, knv6_offset, _) = create_vm_interpreter_stub(
+    let (mut vm_stub, _, knv6_offset, _) = create_vm_interpreter_stub_with_exit_mode(
         0,
         0,
         opcode_map,
@@ -192,6 +259,7 @@ fn build_section_bytecode(
         native_sleds,
         native_sync,
         nested_plan,
+        exit_mode,
     );
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan, nested_plan.enabled);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
@@ -732,6 +800,31 @@ struct TranslateResult {
 fn translate_to_vm_bytecode(
     pe: &PEFile,
     target_rva: u32,
+    original_entry: u32,
+    explicit_rva: bool,
+    opcode_map: &OpcodeMap,
+    pack_seed: u64,
+    partial_enabled: bool,
+    mba_level: u8,
+    isa_mode: IsaMode,
+) -> PEResult<TranslateResult> {
+    translate_to_vm_bytecode_with_strict(
+        pe,
+        target_rva,
+        original_entry,
+        explicit_rva,
+        opcode_map,
+        pack_seed,
+        partial_enabled,
+        mba_level,
+        isa_mode,
+        false,
+    )
+}
+
+fn translate_to_vm_bytecode_with_strict(
+    pe: &PEFile,
+    target_rva: u32,
     _original_entry: u32,
     explicit_rva: bool,
     opcode_map: &OpcodeMap,
@@ -739,6 +832,7 @@ fn translate_to_vm_bytecode(
     partial_enabled: bool,
     mba_level: u8,
     isa_mode: IsaMode,
+    strict: bool,
 ) -> PEResult<TranslateResult> {
     let file_offset = pe.rva_to_file_offset(target_rva)?;
 
@@ -792,6 +886,10 @@ fn translate_to_vm_bytecode(
         partial_enabled,
         &all_instrs,
     )?;
+    if strict {
+        validate_strict_lift(&all_instrs, file_offset, Some(&partial_plan))
+            .map_err(PEError::InvalidPE)?;
+    }
     let callee_entries: Vec<usize> = cfg_entries
         .iter()
         .copied()

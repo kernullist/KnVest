@@ -26,6 +26,8 @@ pub const XOR_HANDLER_VARIANT_COUNT: u8 = 2;
 pub const AND_HANDLER_VARIANT_COUNT: u8 = 2;
 pub const MUL_HANDLER_VARIANT_COUNT: u8 = 2;
 pub const MOVE_HANDLER_VARIANT_COUNT: u8 = 2;
+pub const LOAD_IMM_HANDLER_VARIANT_COUNT: u8 = 2;
+pub const CMP_HANDLER_VARIANT_COUNT: u8 = 2;
 const HANDLER_VARIANT_SALT: u64 = 0x504F_4C59; // "POLY"
 
 /// Logical opcodes implemented by the in-process stub (stable index order).
@@ -447,6 +449,8 @@ pub fn handler_variant_count(op: OpCode) -> u8 {
         OpCode::And => AND_HANDLER_VARIANT_COUNT,
         OpCode::Mul => MUL_HANDLER_VARIANT_COUNT,
         OpCode::Move => MOVE_HANDLER_VARIANT_COUNT,
+        OpCode::LoadImm => LOAD_IMM_HANDLER_VARIANT_COUNT,
+        OpCode::Cmp => CMP_HANDLER_VARIANT_COUNT,
         _ => 1,
     }
 }

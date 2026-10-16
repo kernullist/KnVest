@@ -218,12 +218,35 @@ impl StubEmitter {
         self.labels.insert(name, self.pos());
     }
 
+    fn would_collide_forbidden_rel32(rel: i32) -> bool {
+        let b = rel.to_le_bytes();
+        b == [0xB0, 0xFF, 0xFF, 0xFF]
+            || b == [0xE8, 0xFF, 0xFF, 0xFF]
+            || b == [0x80, 0xFB, 0xFF, 0xFF]
+            || b == [0x80, 0xFD, 0xFF, 0xFF]
+            || b == [0x80, 0xF6, 0xFF, 0xFF]
+            || b[..3] == [0xB0, 0xFF, 0xFF]
+            || b[..3] == [0xE8, 0xFF, 0xFF]
+            || b[1..] == [0xB0, 0xFF, 0xFF]
+            || b[1..] == [0xE8, 0xFF, 0xFF]
+    }
+
     fn jmp_rel32(&mut self, target: &'static str) {
+        if let Some(&target_pos) = self.labels.get(target) {
+            while Self::would_collide_forbidden_rel32(target_pos as i32 - (self.pos() + 5) as i32) {
+                self.emit(&[0x90]);
+            }
+        }
         self.emit(&[0xE9, 0, 0, 0, 0]);
         self.rel32.push((self.pos() - 4, target));
     }
 
     fn jcc_rel32(&mut self, cc: u8, target: &'static str) {
+        if let Some(&target_pos) = self.labels.get(target) {
+            while Self::would_collide_forbidden_rel32(target_pos as i32 - (self.pos() + 6) as i32) {
+                self.emit(&[0x90]);
+            }
+        }
         self.emit(&[0x0F, cc, 0, 0, 0, 0]);
         self.rel32.push((self.pos() - 4, target));
     }
@@ -336,12 +359,28 @@ impl StubEmitter {
         self.emit(&[0x41, 0xC6, 0x02, 0x00]); // mov byte [r10], 0
     }
 
+    /// Zero-wipe the 16-byte stack scratch buffer `[rbp-0x560..-0x550]` immediately after
+    /// `GetProcAddress` so decoded API names never linger in stack memory at runtime.
+    fn emit_wipe_api_str_buf(&mut self) {
+        self.emit(&[0x48, 0x31, 0xC0]); // xor rax, rax
+        self.emit(&[0x48, 0x89, 0x85, 0xA0, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x560], rax
+        self.emit(&[0x48, 0x89, 0x85, 0xA8, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x558], rax
+    }
+
     fn emit_prologue_and_api_resolve(&mut self) {
         let key = self.string_xor_key;
         self.emit(&[0x55]);
         self.emit(&[0x48, 0x89, 0xE5]);
         self.emit(&[0x48, 0x81, 0xEC, 0x30, 0x09, 0x00, 0x00]); // sub rsp, 0x930 (frame + 1 KiB redirect copy)
         self.emit(&[0x48, 0x83, 0xE4, 0xF0]);
+        if self.exit_mode == StubExitMode::ReturnToCaller {
+            // Preserve caller saved-rbp ([rbp+0]) and return address ([rbp+8]) in dedicated frame
+            // slots [rbp-0x518] and [rbp-0x520] so extended VM spill slots r16/r17 cannot corrupt unwind.
+            self.emit(&[0x48, 0x8B, 0x45, 0x00]); // mov rax, [rbp+0]
+            self.emit(&[0x48, 0x89, 0x85, 0xE8, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x518], rax
+            self.emit(&[0x48, 0x8B, 0x45, 0x08]); // mov rax, [rbp+8]
+            self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x520], rax
+        }
         // Zero L2 call depth [rbp-0xC8], push depth [rbp-0xE8], and L4e current bb_id [rbp-0x120]
         self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
@@ -435,6 +474,7 @@ impl StubEmitter {
         self.emit(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
         self.emit(&[0x48, 0x89, 0x85, 0x48, 0xFF, 0xFF, 0xFF]);
+        self.emit_wipe_api_str_buf();
 
         self.emit(&[0x48, 0x89, 0xD9]);
         self.emit_decode_api_str_to_rdx("wf_str", b"WriteFile".len());
@@ -442,6 +482,7 @@ impl StubEmitter {
         self.emit(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
         self.emit(&[0x48, 0x89, 0x85, 0x50, 0xFF, 0xFF, 0xFF]);
+        self.emit_wipe_api_str_buf();
 
         self.emit(&[0x48, 0x89, 0xD9]);
         self.emit_decode_api_str_to_rdx("ep_str", b"ExitProcess".len());
@@ -449,6 +490,7 @@ impl StubEmitter {
         self.emit(&[0xFF, 0x95, 0x40, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xC4, 0x20]);
         self.emit(&[0x48, 0x89, 0x85, 0x58, 0xFF, 0xFF, 0xFF]);
+        self.emit_wipe_api_str_buf();
 
         self.emit(&[0x48, 0xC7, 0xC1, 0xF5, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xEC, 0x20]);
@@ -721,12 +763,32 @@ impl StubEmitter {
 
     fn emit_handler_load_imm(&mut self) {
         self.label("h_load_imm");
+        match self.opcode_map.handler_variant(crate::vm::OpCode::LoadImm) {
+            0 => self.emit_handler_load_imm_v0(),
+            _ => self.emit_handler_load_imm_v1(),
+        }
+    }
+
+    /// LoadImm v0: `mov rax, [rsi]; add rsi, 8; mov [dst], rax`.
+    fn emit_handler_load_imm_v0(&mut self) {
         self.emit_skip_wire_pad(OpCode::LoadImm);
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x06]);
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+        self.jmp_to_dispatch();
+    }
+
+    /// LoadImm v1: load qword into rdx, advance PC via `lea rsi, [rsi+8]`, copy to rax, store to dst.
+    fn emit_handler_load_imm_v1(&mut self) {
+        self.emit_skip_wire_pad(OpCode::LoadImm);
+        self.emit(&[0x0F, 0xB6, 0x0E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x48, 0x8B, 0x16]); // mov rdx, [rsi]
+        self.emit(&[0x48, 0x8D, 0x76, 0x08]); // lea rsi, [rsi+8]
+        self.emit(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
 
@@ -1235,6 +1297,14 @@ impl StubEmitter {
             self.jmp_to_dispatch();
             return;
         }
+        match self.opcode_map.handler_variant(crate::vm::OpCode::Cmp) {
+            0 => self.emit_handler_cmp_v0(),
+            _ => self.emit_handler_cmp_v1(),
+        }
+    }
+
+    /// Cmp v0: qword compare followed by `pushfq; pop rax; and rax, 0x8C1; mov [rbp-0x90], rax`.
+    fn emit_handler_cmp_v0(&mut self) {
         self.emit_skip_wire_pad(OpCode::Cmp);
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
@@ -1246,6 +1316,22 @@ impl StubEmitter {
         self.emit(&[0x58]);
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
         self.emit(&[0x48, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF]);
+        self.jmp_to_dispatch();
+    }
+
+    /// Cmp v1: qword compare followed by `pushfq; pop rdx; and edx, 0x8C1; mov [rbp-0x90], rdx`.
+    fn emit_handler_cmp_v1(&mut self) {
+        self.emit_skip_wire_pad(OpCode::Cmp);
+        self.emit(&[0x0F, 0xB6, 0x0E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x0F, 0xB6, 0x3E]);
+        self.emit(&[0x48, 0xFF, 0xC6]);
+        self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+        self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
+        self.emit(&[0x9C]); // pushfq
+        self.emit(&[0x5A]); // pop rdx
+        self.emit(&[0x81, 0xE2, 0xC1, 0x08, 0x00, 0x00]); // and edx, 0x8C1
+        self.emit(&[0x48, 0x89, 0x95, 0x70, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x90], rdx
         self.jmp_to_dispatch();
     }
 
@@ -1409,7 +1495,12 @@ impl StubEmitter {
                 self.emit(&[0xC3]);
             }
             StubExitMode::ReturnToCaller => {
-                // Return exit register value in rax and unwind stub frame (`leave; ret`).
+                // Restore saved caller rbp ([rbp+0]) and return address ([rbp+8]) in case extended
+                // spill slots r16/r17 were written, then load exit register value into rax and unwind.
+                self.emit(&[0x48, 0x8B, 0x85, 0xE8, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x518]
+                self.emit(&[0x48, 0x89, 0x45, 0x00]); // mov [rbp+0], rax
+                self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x520]
+                self.emit(&[0x48, 0x89, 0x45, 0x08]); // mov [rbp+8], rax
                 self.emit(&[0x0F, 0xB6, 0x0E]); // movzx ecx, byte [rsi]
                 self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]); // mov rax, [rbp+rcx*8-0x80]
                 self.emit(&[0xC9]); // leave (mov rsp, rbp; pop rbp)
@@ -1640,11 +1731,19 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x85, 0xF8, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x508], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x20] VM r12
         self.emit(&[0x48, 0x89, 0x85, 0xF0, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x510], rax
-        self.emit(&[0x48, 0x83, 0xEC, 0x28]);
+        // Allocate 16 bytes for 5th/6th stack args + 0x28 shadow+align (total 0x38, 16B aligned + 8).
+        self.emit(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 0x10
+        self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+        // Marshal Win64 5th arg ([rsp+0x20] <- VM r4 [rbp-0x60]) and 6th arg ([rsp+0x28] <- VM r5 [rbp-0x58]).
+        self.emit(&[0x48, 0x8B, 0x85, 0xA0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x60] (VM r4)
+        self.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+0x20], rax
+        self.emit(&[0x48, 0x8B, 0x85, 0xA8, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x58] (VM r5)
+        self.emit(&[0x48, 0x89, 0x44, 0x24, 0x28]); // mov [rsp+0x28], rax
         self.emit(&[0xFF, 0xD3]); // call rbx
-        self.emit(&[0x48, 0x83, 0xC4, 0x28]);
+        self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
         // Store Win64 return value rax into VM r0 [rbp-0x80] before restoring r10..r12 via rax.
         self.emit(&[0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x80], rax
+        self.emit(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 0x10
         self.emit(&[0x48, 0x8B, 0x85, 0xF0, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x510]
         self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x20], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xF8, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x508]
@@ -1657,7 +1756,35 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
     }
 
+    fn any_handler_offset_collides(&self, candidate_table_base: usize) -> bool {
+        let check = |h: usize| {
+            let off = (h as i64 - candidate_table_base as i64) as i32;
+            Self::would_collide_forbidden_rel32(off)
+                || (off & 0xFF) == 0xB0
+                || (off & 0xFF) == 0xE8
+                || (off & 0xFFFF) == 0xFB80
+                || (off & 0xFFFF) == 0xFD80
+                || (off & 0xFFFF) == 0xF680
+        };
+        for label in CANONICAL_HANDLER_LABELS.iter() {
+            if let Some(&h) = self.labels.get(label) {
+                if check(h) {
+                    return true;
+                }
+            }
+        }
+        if let Some(&h) = self.labels.get("h_set_block_map") {
+            if check(h) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn emit_handler_table_placeholder(&mut self) {
+        while self.any_handler_offset_collides(self.pos()) {
+            self.emit(&[0x90]);
+        }
         self.label("handler_table");
         self.handler_table_start = Some(self.pos());
         for _ in 0..256 {

@@ -471,7 +471,12 @@ pub fn emit_add_reg_reg(bytecode: &mut Vec<u8>, dst: u8, src: u8) {
 pub fn emit_add_reg_imm(bytecode: &mut Vec<u8>, dst: u8, imm: u64) {
     let exclude = [dst];
     let t = temps_excluding(1, &exclude);
-    raw_load_imm(bytecode, t[0], imm);
+    if mba_level() == MbaLevel::Nested {
+        let seed = MBA_SEED.with(|c| c.get());
+        emit_load_imm_unfolded(bytecode, t[0], imm, seed);
+    } else {
+        raw_load_imm(bytecode, t[0], imm);
+    }
     emit_add_three(bytecode, dst, dst, t[0]);
 }
 
@@ -571,6 +576,60 @@ pub fn emit_load_imm_unfolded(bytecode: &mut Vec<u8>, dst: u8, imm: u64, seed: u
         emit_xor_three(bytecode, dst, dst, scratch);
     } else {
         raw_load_imm(bytecode, dst, imm);
+    }
+}
+
+/// Section 2.5: Emit a seed-derived opaque predicate conditional branch guard (`Cmp` + `JmpIf`)
+/// that always jumps over a bogus dead `LoadImm` instruction.
+/// Safe to emit at any point where `r14`, `r15`, and `vm.flags` are about to be overwritten
+/// (such as immediately before a lifted `Cmp` instruction).
+pub fn emit_opaque_branch_guard(bytecode: &mut Vec<u8>, seed: u64, site_id: u64) {
+    let variant = (splitmix64(seed ^ 0x0FA9_0E01 ^ site_id) % 2) as u8;
+    let k = splitmix64(seed ^ 0x0FA9_C0DE ^ site_id) | 1;
+    let dead_imm = splitmix64(seed ^ 0xDEAD_BEEF_CAFE_BABEu64 ^ site_id);
+    if variant == 0 {
+        // Always-equal opaque predicate: (k ^ k) == 0 -> JmpIf(1 = EQ) skips dead LoadImm
+        raw_load_imm(bytecode, 14, k);
+        raw_xor(bytecode, 14, 14, 14);
+        raw_load_imm(bytecode, 15, 0);
+        emit_cmp_regs(bytecode, OpCode::Cmp, 14, 15);
+        let skip_target = (bytecode.len() + 10 + 10) as u64;
+        bytecode.push(active_encode(OpCode::JmpIf));
+        bytecode.push(1);
+        bytecode.extend_from_slice(&skip_target.to_le_bytes());
+        raw_load_imm(bytecode, 14, dead_imm);
+    } else {
+        // Always-not-equal opaque predicate: (k | 1) != 0 -> JmpIf(2 = NE) skips dead LoadImm
+        raw_load_imm(bytecode, 14, k);
+        raw_load_imm(bytecode, 15, 0);
+        emit_cmp_regs(bytecode, OpCode::Cmp, 14, 15);
+        let skip_target = (bytecode.len() + 10 + 10) as u64;
+        bytecode.push(active_encode(OpCode::JmpIf));
+        bytecode.push(2);
+        bytecode.extend_from_slice(&skip_target.to_le_bytes());
+        raw_load_imm(bytecode, 15, dead_imm);
+    }
+}
+
+/// Section 2.5: Emit a branchless algebraic opaque zero-invariant perturbation on `dst`
+/// (`dst = dst ^ ((dst & k) ^ (dst & k))` or `dst = dst + (k ^ k)`), preserving `dst` and flags.
+pub fn emit_opaque_zero_perturbation(bytecode: &mut Vec<u8>, dst: u8, seed: u64, site_id: u64) {
+    let exclude = [dst];
+    let t = temps_excluding(2, &exclude);
+    if t.len() < 2 {
+        return;
+    }
+    let k = splitmix64(seed ^ 0x0FA9_2E50 ^ site_id) | 1;
+    let mode = splitmix64(seed ^ 0x0FA9_7777 ^ site_id) % 2;
+    if mode == 0 {
+        raw_load_imm(bytecode, t[0], k);
+        raw_and(bytecode, t[1], dst, t[0]);
+        raw_xor(bytecode, t[1], t[1], t[1]);
+        raw_xor(bytecode, dst, dst, t[1]);
+    } else {
+        raw_load_imm(bytecode, t[0], k);
+        raw_xor(bytecode, t[1], t[0], t[0]);
+        raw_add(bytecode, dst, dst, t[1]);
     }
 }
 

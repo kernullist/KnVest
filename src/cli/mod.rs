@@ -78,6 +78,16 @@ pub enum Commands {
             help = "L7: Custom output path for the .knvmap sidecar file (defaults to <output>.knvmap when --strip-meta is set)"
         )]
         sidecar: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Strict lifting mode: fail if any non-prologue/epilogue instruction cannot be virtualized without BailNative"
+        )]
+        strict: bool,
+        #[arg(
+            long,
+            help = "Function-level VM exit mode: return to caller with epilogue/ret instead of calling ExitProcess"
+        )]
+        return_mode: bool,
     },
 }
 

@@ -27,16 +27,16 @@ This is an educational project, not a commercial protector. It does NOT include:
 |-------|---------|------------------|---------|
 | **L1–L3** | PE64 parsing, CFG collection, IAT `native_call`, standalone x64 stub | `parser.rs`, `cfg.rs`, `imports.rs`, `lifter.rs`, `vm_stub.rs` | BFS over direct `call rel32` targets in `.text`; `call [rip+IAT]` resolved via PE import directory and invoked with Win64 ABI (`rcx`/`rdx`/`r8`/`r9` + shadow space + `rax -> r0` return capture) |
 | **L4a** | Seeded wire-byte permutation & handler order shuffle | `opcode_map.rs` (`KNV4` v1–v5) | Permutes the 21 canonical opcode wire bytes across `0x00..=0xFF` (`0xFD` reserved for `SetBlockMap` meta-wire) and shuffles native handler emission order in `.knvest` |
-| **L4b / L5a / L6** | Handler polymorphism (n:1 native bodies) | `opcode_map.rs`, `vm_stub.rs`, `virt_isa.rs` | Seed-selected semantically equivalent x64 handler bodies for `Add` (3), `Sub` (2), `Xor` (2), `And` (2), `Mul` (2), and `Move` (2), plus virtual-ISA `sub` split (`neg` + `add`) |
+| **L4b / L5a / L6 / L7** | Handler polymorphism (n:1 native bodies) | `opcode_map.rs`, `vm_stub.rs`, `virt_isa.rs` | Seed-selected semantically equivalent x64 handler bodies for `Add` (3), `Sub` (2), `Xor` (2), `And` (2), `Mul` (2), `Move` (2), `LoadImm` (2), and `Cmp` (2), plus virtual-ISA `sub` split (`neg` + `add`) |
 | **L4c** | Table vs. threaded dispatch | `dispatch.rs`, `threaded.rs` | `--dispatch table` (256-entry handler table) or `--dispatch threaded` (inline `rel32` handler offsets after each wire byte, direct handler-to-handler tail jump) |
 | **L4d** | Partial BB virtualization & native bail-out | `partial.rs` (`KNV5`) | `--partial` keeps selected straight-line basic blocks native via `run_native` / `bail_native` sleds while synchronizing VM spill registers with the native `[rbp±disp]` frame |
 | **L4e / L5d** | Transition-keyed per-edge opcode maps | `block_map.rs` (`KNV6` v1–v3) | Per-CFG-edge `(pred_bb, succ_bb) -> tx_id` 256-entry dispatch tables switched at basic-block boundaries and edge landing pads via `[0xFD][tx_id: u16]` (`set_block_map`) |
-| **L4f / L5b / L6** | Mixed Boolean-Arithmetic (MBA) & constant unfolding | `mba.rs` | `--mba 0\|1\|2` rewrites `Add`, `Sub`, `Xor`, `And`, and synthesized `Or` (`a \| b = (a ^ b) + (a & b)`) into multi-instruction boolean-arithmetic sequences; `emit_load_imm_unfolded` splits 64-bit immediates with seed-derived masks |
+| **L4f / L5b / L6 / L7** | Mixed Boolean-Arithmetic (MBA), constant unfolding & opaque predicates | `mba.rs` | `--mba 0\|1\|2` rewrites `Add`, `Sub`, `Xor`, `And`, and synthesized `Or` (`a \| b = (a ^ b) + (a & b)`) into multi-instruction boolean-arithmetic sequences; `--mba 2` automatically unfolds `LoadImm` constants (`emit_load_imm_unfolded`) and injects seed-derived opaque branch guards (`emit_opaque_branch_guard`) |
 | **L5c** | Bytecode layout diversification | `layout.rs`, `layout_pass.rs` (`KNV7`) | Inserts 0–3 bytes of seed-derived post-wire dead padding (`0xCC`) per opcode and relocates all branch, call, and string-pool offsets |
 | **L5e** | Dual virtual ISA (`reg` / `stack`) | `isa_mode.rs` | `--isa reg` (default 3-operand register ALU) or `--isa stack` (stack-machine ALU popping operands and pushing results on the VM data stack) |
 | **L5f** | Nested VM (two-layer dispatch) | `nested_vm.rs` (`KNV4` v5, `KNV6` v3) | `--nested` separates **outer decode** (per-transition `outer_decode[256]` wire translation) from **inner execute** (`dispatch_inner` handler table) |
-| **L6** | Extended x64 lifter & branch semantics | `lifter.rs`, `cfg.rs`, `machine.rs`, `vm_stub.rs` | Lifts bitwise/unary/shift ops (`AND`, `OR`, `XOR`, `NOT`, `NEG`, `SHL`, `TEST reg, imm`) across register, immediate, and `[rbp±disp]` stack slots, and supports signed, unsigned, and sign conditional jumps (`JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE`, `JA`, `JAE`, `JB`, `JBE`, `JS`, `JNS`) |
-| **L7** | Metadata scrubbing / `.knvmap` sidecar, 32-reg frame & scratch isolation, universal Win64 ABI & caller-return stub, rolling stream cipher | `packer.rs` (`KNVM`), `lifter.rs`, `vm_stub.rs`, `layout.rs` | `--strip-meta` scrubs `KNV4`..`KNV7` & `VMBC` headers and emits `.knvmap`; XOR-encodes all PEB/API strings in `vm_stub`; expands VM to 32 registers (`r14..r15` isolated for scratch, 20 local slots `r10..r13` & `r16..r31`); adds `shr`, `sar`, `idiv`, scaled `lea`, general pointer `[reg+disp]` load/store, and `LiftPolicy::Strict`; supports generic Win64 IAT calls with `rax -> r0` return capture and `StubExitMode::ReturnToCaller` (`leave; ret`); adds `BytecodeCipher` rolling SplitMix64 keystream & slot permutation |
+| **L6** | Extended x64 lifter & branch semantics | `lifter.rs`, `cfg.rs`, `machine.rs`, `vm_stub.rs` | Lifts bitwise/unary/shift ops (`AND`, `OR`, `XOR`, `NOT`, `NEG`, `SHL`, `TEST reg, imm`) and register extension moves (`MOVZX`, `MOVSX`, `MOVSXD`, `CDQE`, plus 32-bit zero-extension `emit_u32_zext`) across register, immediate, and `[rbp±disp]` stack slots, and supports signed, unsigned, and sign conditional jumps (`JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE`, `JA`, `JAE`, `JB`, `JBE`, `JS`, `JNS`) |
+| **L7** | Metadata scrubbing / `.knvmap` sidecar, 32-reg frame & scratch isolation, universal Win64 ABI & caller-return stub, rolling stream cipher | `packer.rs` (`KNVM`), `lifter.rs`, `vm_stub.rs`, `layout.rs` | `--strip-meta` and `--sidecar <PATH>` scrub `KNV4`..`KNV7` & `VMBC` headers and emit `.knvmap`; XOR-encodes all PEB/API strings in `vm_stub` and immediately zero-wipes the stack buffer after `GetProcAddress`; expands VM to 32 registers (`r14..r15` isolated for scratch, 20 local slots `r10..r13` & `r16..r31`); adds `shr`, `sar`, `idiv`, scaled `lea`, general pointer `[reg+disp]` load/store, and `--strict` (`validate_strict_lift`); supports generic Win64 IAT calls (`rcx, rdx, r8, r9` + 5th/6th stack args `[rsp+0x20]=r4`, `[rsp+0x28]=r5` + `rax -> r0`) and `--return-mode` (`StubExitMode::ReturnToCaller`); integrates `BytecodeCipher` rolling SplitMix64 keystream & register slot permutation (`VirtualMachine::with_cipher_decrypted`, `alloc_stack_spill_reg_seeded`) |
 
 ## Build
 
@@ -70,6 +70,8 @@ knvest pack input.exe -o output.exe
 | `--nested` | `false` | Enable L5f nested VM (outer decode + inner execute; requires `--dispatch table`) |
 | `--strip-meta` | `false` | L7: Scrub embedded `KNV4`..`KNV7` & `VMBC` headers from `.knvest` and emit a `.knvmap` sidecar |
 | `--sidecar <PATH>` | `<output>.knvmap` | L7: Custom path for the `.knvmap` sidecar file (supported on both `knvest pack` and `knvest ir`) |
+| `--strict` | `false` | L7: Strict lifting mode — fail if any non-prologue/epilogue instruction cannot be virtualized without `BailNative` |
+| `--return-mode` | `false` | L7: Function-level VM exit mode (`StubExitMode::ReturnToCaller`) — return to caller via `leave; ret` instead of calling `ExitProcess` |
 
 Example invocations:
 
@@ -134,6 +136,8 @@ Logical opcodes with multiple native x64 handler bodies selected deterministical
 | `and` | 2 | Direct `and rax, [src2]` vs. De Morgan `not rax; not rbx; or rax, rbx; not rax` |
 | `mul` | 2 | `imul rax, [src2]` vs. register-staged `mov rbx, [src2]; imul rax, rbx` |
 | `move` | 2 | `mov rax, [src]; mov [dst], rax` vs. `push qword [src]; pop qword [dst]` |
+| `load_imm` | 2 | Direct `mov rax, [rsi]; add rsi, 8` vs. `lodsq` (`0x48, 0xAD`) |
+| `cmp` | 2 | Direct `cmp rax, [rbp+rdi*8-0x80]` vs. register-staged `mov rbx, [rbp+rdi*8-0x80]; cmp rax, rbx` |
 
 ### Lifter & Condition Code Coverage (`L1` – `L6`)
 
@@ -167,7 +171,7 @@ Eight MinGW-style C samples in `sample/`:
 cargo test
 ```
 
-The test suite (**262 tests**: 257 unit tests + 5 integration tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L7 lifting, 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & constant unfolding, handler polymorphism, transition-keyed maps, layout padding, stack ISA, and nested VM execution.
+The test suite (**263 tests**: 257 unit tests + 6 integration tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L7 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `shr`, `sar`, `idiv`, scaled `lea`, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, and `BytecodeCipher` end-to-end execution.
 
 ## Project Structure
 

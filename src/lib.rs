@@ -81,6 +81,8 @@ pub fn extract_partial_plan(pe: &PEFile) -> Result<PartialVirtPlan, pe::PEError>
     packer::extract_partial_plan_from_packed(pe)
 }
 
+pub use pack::{pack_executable_with_full_options, pack_executable_with_options};
+
 pub fn extract_layout_plan(pe: &PEFile) -> Result<BytecodeLayout, pe::PEError> {
     packer::extract_layout_from_packed(pe)
 }

@@ -27,6 +27,8 @@ fn main() -> Result<()> {
             nested,
             strip_meta,
             sidecar,
+            strict,
+            return_mode,
         } => {
             let rva_value = if let Some(rva_str) = rva {
                 let rva_str = rva_str.trim_start_matches("0x");
@@ -56,6 +58,8 @@ fn main() -> Result<()> {
                 nested,
                 strip_meta,
                 sidecar,
+                strict,
+                return_mode,
             )?;
         }
     }
@@ -197,8 +201,10 @@ fn handle_pack_command(
     nested_vm: bool,
     strip_meta: bool,
     sidecar: Option<std::path::PathBuf>,
+    strict: bool,
+    return_mode: bool,
 ) -> Result<()> {
-    pack::pack_executable_with_options(
+    pack::pack_executable_with_full_options(
         &input,
         &output,
         rva,
@@ -210,6 +216,8 @@ fn handle_pack_command(
         nested_vm,
         strip_meta,
         sidecar.as_deref(),
+        strict,
+        return_mode,
     )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
