@@ -1,13 +1,13 @@
-use crate::vm::dispatch::DispatchMode;
-use crate::vm::IsaMode;
 use crate::vm::block_map::{
-    BlockMapPlan, HandlerRedirectPlan, HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_HANDLER_TABLE_OFF,
-    KNV6_ENTRY_OUTER_DECODE_OFF, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE,
-    knv6_entry_size, knv6_handler_table_off,
+    knv6_entry_size, knv6_handler_table_off, BlockMapPlan, HandlerRedirectPlan,
+    HANDLER_REDIRECT_TABLE_SIZE, KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_ENTRY_OUTER_DECODE_OFF,
+    KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, META_WIRE_BYTE,
 };
+use crate::vm::dispatch::DispatchMode;
 use crate::vm::layout::BytecodeLayout;
 use crate::vm::nested_vm::NestedVmPlan;
-use crate::vm::opcode_map::{CANONICAL_HANDLER_LABELS, CANONICAL_OPCODES, OpcodeMap, PackMetadata};
+use crate::vm::opcode_map::{OpcodeMap, PackMetadata, CANONICAL_HANDLER_LABELS, CANONICAL_OPCODES};
+use crate::vm::IsaMode;
 use crate::vm::OpCode;
 use std::collections::HashMap;
 const REDIRECT_FRAME_BUF_OFF: i32 = -0x930;
@@ -144,7 +144,17 @@ pub fn create_vm_interpreter_stub_l8(
     exit_mode: StubExitMode,
     rolling_cipher: bool,
 ) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
-    let mut e = StubEmitter::new(map, dispatch_mode, mba_level, isa_mode, layout_plan, native_sync, block_map_plan, nested_plan, exit_mode);
+    let mut e = StubEmitter::new(
+        map,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        layout_plan,
+        native_sync,
+        block_map_plan,
+        nested_plan,
+        exit_mode,
+    );
     e.set_rolling_cipher(rolling_cipher, map.seed());
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
@@ -326,11 +336,21 @@ impl StubEmitter {
     }
 
     fn emit_mov_qword_from_rip_label(&mut self, dst_reg: u8, target: &'static str) {
-        self.emit_rip_rel32(if dst_reg >= 8 { 0x4C } else { 0x48 }, 0x8B, dst_reg, target);
+        self.emit_rip_rel32(
+            if dst_reg >= 8 { 0x4C } else { 0x48 },
+            0x8B,
+            dst_reg,
+            target,
+        );
     }
 
     fn emit_mov_qword_to_rip_label(&mut self, src_reg: u8, target: &'static str) {
-        self.emit_rip_rel32(if src_reg >= 8 { 0x4C } else { 0x48 }, 0x89, src_reg, target);
+        self.emit_rip_rel32(
+            if src_reg >= 8 { 0x4C } else { 0x48 },
+            0x89,
+            src_reg,
+            target,
+        );
     }
 
     fn emit_rip_rel32(&mut self, rex: u8, opcode: u8, modrm_reg: u8, target: &'static str) {
@@ -432,8 +452,12 @@ impl StubEmitter {
             self.emit(&[0x48, 0x89, 0x85, 0xE0, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x520], rax
         }
         // Zero L2 call depth [rbp-0xC8], push depth [rbp-0xE8], and L4e current bb_id [rbp-0x120]
-        self.emit(&[0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
-        self.emit(&[0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00]);
+        self.emit(&[
+            0x48, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        self.emit(&[
+            0x48, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        ]);
         self.emit_mov_word_imm_to_rbp(-0x120, 0); // mov word [rbp-0x120], 0
         self.emit(&[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x8B, 0x40, 0x18]);
@@ -795,7 +819,7 @@ impl StubEmitter {
             self.emit_mov_qword_to_rbp_from_reg(0, ACTIVE_OUTER_DECODE_PTR_OFF);
         }
         self.emit(&[0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]); // mov rsi, [rbp-0x98]
-        // lea rax, [rbp+REDIRECT_FRAME_BUF_OFF]; mov [rbp-0x130], rax
+                                                                // lea rax, [rbp+REDIRECT_FRAME_BUF_OFF]; mov [rbp-0x130], rax
         self.emit_lea_from_rbp(0, REDIRECT_FRAME_BUF_OFF);
         self.emit_mov_qword_to_rbp_from_reg(0, -0x130);
     }
@@ -894,7 +918,7 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x5C, 0xFD, 0x80]); // mov rbx, [rbp+rdi*8-0x80]
-        self.emit(&[0x48, 0x89, 0xD8]);             // mov rax, rbx
+        self.emit(&[0x48, 0x89, 0xD8]); // mov rax, rbx
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
@@ -1054,7 +1078,7 @@ impl StubEmitter {
         self.emit_alu_operand_reads(OpCode::Mul);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
-        self.emit(&[0x48, 0x0F, 0xAF, 0xC3]);       // imul rax, rbx
+        self.emit(&[0x48, 0x0F, 0xAF, 0xC3]); // imul rax, rbx
         self.emit_alu_store_and_dispatch();
     }
 
@@ -1673,6 +1697,13 @@ impl StubEmitter {
         // Save bytecode pointer past func id at L2 rsi slot [rbp-0x98].
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
 
+        // Pointer mem (0x6) and div/idiv (0x5) before direct-call (0x4).
+        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00]);
+        self.emit(&[0x48, 0x39, 0xC8]);
+        self.jcc_rel32(0x83, "nc_mem");
+        self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00]);
+        self.emit(&[0x48, 0x39, 0xC8]);
+        self.jcc_rel32(0x83, "nc_div");
         // L8 direct call: func_id >= 0x4_0000_0000
         self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x39, 0xC8]);
@@ -1787,7 +1818,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x40, 0x10]); // ImageBase
         self.emit(&[0x48, 0x01, 0xD8]); // add rax, rbx -> &IAT slot
         self.emit(&[0x48, 0x8B, 0x18]); // mov rbx, [rax] — resolved import (call via rbx)
-        // win64 ABI args from VM r0..r3 before ptr test (2151211 putchar order); ptr adds base to rcx.
+                                        // win64 ABI args from VM r0..r3 before ptr test (2151211 putchar order); ptr adds base to rcx.
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
         self.jcc_rel32(0x84, "nc_iat_putchar"); // jz — putchar or generic non-ptr IAT
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] offset
@@ -1818,17 +1849,17 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x85, 0xF8, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x508], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x20] VM r12
         self.emit(&[0x48, 0x89, 0x85, 0xF0, 0xFA, 0xFF, 0xFF]); // mov [rbp-0x510], rax
-        // Allocate 16 bytes for 5th/6th stack args + 0x28 shadow+align (total 0x38, 16B aligned + 8).
+                                                                // Allocate 16 bytes for 5th/6th stack args + 0x28 shadow+align (total 0x38, 16B aligned + 8).
         self.emit(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 0x10
         self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-        // Marshal Win64 5th arg ([rsp+0x20] <- VM r4 [rbp-0x60]) and 6th arg ([rsp+0x28] <- VM r5 [rbp-0x58]).
+                                              // Marshal Win64 5th arg ([rsp+0x20] <- VM r4 [rbp-0x60]) and 6th arg ([rsp+0x28] <- VM r5 [rbp-0x58]).
         self.emit(&[0x48, 0x8B, 0x85, 0xA0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x60] (VM r4)
         self.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+0x20], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xA8, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x58] (VM r5)
         self.emit(&[0x48, 0x89, 0x44, 0x24, 0x28]); // mov [rsp+0x28], rax
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-        // Store Win64 return value rax into VM r0 [rbp-0x80] before restoring r10..r12 via rax.
+                                              // Store Win64 return value rax into VM r0 [rbp-0x80] before restoring r10..r12 via rax.
         self.emit(&[0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x80], rax
         self.emit(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 0x10
         self.emit(&[0x48, 0x8B, 0x85, 0xF0, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x510]
@@ -1850,6 +1881,92 @@ impl StubEmitter {
     const XMM_SCRATCH: i32 = -0x4C0;
 
     fn emit_l8_native_micro_handlers(&mut self) {
+        self.label("nc_div");
+        // r10 = func id, r11 = divisor, kind = bits[15:8]
+        self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
+        self.emit(&[0x41, 0x0F, 0xB6, 0xCA]); // movzx ecx, r10b
+        self.emit(&[0x4C, 0x8B, 0x5C, 0xCD, 0x80]); // mov r11, [rbp+rcx*8-0x80]
+        self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
+        self.emit(&[0xC1, 0xE8, 0x08]); // shr eax, 8
+        self.emit(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
+        self.emit(&[0x83, 0xF8, 0x00]);
+        self.jcc_rel32(0x84, "nc_idiv64");
+        self.emit(&[0x83, 0xF8, 0x01]);
+        self.jcc_rel32(0x84, "nc_idiv32");
+        self.emit(&[0x83, 0xF8, 0x02]);
+        self.jcc_rel32(0x84, "nc_div64");
+        self.emit(&[0x83, 0xF8, 0x03]);
+        self.jcc_rel32(0x84, "nc_div32");
+        self.emit(&[0x83, 0xF8, 0x04]);
+        self.jcc_rel32(0x84, "nc_cdq");
+        // cqo. Writes only VM r2; rax in the frame stays as it was.
+        self.emit(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
+        self.emit(&[0x48, 0x99]); // cqo
+        self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
+        self.jmp_rel32("nc_done");
+        self.label("nc_cdq");
+        // cdq reads eax and writes edx. Do not store rax: a 32-bit mov would clear bits [63:32].
+        self.emit(&[0x8B, 0x45, 0x80]); // mov eax, [rbp-0x80]
+        self.emit(&[0x99]); // cdq
+        self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
+        self.jmp_rel32("nc_done");
+        self.label("nc_div32");
+        self.emit(&[0x8B, 0x45, 0x80]); // mov eax, [rbp-0x80]
+        self.emit(&[0x8B, 0x55, 0x90]); // mov edx, [rbp-0x70]
+        self.emit(&[0x41, 0xF7, 0xF3]); // div r11d
+        self.jmp_rel32("nc_div_store");
+        self.label("nc_idiv64");
+        self.emit(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
+        self.emit(&[0x48, 0x8B, 0x55, 0x90]); // mov rdx, [rbp-0x70]
+        self.emit(&[0x49, 0xF7, 0xFB]); // idiv r11
+        self.jmp_rel32("nc_div_store");
+        self.label("nc_idiv32");
+        self.emit(&[0x8B, 0x45, 0x80]);
+        self.emit(&[0x8B, 0x55, 0x90]);
+        self.emit(&[0x41, 0xF7, 0xFB]); // idiv r11d
+        self.jmp_rel32("nc_div_store");
+        self.label("nc_div64");
+        self.emit(&[0x48, 0x8B, 0x45, 0x80]);
+        self.emit(&[0x48, 0x8B, 0x55, 0x90]);
+        self.emit(&[0x49, 0xF7, 0xF3]); // div r11
+        self.label("nc_div_store");
+        self.emit(&[0x48, 0x89, 0x45, 0x80]); // mov [rbp-0x80], rax
+        self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
+        self.jmp_rel32("nc_done");
+
+        self.label("nc_mem");
+        // r10 = func id, r11 = address, r8 = data reg, r9 = op
+        self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
+        self.emit(&[0x41, 0x0F, 0xB6, 0xCA]); // movzx ecx, r10b
+        self.emit(&[0x4C, 0x8B, 0x5C, 0xCD, 0x80]); // mov r11, [rbp+rcx*8-0x80]
+        self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
+        self.emit(&[0xC1, 0xE8, 0x08]); // shr eax, 8
+        self.emit(&[0x44, 0x0F, 0xB6, 0xC0]); // movzx r8d, al
+        self.emit(&[0x4A, 0x8B, 0x44, 0xC5, 0x80]); // mov rax, [rbp+r8*8-0x80]
+        self.emit(&[0x44, 0x89, 0xD1]); // mov ecx, r10d
+        self.emit(&[0xC1, 0xE9, 0x10]); // shr ecx, 16
+        self.emit(&[0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00]); // and ecx, 0xff
+        self.emit(&[0x83, 0xF9, 0x00]);
+        self.jcc_rel32(0x84, "nc_load64");
+        self.emit(&[0x83, 0xF9, 0x01]);
+        self.jcc_rel32(0x84, "nc_store64");
+        self.emit(&[0x83, 0xF9, 0x02]);
+        self.jcc_rel32(0x84, "nc_load32");
+        self.emit(&[0x41, 0x89, 0x03]); // mov [r11], eax
+        self.jmp_rel32("nc_done");
+        self.label("nc_load64");
+        self.emit(&[0x49, 0x8B, 0x03]); // mov rax, [r11]
+        self.jmp_rel32("nc_mem_writeback");
+        self.label("nc_load32");
+        self.emit(&[0x41, 0x8B, 0x03]); // mov eax, [r11]
+        self.jmp_rel32("nc_mem_writeback");
+        self.label("nc_store64");
+        self.emit(&[0x49, 0x89, 0x03]); // mov [r11], rax
+        self.jmp_rel32("nc_done");
+        self.label("nc_mem_writeback");
+        self.emit(&[0x4A, 0x89, 0x44, 0xC5, 0x80]); // mov [rbp+r8*8-0x80], rax
+        self.jmp_rel32("nc_done");
+
         self.label("nc_direct");
         // rva = low 32 bits; callee = ImageBase + rva; reuse the generic Win64 marshal.
         self.emit(&[0x41, 0x89, 0xC3]); // mov r11d, eax
@@ -1870,7 +1987,7 @@ impl StubEmitter {
         self.label("nc_xmm");
         // Preserve func id, then split subop/dst/src.
         self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
-        // src = r10b, dst = (r10 >> 8) & 0xff, subop = (r10 >> 16) & 0xff
+                                        // src = r10b, dst = (r10 >> 8) & 0xff, subop = (r10 >> 16) & 0xff
         self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
         self.emit(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
         self.emit(&[0x41, 0x89, 0xC0]); // mov r8d, eax  (src)
@@ -2129,7 +2246,7 @@ impl StubEmitter {
         if low32_only {
             self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
             self.emit(&[0xF3, 0x41, 0x0F, 0x10, 0x03]); // movss xmm0, [r11] (zeros upper)
-            // move into xmm1 then store full slot (upper zero)
+                                                        // move into xmm1 then store full slot (upper zero)
             self.emit(&[0x0F, 0x28, 0xC8]); // movaps xmm1, xmm0
         } else {
             self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
@@ -2142,7 +2259,12 @@ impl StubEmitter {
         self.emit_xmm_gp_store_bits(label, low32_only, low32_only);
     }
 
-    fn emit_xmm_gp_store_bits(&mut self, label: &'static str, low32_only: bool, sign_extend32: bool) {
+    fn emit_xmm_gp_store_bits(
+        &mut self,
+        label: &'static str,
+        low32_only: bool,
+        sign_extend32: bool,
+    ) {
         self.label(label);
         self.emit_load_src_xmm0();
         self.emit_lea_from_rbp(11, Self::XMM_SCRATCH);
@@ -2240,7 +2362,12 @@ impl StubEmitter {
         (handler as i64 - table_base as i64) as i32
     }
 
-    fn emit_strings_and_marker(&mut self, knv5: &[u8], block_map_plan: &BlockMapPlan, native_sleds: &[u8]) {
+    fn emit_strings_and_marker(
+        &mut self,
+        knv5: &[u8],
+        block_map_plan: &BlockMapPlan,
+        native_sleds: &[u8],
+    ) {
         let key = self.string_xor_key;
         self.label("k32_str");
         let raw_k32: [u8; 26] = [
@@ -2348,7 +2475,9 @@ impl StubEmitter {
 #[cfg(test)]
 mod tests {
     use super::create_vm_interpreter_stub;
-    use crate::vm::block_map::{KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, KNV6_MAGIC};
+    use crate::vm::block_map::{
+        KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, KNV6_MAGIC,
+    };
 
     /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.
@@ -2366,8 +2495,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         assert!(
             plan.nop_default >= crate::vm::block_map::HANDLER_REDIRECT_TABLE_SIZE as i32,
             "nop_default must point past redirect table, got {:#x}",
@@ -2393,7 +2522,20 @@ mod tests {
 
     #[test]
     fn peb_module_walk_single_advance_per_iteration() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let init = [0x49u8, 0x8B, 0x0B]; // mov rcx, [r11] — first module
         let done = [0x48u8, 0x8B, 0x59, 0x30]; // name_cmp_done: mov rbx, [rcx+0x30]
         let advance = [0x48u8, 0x8B, 0x09]; // mov rcx, [rcx]
@@ -2437,20 +2579,15 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let sig = [0x44u8, 0x0F, 0xB7, 0x06];
         let pos = stub
             .windows(sig.len())
             .position(|w| w == sig)
             .expect("h_set_block_map");
         let body = &stub[pos..pos.saturating_add(160).min(stub.len())];
-        let lea_r15 = [
-            0x49u8,
-            0x8D,
-            0x77,
-            KNV6_ENTRY_HANDLER_TABLE_OFF as u8,
-        ];
+        let lea_r15 = [0x49u8, 0x8D, 0x77, KNV6_ENTRY_HANDLER_TABLE_OFF as u8];
         assert!(
             body.windows(4).any(|w| w == lea_r15),
             "h_set_block_map must lea rsi,[r15+{:#x}] for KNV6 redirect source",
@@ -2461,11 +2598,13 @@ mod tests {
             "h_set_block_map must rep movsq KNV6 redirect into frame buffer"
         );
         assert!(
-            body.windows(7).any(|w| w == [0x48, 0x8D, 0xBD, 0xD0, 0xF6, 0xFF, 0xFF]),
+            body.windows(7)
+                .any(|w| w == [0x48, 0x8D, 0xBD, 0xD0, 0xF6, 0xFF, 0xFF]),
             "h_set_block_map must lea rdi,[rbp-0x930] redirect frame buffer"
         );
         assert!(
-            body.windows(7).any(|w| w == [0x48, 0x89, 0x85, 0xD0, 0xFE, 0xFF, 0xFF]),
+            body.windows(7)
+                .any(|w| w == [0x48, 0x89, 0x85, 0xD0, 0xFE, 0xFF, 0xFF]),
             "h_set_block_map must mov [rbp-0x130], rax (D0 FE FF FF disp32)"
         );
         assert!(
@@ -2488,8 +2627,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         const CORRECT: [u8; 4] = [0x44, 0x0F, 0xB7, 0x06];
         const WRONG: [u8; 4] = [0x45, 0x0F, 0xB7, 0x06];
         assert!(
@@ -2518,8 +2657,8 @@ mod tests {
             &plan,
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         plan.fill_handler_tables(&handler_plan);
         let (stub, _, _, _) = create_vm_interpreter_stub(
             0,
@@ -2533,8 +2672,8 @@ mod tests {
             &plan,
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let sig = [0x44u8, 0x0F, 0xB7, 0x06];
         let set_map = stub
             .windows(sig.len())
@@ -2550,7 +2689,9 @@ mod tests {
             "h_set_block_map must not use disp8 0xE0 (aliases VM r12 at [rbp-0x20])"
         );
         assert!(
-            !body.windows(8).any(|w| w == [0x66, 0x44, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]),
+            !body
+                .windows(8)
+                .any(|w| w == [0x66, 0x44, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF]),
             "h_set_block_map must not store bb_id at [rbp-0x20] (VM r12 slot)"
         );
     }
@@ -2569,8 +2710,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         assert!(
             !stub
                 .windows(8)
@@ -2593,8 +2734,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let save_bb = [
             0x66u8, 0x0F, 0xB7, 0x85, 0xE0, 0xFE, 0xFF, 0xFF, // movzx eax, [rbp-0x120]
             0x48, 0xC1, 0xE0, 0x20, // shl rax, 32
@@ -2621,8 +2762,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let ret_sig = [0x48u8, 0x25, 0xFF, 0xFF, 0xFF, 0xFF];
         let ret_pos = stub
             .windows(ret_sig.len())
@@ -2650,8 +2791,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let ret_restore = [
             0x48u8, 0xC1, 0xE8, 0x20, // shr rax, 32
             0x44, 0x0F, 0xB7, 0xC0, // movzx r8d, eax
@@ -2694,8 +2835,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         assert!(
             stub.windows(9)
                 .any(|w| w == [0x66, 0xC7, 0x85, 0xE0, 0xFE, 0xFF, 0xFF, 0x00, 0x00]),
@@ -2717,8 +2858,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let sig = [0x44u8, 0x0F, 0xB7, 0x06]; // movzx r8d, word [rsi]
         let pos = stub
             .windows(sig.len())
@@ -2726,23 +2867,20 @@ mod tests {
             .expect("h_set_block_map");
         let body = &stub[pos..pos.saturating_add(160).min(stub.len())];
         assert!(
-            body.windows(7).any(|w| w == [0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]),
+            body.windows(7)
+                .any(|w| w == [0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]),
             "h_set_block_map must save bytecode rsi to [rbp-0x98] before rep movsq"
         );
         assert!(
-            body.windows(7).any(|w| w == [0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]),
+            body.windows(7)
+                .any(|w| w == [0x48, 0x8B, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]),
             "h_set_block_map must restore bytecode rsi from [rbp-0x98] after rep movsq"
         );
         assert!(
             !body.contains(&0x56),
             "h_set_block_map must not push rsi (frame is exactly 0x930 — push spills below rsp)"
         );
-        let lea_r15 = [
-            0x49u8,
-            0x8D,
-            0x77,
-            KNV6_ENTRY_HANDLER_TABLE_OFF as u8,
-        ];
+        let lea_r15 = [0x49u8, 0x8D, 0x77, KNV6_ENTRY_HANDLER_TABLE_OFF as u8];
         assert!(
             body.windows(4).any(|w| w == lea_r15),
             "h_set_block_map must lea rsi,[r15+{:#x}] as rep movsq source",
@@ -2753,7 +2891,9 @@ mod tests {
             "h_set_block_map must rep movsq KNV6 redirect into [rbp-0x930] frame buffer"
         );
         assert!(
-            !body.windows(4).any(|w| w == [0x49, 0x8D, 0x47, KNV6_ENTRY_HANDLER_TABLE_OFF as u8]),
+            !body
+                .windows(4)
+                .any(|w| w == [0x49, 0x8D, 0x47, KNV6_ENTRY_HANDLER_TABLE_OFF as u8]),
             "h_set_block_map must not point [rbp-0x130] at raw KNV6 without frame copy"
         );
         assert!(
@@ -2789,8 +2929,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let dispatch = stub
             .windows(18)
             .position(|w| {
@@ -2835,8 +2975,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let sig = [0x44u8, 0x0F, 0xB7, 0x06];
         let set_map = stub
             .windows(sig.len())
@@ -2874,8 +3014,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let sig = [0x44u8, 0x0F, 0xB7, 0x06];
         let set_map = stub
             .windows(sig.len())
@@ -2910,8 +3050,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let stride = KNV6_ENTRY_SIZE as u32;
         let expected = [
             0x49,
@@ -2947,8 +3087,7 @@ mod tests {
             .expect("lea r15,[rip+knv6_block_maps]");
         let target = resolve_lea_rip(&stub, lea_pos);
         assert_eq!(
-            target,
-            knv6_offset,
+            target, knv6_offset,
             "KNV6 resolve must lea r15 to knv6_block_maps label ({knv6_offset:#x})"
         );
     }
@@ -2967,8 +3106,8 @@ mod tests {
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let table_base = handler_table_base(&stub);
         let sig = [0x44u8, 0x0F, 0xB7, 0x06];
         let set_map = stub
@@ -2984,7 +3123,7 @@ mod tests {
     #[test]
     fn knv6_handler_table_slots_resolve_inside_stub() {
         use crate::vm::block_map::{
-            validate_handler_table_targets, BlockMapPlan, install_handler_table_in_stub,
+            install_handler_table_in_stub, validate_handler_table_targets, BlockMapPlan,
         };
 
         let seed = 0x4C34_4100u64;
@@ -3008,8 +3147,8 @@ mod tests {
             &plan,
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         plan.fill_handler_tables(&handler_plan);
         let (mut stub, _, knv6_offset, _) = create_vm_interpreter_stub(
             0,
@@ -3023,8 +3162,8 @@ mod tests {
             &plan,
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         crate::pe::packer::patch_knv6_in_stub(&mut stub, knv6_offset, &plan, false);
         crate::pe::packer::patch_runtime_handler_table(&mut stub, &plan);
 
@@ -3064,13 +3203,14 @@ mod tests {
         // Simulate runtime h_set_block_map refresh for every BB entry.
         for entry in &plan.entries {
             install_handler_table_in_stub(&mut stub, table_base, &entry.handler_table);
-            validate_handler_table_targets(&stub, table_base, &entry.handler_table)
-                .unwrap_or_else(|e| {
+            validate_handler_table_targets(&stub, table_base, &entry.handler_table).unwrap_or_else(
+                |e| {
                     panic!(
                         "after simulated set_block_map bb_id={} invalid: {e}",
                         entry.bb_id
                     )
-                });
+                },
+            );
             let load_imm_wire = plan
                 .map_for_bb_or_base(entry.bb_id, &map)
                 .encode(crate::vm::OpCode::LoadImm) as usize;
@@ -3096,10 +3236,26 @@ mod tests {
 
     #[test]
     fn prologue_init_native_frame_ptr_once() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let lea_rax_stack = [0x48u8, 0x8D, 0x05]; // lea rax, [rip+disp]
         let store_abs = [0x48u8, 0x89, 0x05]; // mov [rip+disp], rax
-        let lea_rax_count = stub.windows(lea_rax_stack.len()).filter(|w| *w == lea_rax_stack).count();
+        let lea_rax_count = stub
+            .windows(lea_rax_stack.len())
+            .filter(|w| *w == lea_rax_stack)
+            .count();
         assert!(
             lea_rax_count >= 1,
             "prologue must lea rax,[native_stack_top] (modrm reg 0, not rsp=4)"
@@ -3122,7 +3278,9 @@ mod tests {
             "prologue must mov [rip+native_frame_ptr], rax"
         );
         assert!(
-            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0xF0, 0xFE, 0xFF, 0xFF]),
+            !stub
+                .windows(7)
+                .any(|w| w == [0x48, 0xC7, 0x85, 0xF0, 0xFE, 0xFF, 0xFF]),
             "must not use spill-adjacent [rbp-0x110] slot for native frame ptr"
         );
     }
@@ -3131,7 +3289,20 @@ mod tests {
     fn run_native_and_bail_share_invoke_without_runtime_alloc() {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync, &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &sync,
+            &crate::vm::NestedVmPlan::disabled(),
+        );
 
         let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
         let mut invoke_sites = Vec::new();
@@ -3183,7 +3354,20 @@ mod tests {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
         let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &sled, &sync, &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &sled,
+            &sync,
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let (run_site, bail_site) = run_native_invoke_body(&stub);
         let run_body = &stub[run_site..bail_site];
         let call_at = run_body
@@ -3235,7 +3419,20 @@ mod tests {
     fn run_native_handler_win64_call_sequence() {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &sync, &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &sync,
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let call_r10 = [0x41u8, 0xFF, 0xD2];
         let call_at = stub
             .windows(call_r10.len())
@@ -3259,7 +3456,9 @@ mod tests {
             "must not indirect-load native frame via [rip+native_frame_ptr] in handler"
         );
         assert!(
-            prefix.windows(7).any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
+            prefix
+                .windows(7)
+                .any(|w| w == [0x48, 0x8D, 0xA5, 0x80, 0x00, 0x00, 0x00]),
             "lea rsp, [rbp+0x80] — call stack above native locals"
         );
         assert!(
@@ -3289,7 +3488,20 @@ mod tests {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
         let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &sled, &sync, &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &sled,
+            &sync,
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
         let run_site = stub
             .windows(invoke_prologue.len())
@@ -3355,7 +3567,20 @@ mod tests {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
         let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &sled, &sync, &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &sled,
+            &sync,
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let (run_site, bail_site) = run_native_invoke_body(&stub);
         let run_body = &stub[run_site..bail_site];
         let call_at = run_body
@@ -3369,7 +3594,9 @@ mod tests {
         let mov_rbp_r14 = [0x4Cu8, 0x89, 0xF5];
         let pre_sync_store = [0x89u8, 0x45, 0xFC];
         assert!(
-            run_body.windows(save_vm_frame.len()).any(|w| w == save_vm_frame),
+            run_body
+                .windows(save_vm_frame.len())
+                .any(|w| w == save_vm_frame),
             "handler must persist VM frame at [rbp-0x118] on entry"
         );
         let lea_at = before_call
@@ -3403,7 +3630,20 @@ mod tests {
         let sync = vec![(-4i32, 10u8)];
         let map = crate::vm::OpcodeMap::from_seed(0x14D0_2026);
         let sled = [0x83u8, 0x6D, 0xFC, 0x01, 0xC3];
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &sled, &sync, &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &sled,
+            &sync,
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let (run_site, bail_site) = run_native_invoke_body(&stub);
         let run_body = &stub[run_site..bail_site];
         let invoke_prologue = [0x48u8, 0x8B, 0x06, 0x49, 0x89, 0xC3];
@@ -3439,8 +3679,8 @@ mod tests {
                 .windows(3)
                 .position(|w| w == [0x4C, 0x89, 0xFD])
                 .expect("restore mov")]
-            .windows(3)
-            .any(|w| w == [0x49, 0x89, 0xEF]),
+                .windows(3)
+                .any(|w| w == [0x49, 0x89, 0xEF]),
             "must not emit mov r15,rbp (49 89 ef) as restore"
         );
     }
@@ -3622,9 +3862,23 @@ invoke_once:
 
     #[test]
     fn iat_native_call_threshold_uses_full_mov_rcx_imm64() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let pattern = [
-            0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rcx, 0x100000000
+            0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, // mov rcx, 0x100000000
             0x48, 0x39, 0xC8, // cmp rax, rcx
         ];
         assert!(
@@ -3640,15 +3894,34 @@ invoke_once:
 
     #[test]
     fn vm_metadata_uses_l2_slots_with_correct_disp32() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
-        let call_depth_init = [0x48u8, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
-        let push_depth_init = [0x48u8, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
+        let call_depth_init = [
+            0x48u8, 0xC7, 0x85, 0x38, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let push_depth_init = [
+            0x48u8, 0xC7, 0x85, 0x18, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        ];
         assert!(
-            stub.windows(call_depth_init.len()).any(|w| w == call_depth_init),
+            stub.windows(call_depth_init.len())
+                .any(|w| w == call_depth_init),
             "call depth must init [rbp-0xC8] (38 FF FF FF)"
         );
         assert!(
-            stub.windows(push_depth_init.len()).any(|w| w == push_depth_init),
+            stub.windows(push_depth_init.len())
+                .any(|w| w == push_depth_init),
             "push depth must init [rbp-0xE8] (18 FF FF FF)"
         );
         let flags_store = [0x48u8, 0x89, 0x85, 0x70, 0xFF, 0xFF, 0xFF];
@@ -3665,11 +3938,15 @@ invoke_once:
         let wrong_call_on_bytes_written = [0x48u8, 0xC7, 0x85, 0x30, 0xFF, 0xFF, 0xFF];
         let hcall_on_char_buf = [0x48u8, 0x89, 0xB5, 0x10, 0xFF, 0xFF, 0xFF];
         assert!(
-            !stub.windows(wrong_call_on_bytes_written.len()).any(|w| w == wrong_call_on_bytes_written),
+            !stub
+                .windows(wrong_call_on_bytes_written.len())
+                .any(|w| w == wrong_call_on_bytes_written),
             "must not store call depth at [rbp-0xD0] bytes-written slot"
         );
         assert!(
-            !stub.windows(hcall_on_char_buf.len()).any(|w| w == hcall_on_char_buf),
+            !stub
+                .windows(hcall_on_char_buf.len())
+                .any(|w| w == hcall_on_char_buf),
             "h_call scratch must not use [rbp-0xF0] char buf"
         );
         // disp32 decode sanity: first byte is NOT the hex offset for negatives below -0x80
@@ -3681,7 +3958,20 @@ invoke_once:
 
     #[test]
     fn iat_native_call_maps_x64_rcx_from_vm_reg0() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         // nc_iat must load win64 rcx from VM r0 slot [rbp-0x80] (zero-extended via mov ecx)
         let rcx_from_r0 = [0x8Bu8, 0x8D, 0x80, 0xFF, 0xFF, 0xFF];
         assert!(
@@ -3695,7 +3985,9 @@ invoke_once:
         );
         let rdx_wrong_gap = [0x48u8, 0x8B, 0x95, 0x78, 0xFF, 0xFF, 0xFF];
         assert!(
-            !stub.windows(rdx_wrong_gap.len()).any(|w| w == rdx_wrong_gap),
+            !stub
+                .windows(rdx_wrong_gap.len())
+                .any(|w| w == rdx_wrong_gap),
             "IAT rdx must not use 78 FF FF FF ([rbp-0x88] gap, not r1)"
         );
         let ptr_fixup = [0x48u8, 0x01, 0xC1]; // add rcx, rax after lea rax,[bytecode]
@@ -3749,7 +4041,9 @@ invoke_once:
         );
         let r8_from_flags = [0x4Cu8, 0x8B, 0x85, 0x70, 0xFF, 0xFF, 0xFF];
         assert!(
-            !stub.windows(r8_from_flags.len()).any(|w| w == r8_from_flags),
+            !stub
+                .windows(r8_from_flags.len())
+                .any(|w| w == r8_from_flags),
             "IAT path must not load r8 from cmp flags slot [rbp-0x90] (70 FF FF FF)"
         );
         let r9_from_r3 = [0x4Cu8, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF];
@@ -3759,7 +4053,9 @@ invoke_once:
         );
         let r9_from_stdout = [0x4Cu8, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF];
         assert!(
-            !stub.windows(r9_from_stdout.len()).any(|w| w == r9_from_stdout),
+            !stub
+                .windows(r9_from_stdout.len())
+                .any(|w| w == r9_from_stdout),
             "IAT path must not load r9 from stdout slot [rbp-0xA0]"
         );
         let iat_call = [0xFFu8, 0xD3]; // call rbx
@@ -3774,16 +4070,21 @@ invoke_once:
         );
         // Byte-exact nc_iat prologue: eax→r11d, then ebx←r11d (not reversed)
         assert_eq!(
-            &stub[nc_iat_off + mov_r11d_eax.len()..nc_iat_off + mov_r11d_eax.len() + mov_ebx_r11d.len()],
+            &stub[nc_iat_off + mov_r11d_eax.len()
+                ..nc_iat_off + mov_r11d_eax.len() + mov_ebx_r11d.len()],
             mov_ebx_r11d,
             "after mov r11d,eax nc_iat must emit 44 89 DB (mov ebx,r11d)"
         );
         assert!(
-            !stub.windows(wrong_mov_r11d_ebx.len()).any(|w| w == wrong_mov_r11d_ebx),
+            !stub
+                .windows(wrong_mov_r11d_ebx.len())
+                .any(|w| w == wrong_mov_r11d_ebx),
             "must not emit 41 89 DB (mov r11d,ebx) after copying func_id low dword"
         );
         assert!(
-            !stub.windows([0xFFu8, 0xD0].len()).any(|w| w == [0xFF, 0xD0]),
+            !stub
+                .windows([0xFFu8, 0xD0].len())
+                .any(|w| w == [0xFF, 0xD0]),
             "stub must not use call rax (FF D0) — IAT target lives in rbx"
         );
     }
@@ -3795,26 +4096,47 @@ invoke_once:
     /// Metadata (push/call depth, flags, rsi save) must not use VM r0..r15 frame slots.
     #[test]
     fn vm_stub_metadata_must_not_alias_vm_reg_slots() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let r13_slot = vm_reg_slot_disp32(13); // E8 FF FF FF = [rbp-0x18]
         assert!(
             !stub.windows(4).any(|w| w == r13_slot),
             "stub must not use r13 slot disp E8 FF FF FF (fact push depth collision)"
         );
         assert!(
-            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0x30, 0xFF, 0xFF, 0xFF]),
+            !stub
+                .windows(7)
+                .any(|w| w == [0x48, 0xC7, 0x85, 0x30, 0xFF, 0xFF, 0xFF]),
             "must not init call depth at [rbp-0xD0] (30 FF)"
         );
         assert!(
-            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0x28, 0xFF, 0xFF, 0xFF]),
+            !stub
+                .windows(7)
+                .any(|w| w == [0x48, 0xC7, 0x85, 0x28, 0xFF, 0xFF, 0xFF]),
             "must not init push depth at [rbp-0xD8] (28 FF)"
         );
         assert!(
-            !stub.windows(7).any(|w| w == [0x48, 0x89, 0xB5, 0x10, 0xFF, 0xFF, 0xFF]),
+            !stub
+                .windows(7)
+                .any(|w| w == [0x48, 0x89, 0xB5, 0x10, 0xFF, 0xFF, 0xFF]),
             "h_call scratch must not use char buf [rbp-0xF0] (10 FF)"
         );
         assert!(
-            !stub.windows(7).any(|w| w == [0x48, 0xC7, 0x85, 0xA8, 0xFF, 0xFF, 0xFF]),
+            !stub
+                .windows(7)
+                .any(|w| w == [0x48, 0xC7, 0x85, 0xA8, 0xFF, 0xFF, 0xFF]),
             "must not init call depth at VM r5 slot (A8 FF)"
         );
         assert!(
@@ -3825,11 +4147,17 @@ invoke_once:
         let push_depth = [0x18u8, 0xFF, 0xFF, 0xFF];
         let call_depth = [0x38u8, 0xFF, 0xFF, 0xFF];
         assert!(
-            stub.windows(push_depth.len()).filter(|w| *w == push_depth).count() >= 4,
+            stub.windows(push_depth.len())
+                .filter(|w| *w == push_depth)
+                .count()
+                >= 4,
             "h_push/h_pop must reference push depth [rbp-0xE8] (18 FF FF FF)"
         );
         assert!(
-            stub.windows(call_depth.len()).filter(|w| *w == call_depth).count() >= 4,
+            stub.windows(call_depth.len())
+                .filter(|w| *w == call_depth)
+                .count()
+                >= 4,
             "h_call/h_ret must reference call depth [rbp-0xC8] (38 FF FF FF)"
         );
         // nc2 reads VM r2 (arith/loop/call/str leave printed int in r2 before nc2)
@@ -3842,12 +4170,19 @@ invoke_once:
         let data_stack_disp = [0x80u8, 0xFC, 0xFF, 0xFF];
         assert_eq!(i32::from_le_bytes(data_stack_disp), -0x380);
         assert!(
-            stub.windows(data_stack_disp.len()).filter(|w| *w == data_stack_disp).count() >= 2,
+            stub.windows(data_stack_disp.len())
+                .filter(|w| *w == data_stack_disp)
+                .count()
+                >= 2,
             "h_push/h_pop data stack must use [rbp-0x380] (80 FC FF FF)"
         );
         assert!(
-            !stub.windows(8).any(|w| w == [0x48, 0x89, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF])
-                && !stub.windows(8).any(|w| w == [0x48, 0x8B, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]),
+            !stub
+                .windows(8)
+                .any(|w| w == [0x48, 0x89, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF])
+                && !stub
+                    .windows(8)
+                    .any(|w| w == [0x48, 0x8B, 0x84, 0xD5, 0x80, 0xF6, 0xFF, 0xFF]),
             "data stack push/pop must not use [rbp-0x980] (80 F6 FF FF — out of frame)"
         );
         assert!(
@@ -3860,7 +4195,8 @@ invoke_once:
         );
         let prologue_alloc = [0x48u8, 0x81, 0xEC, 0x30, 0x09, 0x00, 0x00];
         assert!(
-            stub.windows(prologue_alloc.len()).any(|w| w == prologue_alloc),
+            stub.windows(prologue_alloc.len())
+                .any(|w| w == prologue_alloc),
             "prologue must allocate >= 0x930 bytes (frame + 1 KiB redirect copy)"
         );
         let qword_cmp = [0x48u8, 0x8B, 0x44, 0xCD, 0x80, 0x48, 0x3B, 0x44, 0xFD, 0x80];
@@ -3889,14 +4225,20 @@ invoke_once:
             stub.windows(cmp32_flags.len()).any(|w| w == cmp32_flags),
             "h_cmp32 must store masked flags to [rbp-0x90] after dword cmp (same path as h_cmp)"
         );
-        let spill_save_r10 = [0x48u8, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0x00, 0xFB, 0xFF, 0xFF];
+        let spill_save_r10 = [
+            0x48u8, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0x00, 0xFB, 0xFF, 0xFF,
+        ];
         assert!(
-            stub.windows(spill_save_r10.len()).any(|w| w == spill_save_r10),
+            stub.windows(spill_save_r10.len())
+                .any(|w| w == spill_save_r10),
             "nc_iat_call must save VM r10 to frame scratch [rbp-0x500] before external call"
         );
-        let spill_restore_r10 = [0x48u8, 0x8B, 0x85, 0x00, 0xFB, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF];
+        let spill_restore_r10 = [
+            0x48u8, 0x8B, 0x85, 0x00, 0xFB, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xD0, 0xFF, 0xFF, 0xFF,
+        ];
         assert!(
-            stub.windows(spill_restore_r10.len()).any(|w| w == spill_restore_r10),
+            stub.windows(spill_restore_r10.len())
+                .any(|w| w == spill_restore_r10),
             "nc_iat_call must restore VM r10 from frame scratch after external call"
         );
         assert!(
@@ -3915,8 +4257,10 @@ invoke_once:
         ];
         for disp in scratch_disps {
             assert!(
-                stub.windows(7)
-                    .any(|w| w[0] == 0x48 && (w[1] == 0x89 || w[1] == 0x8B) && w[2] == 0x85 && w[3..7] == disp),
+                stub.windows(7).any(|w| w[0] == 0x48
+                    && (w[1] == 0x89 || w[1] == 0x8B)
+                    && w[2] == 0x85
+                    && w[3..7] == disp),
                 "nc_iat scratch must use [rbp-0x500..-0x510], missing disp {:?} ({})",
                 disp,
                 i32::from_le_bytes(disp)
@@ -3930,10 +4274,7 @@ invoke_once:
         for bad in forbidden_scratch {
             assert!(
                 !stub.windows(7).any(|w| {
-                    w[0] == 0x48
-                        && (w[1] == 0x89 || w[1] == 0x8B)
-                        && w[2] == 0x85
-                        && w[3..7] == bad
+                    w[0] == 0x48 && (w[1] == 0x89 || w[1] == 0x8B) && w[2] == 0x85 && w[3..7] == bad
                 }),
                 "nc_iat scratch must not use FD-band disp {:?} (decoded {})",
                 bad,
@@ -3948,10 +4289,7 @@ invoke_once:
         for bad in ret_stack_band {
             assert!(
                 !stub.windows(7).any(|w| {
-                    w[0] == 0x48
-                        && (w[1] == 0x89 || w[1] == 0x8B)
-                        && w[2] == 0x85
-                        && w[3..7] == bad
+                    w[0] == 0x48 && (w[1] == 0x89 || w[1] == 0x8B) && w[2] == 0x85 && w[3..7] == bad
                 }),
                 "nc_iat scratch must not use ret-stack band disp {bad:02x?} ([rbp-0x200..-0x80])"
             );
@@ -4032,7 +4370,20 @@ invoke_once:
     /// Every SIB used for VM reg [rbp+idx*scale-0x80] in handlers must be scale*8 (CD/FD/D5).
     #[test]
     fn vm_reg_sib_must_be_scale8_in_handlers() {
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &crate::vm::OpcodeMap::from_seed(0), crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let forbidden_sib = [
             (0x8D, "rcx scale*4"),
             (0xBD, "rdi scale*4"),
@@ -4107,7 +4458,11 @@ invoke_once:
         assert_eq!(frame.get(StubFrame::reg_slot(11)), 2);
         assert_eq!(frame.get(StubFrame::reg_slot(12)), 3);
         assert_eq!(frame.get(-0xE8), 1, "only main r5 remains on data stack");
-        assert_eq!(frame.get(StubFrame::data_slot(1)), 1, "stack[1] holds spilled r10");
+        assert_eq!(
+            frame.get(StubFrame::data_slot(1)),
+            1,
+            "stack[1] holds spilled r10"
+        );
     }
 
     fn handler_table_base(stub: &[u8]) -> usize {
@@ -4137,7 +4492,9 @@ invoke_once:
 
     fn seed_for_sub_variant(target: u8) -> u64 {
         for seed in 0..512u64 {
-            if crate::vm::OpcodeMap::from_seed(seed).handler_variant(crate::vm::OpCode::Sub) == target {
+            if crate::vm::OpcodeMap::from_seed(seed).handler_variant(crate::vm::OpCode::Sub)
+                == target
+            {
                 return seed;
             }
         }
@@ -4173,8 +4530,8 @@ invoke_once:
             &crate::vm::BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let h = sub_handler_offset(&stub, &map);
         let body = &stub[h..h + 48];
         assert!(
@@ -4195,14 +4552,43 @@ invoke_once:
         let seed_v1 = seed_for_add_variant(1);
         let map_v0 = crate::vm::OpcodeMap::from_seed(seed_v0);
         let map_v1 = crate::vm::OpcodeMap::from_seed(seed_v1);
-        let (stub_v0, _, _, _) = create_vm_interpreter_stub(0, 0, &map_v0, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
-        let (stub_v1, _, _, _) = create_vm_interpreter_stub(0, 0, &map_v1, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub_v0, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map_v0,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
+        let (stub_v1, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map_v1,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
 
         let h0 = add_handler_offset(&stub_v0, &map_v0);
         let h1 = add_handler_offset(&stub_v1, &map_v1);
         let body_v0 = &stub_v0[h0..h0 + 48];
         let body_v1 = &stub_v1[h1..h1 + 48];
-        assert_ne!(body_v0, body_v1, "Add handlers for variant 0 vs 1 must differ");
+        assert_ne!(
+            body_v0, body_v1,
+            "Add handlers for variant 0 vs 1 must differ"
+        );
 
         let lea_add = [0x48u8, 0x8D, 0x04, 0x03];
         let direct_add = [0x48u8, 0x03, 0x44, 0xD5, 0x80];
@@ -4222,7 +4608,20 @@ invoke_once:
         if ADD_HANDLER_VARIANT_COUNT >= 3 {
             let seed_v2 = seed_for_add_variant(2);
             let map_v2 = crate::vm::OpcodeMap::from_seed(seed_v2);
-            let (stub_v2, _, _, _) = create_vm_interpreter_stub(0, 0, &map_v2, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+            let (stub_v2, _, _, _) = create_vm_interpreter_stub(
+                0,
+                0,
+                &map_v2,
+                crate::vm::DispatchMode::Table,
+                0,
+                crate::vm::IsaMode::Reg,
+                &crate::vm::BytecodeLayout::identity(),
+                &[],
+                &crate::vm::BlockMapPlan::default(),
+                &[],
+                &[],
+                &crate::vm::NestedVmPlan::disabled(),
+            );
             let h2 = add_handler_offset(&stub_v2, &map_v2);
             let body_v2 = &stub_v2[h2..h2 + 48];
             assert_ne!(body_v0, body_v2);
@@ -4230,7 +4629,9 @@ invoke_once:
             // v2 stores partial sum before final add
             let partial_store = [0x48u8, 0x89, 0x44, 0xCD, 0x80, 0x48, 0x8B, 0x44, 0xCD, 0x80];
             assert!(
-                body_v2.windows(partial_store.len()).any(|w| w == partial_store),
+                body_v2
+                    .windows(partial_store.len())
+                    .any(|w| w == partial_store),
                 "Add v2 must store src1 then reload dst before adding src2"
             );
         }
@@ -4240,8 +4641,34 @@ invoke_once:
     fn add_handler_polymorphism_same_seed_is_stable() {
         let seed = seed_for_add_variant(1);
         let map = crate::vm::OpcodeMap::from_seed(seed);
-        let (a, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
-        let (b, _, _, _) = create_vm_interpreter_stub(0, 0, &map, crate::vm::DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &crate::vm::BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (a, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
+        let (b, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let ha = add_handler_offset(&a, &map);
         let hb = add_handler_offset(&b, &map);
         assert_eq!(&a[ha..ha + 48], &b[hb..hb + 48]);
@@ -4249,16 +4676,17 @@ invoke_once:
 
     #[test]
     fn mul_and_move_handler_variants_vary_across_seeds() {
-        let handler_off = |stub: &[u8], map: &crate::vm::OpcodeMap, op: crate::vm::OpCode| -> usize {
-            let table_base = handler_table_base(stub);
-            let wire = map.encode(op) as usize;
-            let off = i32::from_le_bytes(
-                stub[table_base + wire * 4..table_base + wire * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            );
-            table_base + off as usize
-        };
+        let handler_off =
+            |stub: &[u8], map: &crate::vm::OpcodeMap, op: crate::vm::OpCode| -> usize {
+                let table_base = handler_table_base(stub);
+                let wire = map.encode(op) as usize;
+                let off = i32::from_le_bytes(
+                    stub[table_base + wire * 4..table_base + wire * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                table_base + off as usize
+            };
 
         for op in [crate::vm::OpCode::Mul, crate::vm::OpCode::Move] {
             let seed_v0 = (0..512u64)
@@ -4385,7 +4813,7 @@ invoke_once:
 
     #[test]
     fn l7_return_to_caller_exit_mode_emits_leave_ret_and_nc_iat_generic_captures_rax() {
-        use super::{StubExitMode, create_vm_interpreter_stub_with_exit_mode};
+        use super::{create_vm_interpreter_stub_with_exit_mode, StubExitMode};
         let map = crate::vm::OpcodeMap::from_seed(0x7777);
         let (stub_ret, _, _, _) = create_vm_interpreter_stub_with_exit_mode(
             0,
@@ -4426,5 +4854,47 @@ invoke_once:
             stub_ret.windows(mask_3f.len()).any(|w| w == mask_3f),
             "nc_iat must mask IAT RVA with 0x3fffffff"
         );
+    }
+
+    #[test]
+    fn native_micro_div_and_mem_use_real_idiv_and_data_reg() {
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
+        // shr eax, 8; movzx r8d, al — data-reg index, not movzx eax, r8b (41 0F B6 C0).
+        let data_reg = [0xC1u8, 0xE8, 0x08, 0x44, 0x0F, 0xB6, 0xC0];
+        assert!(
+            stub.windows(data_reg.len()).any(|w| w == data_reg),
+            "pointer mem must movzx r8d, al so the data register survives the address load"
+        );
+        // cdq writes edx only: mov eax,[rbp-0x80]; cdq; mov [rbp-0x70], rdx
+        let cdq = [0x8Bu8, 0x45, 0x80, 0x99, 0x48, 0x89, 0x55, 0x90];
+        assert!(
+            stub.windows(cdq.len()).any(|w| w == cdq),
+            "cdq micro must sign-fill edx without storing rax back"
+        );
+        let cqo = [0x48u8, 0x8B, 0x45, 0x80, 0x48, 0x99, 0x48, 0x89, 0x55, 0x90];
+        assert!(
+            stub.windows(cqo.len()).any(|w| w == cqo),
+            "cqo micro must be the REX.W form"
+        );
+        assert!(
+            stub.windows(3).any(|w| w == [0x41, 0xF7, 0xFB]),
+            "idiv r11d"
+        );
+        assert!(stub.windows(3).any(|w| w == [0x49, 0xF7, 0xFB]), "idiv r11");
+        assert!(stub.windows(3).any(|w| w == [0x41, 0xF7, 0xF3]), "div r11d");
+        assert!(stub.windows(3).any(|w| w == [0x49, 0xF7, 0xF3]), "div r11");
     }
 }

@@ -593,6 +593,10 @@ impl VirtualMachine {
                     self.pc = self.get_register(reg)? as usize;
                 } else if let Some((subop, dst, src)) = crate::vm::l8::decode_xmm(func_id) {
                     self.exec_xmm_micro(subop, dst, src)?;
+                } else if let Some((kind, reg)) = crate::vm::l8::decode_div(func_id) {
+                    self.exec_div_micro(kind, reg)?;
+                } else if let Some((op, data, addr)) = crate::vm::l8::decode_mem(func_id) {
+                    self.exec_mem_micro(op, data, addr)?;
                 } else if let Some(rva) = crate::vm::l8::decode_direct_call(func_id) {
                     self.direct_calls.push(rva);
                     if let Some(func) = self.native_functions.get(&func_id).copied() {
@@ -667,6 +671,69 @@ impl VirtualMachine {
         }
 
         Ok(())
+    }
+
+    fn exec_div_micro(&mut self, kind: u8, divisor_reg: u8) -> VMResult<()> {
+        let divisor = self.get_register(divisor_reg)?;
+        let lo = self.get_register(0)?;
+        let hi = self.get_register(2)?;
+        match crate::vm::l8::exec_div(kind, lo, hi, divisor) {
+            Ok((quot, rem)) => {
+                self.set_register(0, quot)?;
+                self.set_register(2, rem)?;
+                Ok(())
+            }
+            Err(()) => Err(VMError::DivisionByZero),
+        }
+    }
+
+    fn read_mem(&self, addr: usize, len: usize) -> VMResult<u64> {
+        if addr
+            .checked_add(len)
+            .map(|end| end > self.memory.len())
+            .unwrap_or(true)
+        {
+            return Err(VMError::MemoryViolation(addr));
+        }
+        let mut bytes = [0u8; 8];
+        bytes[..len].copy_from_slice(&self.memory[addr..addr + len]);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn write_mem(&mut self, addr: usize, value: u64, len: usize) -> VMResult<()> {
+        if addr
+            .checked_add(len)
+            .map(|end| end > self.memory.len())
+            .unwrap_or(true)
+        {
+            return Err(VMError::MemoryViolation(addr));
+        }
+        let bytes = value.to_le_bytes();
+        self.memory[addr..addr + len].copy_from_slice(&bytes[..len]);
+        Ok(())
+    }
+
+    fn exec_mem_micro(&mut self, op: u8, data_reg: u8, addr_reg: u8) -> VMResult<()> {
+        let addr = self.get_register(addr_reg)? as usize;
+        match op {
+            crate::vm::l8::MEM_LOAD64 => {
+                let value = self.read_mem(addr, 8)?;
+                self.set_register(data_reg, value)
+            }
+            crate::vm::l8::MEM_LOAD32 => {
+                let value = self.read_mem(addr, 4)?;
+                self.set_register(data_reg, value)
+            }
+            crate::vm::l8::MEM_STORE64 => {
+                let value = self.get_register(data_reg)?;
+                self.write_mem(addr, value, 8)
+            }
+            crate::vm::l8::MEM_STORE32 => {
+                let value = self.get_register(data_reg)?;
+                self.write_mem(addr, value, 4)
+            }
+            _ => Err(VMError::NativeCallError(format!("unknown mem op {op}"))),
+        }
     }
 
     fn exec_xmm_micro(&mut self, subop: u8, dst: u8, src: u8) -> VMResult<()> {

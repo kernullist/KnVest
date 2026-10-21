@@ -360,6 +360,7 @@ fn l8_lifter_jmp_reg_and_sse_and_switch_cfg() {
                 scale: 4,
                 disp: 0,
                 sign_extend32: true,
+                dword: true,
             },
         ),
         insn(
