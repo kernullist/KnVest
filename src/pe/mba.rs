@@ -9,7 +9,9 @@ pub const MBA_TEMP_T1: u8 = 11;
 const ALL_ONES: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const MBA_CATALOG_SALT: u64 = 0x4D4241_4C35; // "MBAL5"
 const MBA_NEST_MAX_DEPTH: u32 = 2;
-const MBA_POOL: [u8; 3] = [8, 9, 14];
+/// Dedicated scratch only: r13 (virt-ISA split) + r14/r15 (MBA/lifter).
+/// Never r8/r9 — those are live Win64 argument registers.
+const MBA_POOL: [u8; 3] = [13, 14, 15];
 
 std::thread_local! {
     static MBA_LEVEL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -293,7 +295,7 @@ fn temps_excluding(count: usize, exclude: &[u8]) -> Vec<u8> {
 }
 
 /// Copy operands into scratch that does not overlap `dst` or each other.
-/// Uses only dedicated MBA temps (r8/r9/r14), never lifter spill slots r10–r15.
+/// Uses only dedicated MBA/virt-ISA temps (r13/r14/r15), never ABI regs or spill slots.
 fn materialize_pair(bytecode: &mut Vec<u8>, dst: u8, src1: u8, src2: u8) -> Option<(u8, u8)> {
     let exclude = [dst, src1, src2];
     let t = temps_excluding(2, &exclude);
@@ -593,21 +595,25 @@ pub fn emit_opaque_branch_guard(bytecode: &mut Vec<u8>, seed: u64, site_id: u64)
         raw_xor(bytecode, 14, 14, 14);
         raw_load_imm(bytecode, 15, 0);
         emit_cmp_regs(bytecode, OpCode::Cmp, 14, 15);
-        let skip_target = (bytecode.len() + 10 + 10) as u64;
         bytecode.push(active_encode(OpCode::JmpIf));
         bytecode.push(1);
-        bytecode.extend_from_slice(&skip_target.to_le_bytes());
+        let placeholder = bytecode.len();
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
         raw_load_imm(bytecode, 14, dead_imm);
+        let skip_target = bytecode.len() as u64;
+        bytecode[placeholder..placeholder + 8].copy_from_slice(&skip_target.to_le_bytes());
     } else {
         // Always-not-equal opaque predicate: (k | 1) != 0 -> JmpIf(2 = NE) skips dead LoadImm
         raw_load_imm(bytecode, 14, k);
         raw_load_imm(bytecode, 15, 0);
         emit_cmp_regs(bytecode, OpCode::Cmp, 14, 15);
-        let skip_target = (bytecode.len() + 10 + 10) as u64;
         bytecode.push(active_encode(OpCode::JmpIf));
         bytecode.push(2);
-        bytecode.extend_from_slice(&skip_target.to_le_bytes());
+        let placeholder = bytecode.len();
+        bytecode.extend_from_slice(&0u64.to_le_bytes());
         raw_load_imm(bytecode, 15, dead_imm);
+        let skip_target = bytecode.len() as u64;
+        bytecode[placeholder..placeholder + 8].copy_from_slice(&skip_target.to_le_bytes());
     }
 }
 
@@ -635,7 +641,12 @@ pub fn emit_opaque_zero_perturbation(bytecode: &mut Vec<u8>, dst: u8, seed: u64,
 
 pub fn catalog_identities_for_seed(seed: u64) -> Vec<MbaIdentity> {
     let mut out = Vec::new();
-    for family in [MbaFamily::Add, MbaFamily::Sub, MbaFamily::Xor, MbaFamily::And] {
+    for family in [
+        MbaFamily::Add,
+        MbaFamily::Sub,
+        MbaFamily::Xor,
+        MbaFamily::And,
+    ] {
         let catalog = family.catalog();
         let h = splitmix64(seed ^ MBA_CATALOG_SALT ^ family.salt());
         out.push(catalog[h as usize % catalog.len()]);
@@ -777,7 +788,11 @@ mod tests {
             let (bc, map) = bc_add_via_mba(3, 1, 2, 1, seed);
             assert_eq!(run_add_bc(&bc, &map), 130, "seed {seed:#x}");
             let (bc_overlap, map2) = bc_add_via_mba(11, 11, 12, 1, seed);
-            assert_eq!(run_add_bc(&bc_overlap, &map2), 130, "overlap seed {seed:#x}");
+            assert_eq!(
+                run_add_bc(&bc_overlap, &map2),
+                130,
+                "overlap seed {seed:#x}"
+            );
         }
     }
 
@@ -841,7 +856,7 @@ mod tests {
         assert!(hdr.contains("(a^b)+2*(a&b)"));
     }
 
-    /// Stack locals live in r8–r15; MBA must not clobber unrelated spill values.
+    /// Spill slots live in r10–r12 / r16–r31; MBA must not clobber them or ABI regs r8/r9.
     #[test]
     fn mba_preserves_live_spill_regs_across_xor_form_add() {
         use crate::vm::VirtualMachine;
@@ -864,8 +879,16 @@ mod tests {
         let mut vm = VirtualMachine::with_opcode_map(bc, map);
         vm.run().unwrap();
         assert_eq!(vm.get_register(0).unwrap(), 7);
-        assert_eq!(vm.get_register(11).unwrap(), 5, "spill r11 must survive MBA add");
-        assert_eq!(vm.get_register(12).unwrap(), 999, "spill r12 must survive MBA add");
+        assert_eq!(
+            vm.get_register(11).unwrap(),
+            5,
+            "spill r11 must survive MBA add"
+        );
+        assert_eq!(
+            vm.get_register(12).unwrap(),
+            999,
+            "spill r12 must survive MBA add"
+        );
     }
 
     #[test]
@@ -1015,5 +1038,75 @@ mod tests {
             vm.run().unwrap();
             assert_eq!(vm.get_register(0).unwrap(), secret);
         }
+    }
+
+    #[test]
+    fn mba_add_does_not_clobber_win64_arg_regs_r8_r9() {
+        use crate::vm::VirtualMachine;
+        let seed = seed_picking(MbaFamily::Add, MbaIdentity::AddViaXorAnd);
+        let map = OpcodeMap::from_seed(seed);
+        crate::vm::set_active_map(&map);
+        set_mba_context(1, seed);
+        let mut bc = Vec::new();
+        raw_load_imm(&mut bc, 1, 3);
+        raw_load_imm(&mut bc, 2, 4);
+        raw_load_imm(&mut bc, 8, 0xA8);
+        raw_load_imm(&mut bc, 9, 0xA9);
+        emit_add_three(&mut bc, 0, 1, 2);
+        bc.push(map.encode(OpCode::Exit));
+        bc.push(0);
+        clear_mba_context();
+        crate::vm::clear_active_map();
+
+        let mut vm = VirtualMachine::with_opcode_map(bc, map);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 7);
+        assert_eq!(vm.get_register(8).unwrap(), 0xA8, "r8 must survive MBA add");
+        assert_eq!(vm.get_register(9).unwrap(), 0xA9, "r9 must survive MBA add");
+    }
+
+    #[test]
+    fn opaque_branch_guard_skip_is_instruction_aligned_in_stack_isa() {
+        use crate::ir::{Instruction, Operand};
+        use crate::vm::isa_mode::set_isa_mode;
+        use crate::vm::{BytecodeLayout, DispatchMode, VirtualMachine};
+
+        let seed = 0xCAFE_BABE_1234_5678u64;
+        let map = OpcodeMap::from_seed(seed);
+        crate::vm::set_active_map(&map);
+        set_isa_mode(IsaMode::Stack);
+        let mut bc = Vec::new();
+        raw_load_imm(&mut bc, 0, 12345);
+        emit_opaque_branch_guard(&mut bc, seed, 1);
+        bc.push(map.encode(OpCode::Exit));
+        bc.push(0);
+        set_isa_mode(IsaMode::Reg);
+        crate::vm::clear_active_map();
+
+        let insns = Instruction::disassemble_with_layout_and_isa(
+            &bc,
+            &map,
+            None,
+            DispatchMode::Table,
+            &BytecodeLayout::identity(),
+            IsaMode::Stack,
+        );
+        let jmpif = insns
+            .iter()
+            .find(|i| i.opcode == crate::vm::OpCode::JmpIf)
+            .expect("opaque guard emits jmp_if");
+        let target = match jmpif.operands.get(1) {
+            Some(Operand::Immediate(v)) => *v as usize,
+            other => panic!("jmp_if target should be an immediate, got {other:?}"),
+        };
+        assert!(
+            insns.iter().any(|i| i.offset == target),
+            "opaque skip {target} must land on an instruction start; offsets={:?}",
+            insns.iter().map(|i| i.offset).collect::<Vec<_>>()
+        );
+
+        let mut vm = VirtualMachine::with_opcode_map(bc, map).with_isa_mode(IsaMode::Stack);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 12345);
     }
 }

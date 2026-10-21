@@ -1,8 +1,8 @@
+use super::block_map::{BlockMapPlan, META_WIRE_BYTE};
 use super::isa_mode::IsaMode;
+use super::layout::BytecodeLayout;
 use super::opcode::OpCode;
 use super::opcode_map::OpcodeMap;
-use super::block_map::{BlockMapPlan, META_WIRE_BYTE};
-use super::layout::BytecodeLayout;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -203,7 +203,11 @@ impl VirtualMachine {
     }
 
     pub fn write_memory_u64(&mut self, addr: usize, value: u64) -> VMResult<()> {
-        let off = if addr >= 0x10000 { addr - 0x10000 } else { addr };
+        let off = if addr >= 0x10000 {
+            addr - 0x10000
+        } else {
+            addr
+        };
         if off + 8 <= self.memory.len() {
             self.memory[off..off + 8].copy_from_slice(&value.to_le_bytes());
             Ok(())
@@ -213,7 +217,11 @@ impl VirtualMachine {
     }
 
     pub fn read_memory_u64(&self, addr: usize) -> VMResult<u64> {
-        let off = if addr >= 0x10000 { addr - 0x10000 } else { addr };
+        let off = if addr >= 0x10000 {
+            addr - 0x10000
+        } else {
+            addr
+        };
         if off + 8 <= self.memory.len() {
             Ok(u64::from_le_bytes(
                 self.memory[off..off + 8].try_into().unwrap(),
@@ -331,7 +339,9 @@ impl VirtualMachine {
             self.skip_layout_pad_meta()?;
             let tx_id = self.read_u16()?;
             let new_map = if let Some(plan) = &self.block_map_plan {
-                plan.map_for_tx_or_base(tx_id, self.opcode_map.as_ref().unwrap())
+                plan.map_for_tx(tx_id)
+                    .map(|e| OpcodeMap::from_parts(base_seed, e.wire))
+                    .ok_or(VMError::InvalidOpcode(META_WIRE_BYTE))?
             } else {
                 BlockMapPlan::block_opcode_map(base_seed, tx_id as usize)
             };
@@ -350,17 +360,17 @@ impl VirtualMachine {
         self.skip_layout_pad_semantic(opcode)?;
 
         match opcode {
-            OpCode::Nop => {},
+            OpCode::Nop => {}
             OpCode::SetBlockMap => {
                 // Handled via META_WIRE_BYTE before decode; unreachable in normal bytecode.
-            },
-            
+            }
+
             OpCode::LoadImm => {
                 let reg = self.read_u8()?;
                 let value = self.read_u64()?;
                 self.set_register(reg, value)?;
-            },
-            
+            }
+
             OpCode::LoadMem => {
                 let dst = self.read_u8()?;
                 let addr_reg = self.read_u8()?;
@@ -371,8 +381,8 @@ impl VirtualMachine {
                 let mut bytes = [0u8; 8];
                 bytes.copy_from_slice(&self.memory[addr..addr + 8]);
                 self.set_register(dst, u64::from_le_bytes(bytes))?;
-            },
-            
+            }
+
             OpCode::StoreMem => {
                 let addr_reg = self.read_u8()?;
                 let src = self.read_u8()?;
@@ -382,15 +392,15 @@ impl VirtualMachine {
                     return Err(VMError::MemoryViolation(addr));
                 }
                 self.memory[addr..addr + 8].copy_from_slice(&value.to_le_bytes());
-            },
-            
+            }
+
             OpCode::Move => {
                 let dst = self.read_u8()?;
                 let src = self.read_u8()?;
                 let value = self.get_register(src)?;
                 self.set_register(dst, value)?;
-            },
-            
+            }
+
             OpCode::Add => {
                 if self.isa_mode.is_stack() {
                     let dst = self.read_u8()?;
@@ -405,8 +415,8 @@ impl VirtualMachine {
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1.wrapping_add(val2))?;
                 }
-            },
-            
+            }
+
             OpCode::Sub => {
                 if self.isa_mode.is_stack() {
                     let dst = self.read_u8()?;
@@ -421,8 +431,8 @@ impl VirtualMachine {
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1.wrapping_sub(val2))?;
                 }
-            },
-            
+            }
+
             OpCode::Mul => {
                 if self.isa_mode.is_stack() {
                     let dst = self.read_u8()?;
@@ -437,7 +447,7 @@ impl VirtualMachine {
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1.wrapping_mul(val2))?;
                 }
-            },
+            }
 
             OpCode::And => {
                 if self.isa_mode.is_stack() {
@@ -453,8 +463,8 @@ impl VirtualMachine {
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1 & val2)?;
                 }
-            },
-            
+            }
+
             OpCode::Xor => {
                 if self.isa_mode.is_stack() {
                     let dst = self.read_u8()?;
@@ -469,8 +479,8 @@ impl VirtualMachine {
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1 ^ val2)?;
                 }
-            },
-            
+            }
+
             OpCode::Cmp => {
                 let (val1, val2) = if self.isa_mode.is_stack() {
                     (self.pop_data_stack()?, self.pop_data_stack()?)
@@ -488,37 +498,35 @@ impl VirtualMachine {
                     | (if sf { 0x80 } else { 0 })
                     | (if cf { 0x01 } else { 0 })
                     | (if of { 0x800 } else { 0 });
-            },
+            }
 
             OpCode::Cmp32 => {
                 let (val1, val2) = if self.isa_mode.is_stack() {
-                    (
-                        self.pop_data_stack()? as u32 as u64,
-                        self.pop_data_stack()? as u32 as u64,
-                    )
+                    (self.pop_data_stack()? as u32, self.pop_data_stack()? as u32)
                 } else {
                     let src1 = self.read_u8()?;
                     let src2 = self.read_u8()?;
                     (
-                        self.get_register(src1)? as u32 as u64,
-                        self.get_register(src2)? as u32 as u64,
+                        self.get_register(src1)? as u32,
+                        self.get_register(src2)? as u32,
                     )
                 };
+                // Match native `cmp r32, r32`: ZF/SF/CF/OF come from the 32-bit result.
                 let result = val1.wrapping_sub(val2);
                 let zf = val1 == val2;
-                let sf = (result as i64) < 0;
+                let sf = (result as i32) < 0;
                 let cf = val1 < val2;
-                let of = ((val1 ^ val2) & (val1 ^ result)) >> 63 != 0;
+                let of = ((val1 ^ val2) & (val1 ^ result)) >> 31 != 0;
                 self.flags = (if zf { 0x40 } else { 0 })
                     | (if sf { 0x80 } else { 0 })
                     | (if cf { 0x01 } else { 0 })
                     | (if of { 0x800 } else { 0 });
-            },
+            }
 
             OpCode::Jmp => {
                 let offset = self.read_u64()? as usize;
                 self.pc = offset;
-            },
+            }
 
             OpCode::JmpIf => {
                 let condition = self.read_u8()?;
@@ -528,25 +536,25 @@ impl VirtualMachine {
                 let sf = self.flags & 0x80 != 0;
                 let of = self.flags & 0x800 != 0;
                 let should_jump = match condition {
-                    1 => zf,                          // JE: ZF=1
-                    2 => !zf,                         // JNE: ZF=0
-                    3 => !zf && sf == of,             // JG: ZF=0 && SF==OF
-                    4 => sf != of,                    // JL: SF!=OF
-                    5 => zf || sf != of,              // JLE: ZF=1 || SF!=OF
-                    6 => sf == of,                    // JGE: SF==OF
-                    7 => !cf && !zf,                  // JA: CF=0 && ZF=0
-                    8 => !cf,                         // JAE: CF=0
-                    9 => cf,                          // JB: CF=1
-                    10 => cf || zf,                   // JBE: CF=1 || ZF=1
-                    11 => sf,                         // JS: SF=1
-                    12 => !sf,                        // JNS: SF=0
-                    _ => false,
+                    1 => zf,              // JE: ZF=1
+                    2 => !zf,             // JNE: ZF=0
+                    3 => !zf && sf == of, // JG: ZF=0 && SF==OF
+                    4 => sf != of,        // JL: SF!=OF
+                    5 => zf || sf != of,  // JLE: ZF=1 || SF!=OF
+                    6 => sf == of,        // JGE: SF==OF
+                    7 => !cf && !zf,      // JA: CF=0 && ZF=0
+                    8 => !cf,             // JAE: CF=0
+                    9 => cf,              // JB: CF=1
+                    10 => cf || zf,       // JBE: CF=1 || ZF=1
+                    11 => sf,             // JS: SF=1
+                    12 => !sf,            // JNS: SF=0
+                    _ => return Err(VMError::InvalidOpcode(condition)),
                 };
                 if should_jump {
                     self.pc = offset;
                 }
-            },
-            
+            }
+
             OpCode::Call => {
                 let offset = self.read_u64()? as usize;
                 if self.block_map_plan.is_some() {
@@ -557,27 +565,28 @@ impl VirtualMachine {
                     self.push_stack(self.pc as u64)?;
                 }
                 self.pc = offset;
-            },
-            
+            }
+
             OpCode::Ret => {
                 if self.block_map_plan.is_some() {
                     let packed = self.pop_stack()?;
                     self.pc = (packed & 0xFFFF_FFFF) as usize;
                     let caller_bb = (packed >> 32) as u16;
                     if let Some(plan) = &self.block_map_plan {
-                        let base = self
-                            .opcode_map
-                            .as_ref()
+                        let base = self.opcode_map.as_ref().ok_or(VMError::InvalidOpcode(0))?;
+                        let restored = plan
+                            .map_for_tx(caller_bb)
+                            .map(|e| OpcodeMap::from_parts(base.seed(), e.wire))
                             .ok_or(VMError::InvalidOpcode(0))?;
-                        self.opcode_map = Some(plan.map_for_tx_or_base(caller_bb, base));
+                        self.opcode_map = Some(restored);
                         self.current_bb_id = caller_bb;
                     }
                 } else {
                     let return_addr = self.pop_stack()? as usize;
                     self.pc = return_addr;
                 }
-            },
-            
+            }
+
             OpCode::NativeCall => {
                 let func_id = self.read_u64()?;
                 if let Some(reg) = crate::vm::l8::decode_jmp_reg(func_id) {
@@ -594,10 +603,13 @@ impl VirtualMachine {
                 } else if let Some(func) = self.native_functions.get(&func_id).copied() {
                     func(self)?;
                 } else {
-                    return Err(VMError::NativeCallError(format!("Unknown function ID: {}", func_id)));
+                    return Err(VMError::NativeCallError(format!(
+                        "Unknown function ID: {}",
+                        func_id
+                    )));
                 }
-            },
-            
+            }
+
             OpCode::Push => {
                 let reg = self.read_u8()?;
                 let value = self.get_register(reg)?;
@@ -606,8 +618,8 @@ impl VirtualMachine {
                 } else {
                     self.push_stack(value)?;
                 }
-            },
-            
+            }
+
             OpCode::Pop => {
                 let reg = self.read_u8()?;
                 let value = if self.isa_mode.is_stack() {
@@ -616,13 +628,13 @@ impl VirtualMachine {
                     self.pop_stack()?
                 };
                 self.set_register(reg, value)?;
-            },
-            
+            }
+
             OpCode::LoadByte => {
                 let dst = self.read_u8()?;
                 let addr_reg = self.read_u8()?;
                 let addr = self.get_register(addr_reg)? as usize;
-                
+
                 let byte_val = if addr < self.data_section.len() {
                     self.data_section[addr]
                 } else if addr >= 0x10000 && addr < 0x10000 + self.memory.len() {
@@ -632,26 +644,26 @@ impl VirtualMachine {
                 } else {
                     0
                 };
-                
+
                 self.set_register(dst, byte_val as u64)?;
-            },
-            
+            }
+
             OpCode::LoadStr => {
                 let dst = self.read_u8()?;
                 let offset = self.read_u64()? as usize;
                 self.set_register(dst, offset as u64)?;
-            },
-            
+            }
+
             OpCode::Exit => {
                 let code_reg = self.read_u8()?;
                 let code = self.get_register(code_reg)? as i32;
                 self.exit_code = Some(code);
-            },
+            }
 
             OpCode::RunNative | OpCode::BailNative => {
                 let _sled_offset = self.read_u64()?;
                 let _orig_rva = self.read_u64()?;
-            },
+            }
         }
 
         Ok(())
@@ -683,7 +695,8 @@ mod tests {
     #[test]
     fn test_load_imm() {
         let mut bytecode = vec![
-            OpCode::LoadImm as u8, 0, // Load into register 0
+            OpCode::LoadImm as u8,
+            0, // Load into register 0
         ];
         bytecode.extend_from_slice(&42u64.to_le_bytes());
         bytecode.push(OpCode::Exit as u8);
@@ -696,9 +709,7 @@ mod tests {
 
     #[test]
     fn test_add() {
-        let mut bytecode = vec![
-            OpCode::LoadImm as u8, 0,
-        ];
+        let mut bytecode = vec![OpCode::LoadImm as u8, 0];
         bytecode.extend_from_slice(&10u64.to_le_bytes());
         bytecode.push(OpCode::LoadImm as u8);
         bytecode.push(1);
@@ -786,9 +797,7 @@ mod tests {
 
     #[test]
     fn test_stack_operations() {
-        let mut bytecode = vec![
-            OpCode::LoadImm as u8, 0,
-        ];
+        let mut bytecode = vec![OpCode::LoadImm as u8, 0];
         bytecode.extend_from_slice(&100u64.to_le_bytes());
         bytecode.extend_from_slice(&[OpCode::Push as u8, 0]);
         bytecode.extend_from_slice(&[OpCode::Pop as u8, 1]);
@@ -853,5 +862,89 @@ mod tests {
         // JNS (12): SF == 0 (result non-negative)
         assert_eq!(eval_cond(10, 3, 12), 1);
         assert_eq!(eval_cond(3, 10, 12), 0);
+    }
+
+    #[test]
+    fn cmp32_flags_use_32bit_signed_result() {
+        let eval_cond = |lhs: u64, rhs: u64, cond: u8| -> u64 {
+            let mut bc = Vec::new();
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(1);
+            bc.extend_from_slice(&lhs.to_le_bytes());
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(2);
+            bc.extend_from_slice(&rhs.to_le_bytes());
+            bc.extend_from_slice(&[OpCode::Cmp32 as u8, 1, 2]);
+            bc.push(OpCode::JmpIf as u8);
+            bc.push(cond);
+            let jmp_patch = bc.len();
+            bc.extend_from_slice(&0u64.to_le_bytes());
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(0);
+            bc.extend_from_slice(&0u64.to_le_bytes());
+            bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+            let taken_pc = bc.len() as u64;
+            bc[jmp_patch..jmp_patch + 8].copy_from_slice(&taken_pc.to_le_bytes());
+            bc.push(OpCode::LoadImm as u8);
+            bc.push(0);
+            bc.extend_from_slice(&1u64.to_le_bytes());
+            bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+
+            let mut vm = VirtualMachine::new(bc);
+            vm.run().unwrap();
+            vm.get_register(0).unwrap()
+        };
+
+        // JL: 0xFFFFFFFF as i32 is -1, which is < 0
+        assert_eq!(eval_cond(0xFFFF_FFFF, 0, 4), 1);
+        assert_eq!(eval_cond(0, 0xFFFF_FFFF, 4), 0);
+        // JG: 0 > -1
+        assert_eq!(eval_cond(0, 0xFFFF_FFFF, 3), 1);
+        // JS: 0x80000000 - 0 is negative as i32
+        assert_eq!(eval_cond(0x8000_0000, 0, 11), 1);
+        // JA (unsigned): 0xFFFFFFFF > 0
+        assert_eq!(eval_cond(0xFFFF_FFFF, 0, 7), 1);
+        // INT_MIN - 1: result is positive (SF=0) with OF=1, so JL (SF!=OF) is taken
+        assert_eq!(eval_cond(0x8000_0000, 1, 4), 1);
+    }
+
+    #[test]
+    fn jmpif_unknown_condition_is_an_error() {
+        let mut bc = Vec::new();
+        bc.push(OpCode::LoadImm as u8);
+        bc.push(1);
+        bc.extend_from_slice(&1u64.to_le_bytes());
+        bc.push(OpCode::LoadImm as u8);
+        bc.push(2);
+        bc.extend_from_slice(&1u64.to_le_bytes());
+        bc.extend_from_slice(&[OpCode::Cmp as u8, 1, 2]);
+        bc.push(OpCode::JmpIf as u8);
+        bc.push(0);
+        bc.extend_from_slice(&0u64.to_le_bytes());
+        bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+        let mut vm = VirtualMachine::new(bc);
+        assert!(matches!(vm.run(), Err(VMError::InvalidOpcode(0))));
+    }
+
+    #[test]
+    fn set_block_map_unknown_tx_id_is_an_error() {
+        use crate::vm::block_map::{emit_block_map_refresh, BlockMapPlan};
+
+        let seed = 0x4C34_4100u64;
+        let base = OpcodeMap::from_seed(seed);
+        let mut plan = BlockMapPlan {
+            decode_key: BlockMapPlan::global_decode_key(seed),
+            entries: vec![],
+            ..Default::default()
+        };
+        plan.record_block(seed, 0);
+
+        let mut bytecode = Vec::new();
+        emit_block_map_refresh(&mut bytecode, 99);
+        bytecode.push(plan.map_for_bb_or_base(0, &base).encode(OpCode::Exit));
+        bytecode.push(0);
+
+        let mut vm = VirtualMachine::with_block_maps(bytecode, base, plan);
+        assert!(matches!(vm.run(), Err(VMError::InvalidOpcode(_))));
     }
 }

@@ -1,11 +1,11 @@
+use crate::pe::mba::{MBA_TEMP_NEG, MBA_TEMP_T0, MBA_TEMP_T1, MBA_TEMP_ZERO};
+use crate::vm::block_map::{BlockMapPlan, META_OPERAND_LEN, META_WIRE_BYTE};
 use crate::vm::dispatch::{DispatchMode, THREAD_TARGET_SIZE};
-use crate::vm::isa_mode::{is_stack_alu_op, IsaMode, operand_len_for};
-use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE, META_OPERAND_LEN};
+use crate::vm::isa_mode::{is_stack_alu_op, operand_len_for, IsaMode};
 use crate::vm::layout::BytecodeLayout;
 use crate::vm::opcode_map::OpcodeMap;
-use crate::vm::OpCode;
 use crate::vm::virt_isa::VIRT_ISA_SPLIT_TEMP;
-use crate::pe::mba::{MBA_TEMP_NEG, MBA_TEMP_T0, MBA_TEMP_T1, MBA_TEMP_ZERO};
+use crate::vm::OpCode;
 use std::fmt;
 
 pub struct Instruction {
@@ -41,7 +41,11 @@ impl fmt::Display for Operand {
 }
 
 impl Instruction {
-    pub fn disassemble(bytecode: &[u8], opcode_map: &OpcodeMap, dispatch_mode: DispatchMode) -> Vec<Self> {
+    pub fn disassemble(
+        bytecode: &[u8],
+        opcode_map: &OpcodeMap,
+        dispatch_mode: DispatchMode,
+    ) -> Vec<Self> {
         Self::disassemble_with_block_maps(bytecode, opcode_map, None, dispatch_mode)
     }
 
@@ -164,15 +168,15 @@ impl Instruction {
                     continue;
                 }
             };
-            
+
             consecutive_invalid = 0;
             offset += layout.post_wire_pad_for(opcode) as usize;
 
             let mut operands = Vec::new();
 
             match opcode {
-                OpCode::Nop | OpCode::SetBlockMap => {},
-                
+                OpCode::Nop | OpCode::SetBlockMap => {}
+
                 OpCode::LoadImm => {
                     if offset < bytecode.len() {
                         operands.push(Operand::Register(bytecode[offset]));
@@ -184,8 +188,8 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
                         offset += 8;
                     }
-                },
-                
+                }
+
                 OpCode::LoadMem | OpCode::StoreMem | OpCode::Move => {
                     if offset < bytecode.len() {
                         operands.push(Operand::Register(bytecode[offset]));
@@ -195,8 +199,8 @@ impl Instruction {
                         operands.push(Operand::Register(bytecode[offset]));
                         offset += 1;
                     }
-                },
-                
+                }
+
                 OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => {
                     let count = operand_len_for(opcode, isa_mode);
                     for _ in 0..count {
@@ -208,8 +212,8 @@ impl Instruction {
                     if isa_mode.is_stack() && count == 1 {
                         operands.push(Operand::Immediate(0)); // stack marker: pops 2 slots
                     }
-                },
-                
+                }
+
                 OpCode::Cmp | OpCode::Cmp32 => {
                     let count = operand_len_for(opcode, isa_mode);
                     for _ in 0..count {
@@ -221,8 +225,8 @@ impl Instruction {
                     if isa_mode.is_stack() && count == 0 {
                         operands.push(Operand::Immediate(0)); // stack marker: pops 2 slots
                     }
-                },
-                
+                }
+
                 OpCode::Jmp => {
                     if offset + 8 <= bytecode.len() {
                         let mut bytes = [0u8; 8];
@@ -230,11 +234,11 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
                         offset += 8;
                     }
-                },
-                
+                }
+
                 OpCode::JmpIf => {
                     if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
+                        operands.push(Operand::Immediate(u64::from(bytecode[offset])));
                         offset += 1;
                     }
                     if offset + 8 <= bytecode.len() {
@@ -243,8 +247,8 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
                         offset += 8;
                     }
-                },
-                
+                }
+
                 OpCode::Call | OpCode::NativeCall => {
                     if offset + 8 <= bytecode.len() {
                         let mut bytes = [0u8; 8];
@@ -252,17 +256,17 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
                         offset += 8;
                     }
-                },
-                
-                OpCode::Ret => {},
-                
+                }
+
+                OpCode::Ret => {}
+
                 OpCode::Push | OpCode::Pop | OpCode::Exit => {
                     if offset < bytecode.len() {
                         operands.push(Operand::Register(bytecode[offset]));
                         offset += 1;
                     }
-                },
-                
+                }
+
                 OpCode::LoadByte => {
                     if offset < bytecode.len() {
                         operands.push(Operand::Register(bytecode[offset]));
@@ -272,8 +276,8 @@ impl Instruction {
                         operands.push(Operand::Register(bytecode[offset]));
                         offset += 1;
                     }
-                },
-                
+                }
+
                 OpCode::LoadStr => {
                     if offset < bytecode.len() {
                         operands.push(Operand::Register(bytecode[offset]));
@@ -285,7 +289,7 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
                         offset += 8;
                     }
-                },
+                }
 
                 OpCode::RunNative | OpCode::BailNative => {
                     if offset + 8 <= bytecode.len() {
@@ -300,7 +304,7 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
                         offset += 8;
                     }
-                },
+                }
             }
 
             instructions.push(Instruction {
@@ -358,10 +362,14 @@ impl Instruction {
                 if i > 0 {
                     output.push_str(", ");
                 }
-                if matches!(operand, Operand::Immediate(0))
-                    && is_stack_alu_op(instr.opcode)
-                {
+                if matches!(operand, Operand::Immediate(0)) && is_stack_alu_op(instr.opcode) {
                     output.push_str("<stack>");
+                } else if instr.opcode == OpCode::JmpIf && i == 0 {
+                    if let Operand::Immediate(imm) = operand {
+                        output.push_str(jmpif_condition_name(*imm));
+                    } else {
+                        output.push_str(&operand.to_string());
+                    }
                 } else if instr.opcode == OpCode::NativeCall {
                     if let Operand::Immediate(imm) = operand {
                         if let Some(text) = crate::vm::l8::format_native_micro(*imm) {
@@ -381,6 +389,24 @@ impl Instruction {
         }
 
         output
+    }
+}
+
+fn jmpif_condition_name(cond: u64) -> &'static str {
+    match cond {
+        1 => "je",
+        2 => "jne",
+        3 => "jg",
+        4 => "jl",
+        5 => "jle",
+        6 => "jge",
+        7 => "ja",
+        8 => "jae",
+        9 => "jb",
+        10 => "jbe",
+        11 => "js",
+        12 => "jns",
+        _ => "cond?",
     }
 }
 
@@ -468,13 +494,27 @@ fn find_mba_substitution_starts(
                 && n.opcode == OpCode::Sub
                 && f.opcode == OpCode::Sub
             {
-                let Some(zero) = reg_at(&z.operands, 0) else { continue };
-                let Some(neg) = reg_at(&n.operands, 0) else { continue };
-                let Some(zero2) = reg_at(&n.operands, 1) else { continue };
-                let Some(b) = reg_at(&n.operands, 2) else { continue };
-                let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
-                let Some(a) = reg_at(&f.operands, 1) else { continue };
-                let Some(neg2) = reg_at(&f.operands, 2) else { continue };
+                let Some(zero) = reg_at(&z.operands, 0) else {
+                    continue;
+                };
+                let Some(neg) = reg_at(&n.operands, 0) else {
+                    continue;
+                };
+                let Some(zero2) = reg_at(&n.operands, 1) else {
+                    continue;
+                };
+                let Some(b) = reg_at(&n.operands, 2) else {
+                    continue;
+                };
+                let Some(final_dst) = reg_at(&f.operands, 0) else {
+                    continue;
+                };
+                let Some(a) = reg_at(&f.operands, 1) else {
+                    continue;
+                };
+                let Some(neg2) = reg_at(&f.operands, 2) else {
+                    continue;
+                };
                 if zero == zero2 && neg == neg2 {
                     out.insert(i, mba_note_add_neg(a, b, final_dst));
                     continue;
@@ -492,13 +532,27 @@ fn find_mba_substitution_starts(
                 && n.opcode == OpCode::Sub
                 && f.opcode == OpCode::Add
             {
-                let Some(zero) = reg_at(&z.operands, 0) else { continue };
-                let Some(neg) = reg_at(&n.operands, 0) else { continue };
-                let Some(zero2) = reg_at(&n.operands, 1) else { continue };
-                let Some(b) = reg_at(&n.operands, 2) else { continue };
-                let Some(final_dst) = reg_at(&f.operands, 0) else { continue };
-                let Some(a) = reg_at(&f.operands, 1) else { continue };
-                let Some(neg2) = reg_at(&f.operands, 2) else { continue };
+                let Some(zero) = reg_at(&z.operands, 0) else {
+                    continue;
+                };
+                let Some(neg) = reg_at(&n.operands, 0) else {
+                    continue;
+                };
+                let Some(zero2) = reg_at(&n.operands, 1) else {
+                    continue;
+                };
+                let Some(b) = reg_at(&n.operands, 2) else {
+                    continue;
+                };
+                let Some(final_dst) = reg_at(&f.operands, 0) else {
+                    continue;
+                };
+                let Some(a) = reg_at(&f.operands, 1) else {
+                    continue;
+                };
+                let Some(neg2) = reg_at(&f.operands, 2) else {
+                    continue;
+                };
                 if zero == zero2 && neg == neg2 {
                     out.insert(i, mba_note_sub_neg(a, b, final_dst));
                     continue;
@@ -507,7 +561,10 @@ fn find_mba_substitution_starts(
         }
 
         // add via xor/and: [move ta,a][move tb,b] xor ; and ; add t,t,t ; add dst,...
-        for start in i..=i.saturating_add(2).min(instructions.len().saturating_sub(4)) {
+        for start in i..=i
+            .saturating_add(2)
+            .min(instructions.len().saturating_sub(4))
+        {
             let mut off = start;
             let mut orig_a = None;
             let mut orig_b = None;
@@ -529,13 +586,21 @@ fn find_mba_substitution_starts(
             if x.opcode != OpCode::Xor || n.opcode != OpCode::And || fin.opcode != OpCode::Add {
                 continue;
             }
-            let Some((ta, tb)) = same_src_pair(x, n) else { continue };
+            let Some((ta, tb)) = same_src_pair(x, n) else {
+                continue;
+            };
             if triple_add(dbl) != reg_at(&n.operands, 0) {
                 continue;
             }
-            let Some(dst) = reg_at(&fin.operands, 0) else { continue };
-            let Some(xdst) = reg_at(&x.operands, 0) else { continue };
-            let Some(ndst) = reg_at(&fin.operands, 2) else { continue };
+            let Some(dst) = reg_at(&fin.operands, 0) else {
+                continue;
+            };
+            let Some(xdst) = reg_at(&x.operands, 0) else {
+                continue;
+            };
+            let Some(ndst) = reg_at(&fin.operands, 2) else {
+                continue;
+            };
             if reg_at(&fin.operands, 1) != Some(xdst) || reg_at(&n.operands, 0) != Some(ndst) {
                 continue;
             }
@@ -553,7 +618,9 @@ fn find_mba_substitution_starts(
                 let sum = &instructions[i + 2];
                 let fin = &instructions[i + 3];
                 if sum.opcode == OpCode::Add && fin.opcode == OpCode::Sub {
-                    let Some((a, b)) = alu_src_pair(&z) else { continue };
+                    let Some((a, b)) = alu_src_pair(&z) else {
+                        continue;
+                    };
                     if alu_src_pair(sum) == Some((a, b)) {
                         if let Some(dst) = reg_at(&fin.operands, 0) {
                             out.insert(i, mba_note_xor_add_and(a, b, dst));
@@ -577,9 +644,15 @@ fn find_mba_substitution_starts(
                 && x.opcode == OpCode::Xor
                 && fin.opcode == OpCode::Sub
             {
-                let Some((a, b)) = alu_src_pair(&z) else { continue };
-                let Some(t0) = reg_at(&z.operands, 0) else { continue };
-                let Some(t1) = reg_at(&sum.operands, 0) else { continue };
+                let Some((a, b)) = alu_src_pair(&z) else {
+                    continue;
+                };
+                let Some(t0) = reg_at(&z.operands, 0) else {
+                    continue;
+                };
+                let Some(t1) = reg_at(&sum.operands, 0) else {
+                    continue;
+                };
                 if alu_src_pair(sum) != Some((a, b)) {
                     continue;
                 }
@@ -633,9 +706,7 @@ fn find_virt_isa_annotations(
             };
             out.insert(
                 i,
-                format!(
-                    "split | x86 sub → move r{temp},r{lhs} ; sub r{dst},r{temp},r{src}"
-                ),
+                format!("split | x86 sub → move r{temp},r{lhs} ; sub r{dst},r{temp},r{src}"),
             );
             continue;
         }
@@ -654,10 +725,7 @@ fn find_virt_isa_annotations(
             };
             if cmp_b == holder {
                 if holder == 0 && cmp_a == 0 {
-                    out.insert(
-                        i,
-                        "merge | x86 xor eax,eax → load_imm r0,0".to_string(),
-                    );
+                    out.insert(i, "merge | x86 xor eax,eax → load_imm r0,0".to_string());
                 } else {
                     out.insert(
                         i,
@@ -672,10 +740,7 @@ fn find_virt_isa_annotations(
             && reg_at(&z.operands, 0) == Some(0)
             && (c.opcode != OpCode::Cmp || reg_at(&c.operands, 1) != Some(0))
         {
-            out.insert(
-                i,
-                "merge | x86 xor eax,eax → load_imm r0,0".to_string(),
-            );
+            out.insert(i, "merge | x86 xor eax,eax → load_imm r0,0".to_string());
         }
     }
     out
@@ -691,11 +756,39 @@ mod tests {
         let map = OpcodeMap::from_seed(99);
         let mut bytecode = vec![map.encode(OpCode::LoadImm), 0];
         bytecode.extend_from_slice(&42u64.to_le_bytes());
-        
+
         let instructions = Instruction::disassemble(&bytecode, &map, DispatchMode::Table);
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].opcode, OpCode::LoadImm);
         assert_eq!(instructions[0].operands.len(), 2);
+    }
+
+    #[test]
+    fn jmpif_condition_is_an_immediate_not_a_register() {
+        let map = OpcodeMap::from_seed(0);
+        let mut bytecode = vec![map.encode(OpCode::Cmp), 1, 2];
+        bytecode.push(map.encode(OpCode::JmpIf));
+        bytecode.push(4); // JL
+        bytecode.extend_from_slice(&0x20u64.to_le_bytes());
+        let ins = Instruction::disassemble(&bytecode, &map, DispatchMode::Table);
+        let jmpif = ins
+            .iter()
+            .find(|i| i.opcode == OpCode::JmpIf)
+            .expect("jmp_if");
+        assert!(
+            matches!(jmpif.operands.first(), Some(Operand::Immediate(4))),
+            "jmp_if cond must be immediate 4, got {:?}",
+            jmpif.operands
+        );
+        let printed = Instruction::pretty_print(&ins);
+        assert!(
+            printed.contains("jl"),
+            "pretty print should name JL: {printed}"
+        );
+        assert!(
+            !printed.contains("r4"),
+            "pretty print must not treat cond 4 as r4: {printed}"
+        );
     }
 
     #[test]
@@ -705,7 +798,7 @@ mod tests {
         bytecode.extend_from_slice(&42u64.to_le_bytes());
         bytecode.push(map.encode(OpCode::Exit));
         bytecode.push(0);
-        
+
         let instructions = Instruction::disassemble(&bytecode, &map, DispatchMode::Table);
         let output = Instruction::pretty_print(&instructions);
         assert!(output.contains("load_imm"));
@@ -719,7 +812,9 @@ mod tests {
         let mut bytecode = vec![map_a.encode(OpCode::LoadImm), 0];
         bytecode.extend_from_slice(&1u64.to_le_bytes());
         let wrong = Instruction::disassemble(&bytecode, &map_b, DispatchMode::Table);
-        assert!(wrong.iter().any(|i| !i.operands.is_empty() && matches!(i.operands[0], Operand::Unknown(_))));
+        assert!(wrong
+            .iter()
+            .any(|i| !i.operands.is_empty() && matches!(i.operands[0], Operand::Unknown(_))));
     }
 
     #[test]
