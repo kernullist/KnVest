@@ -62,7 +62,9 @@ pub fn native_call_ids_in_bytecode(bytecode: &[u8]) -> Vec<u64> {
     let mut i = 0usize;
     while i < bytecode.len() {
         if active_decode(bytecode[i]) == Some(OpCode::NativeCall) && i + 9 <= bytecode.len() {
-            ids.push(u64::from_le_bytes(bytecode[i + 1..i + 9].try_into().unwrap()));
+            ids.push(u64::from_le_bytes(
+                bytecode[i + 1..i + 9].try_into().unwrap(),
+            ));
             i += 9;
         } else {
             i += 1;
@@ -115,19 +117,15 @@ pub fn native_call_ids_in_bytecode_with_layout(
     let mut current_map = map.clone();
     while offset < bytecode.len() {
         if bytecode[offset] == META_WIRE_BYTE {
-            let meta_off = offset
-                + layout.operands_offset_dispatch(OpCode::SetBlockMap, true, dispatch_mode);
+            let meta_off =
+                offset + layout.operands_offset_dispatch(OpCode::SetBlockMap, true, dispatch_mode);
             if meta_off + META_OPERAND_LEN <= bytecode.len() {
                 let bb_id = u16::from_le_bytes([bytecode[meta_off], bytecode[meta_off + 1]]);
                 current_map = block_plan
                     .map(|p| p.map_for_tx_or_base(bb_id, map))
                     .unwrap_or_else(|| BlockMapPlan::block_opcode_map(map.seed(), bb_id as usize));
-                offset += layout.insn_len(
-                    OpCode::SetBlockMap,
-                    META_OPERAND_LEN,
-                    dispatch_mode,
-                    true,
-                );
+                offset +=
+                    layout.insn_len(OpCode::SetBlockMap, META_OPERAND_LEN, dispatch_mode, true);
                 continue;
             }
             break;
@@ -146,8 +144,7 @@ pub fn native_call_ids_in_bytecode_with_layout(
             break;
         }
         if op == OpCode::NativeCall && operand_len >= 8 {
-            let id_off = offset
-                + layout.operands_offset_dispatch(op, false, dispatch_mode);
+            let id_off = offset + layout.operands_offset_dispatch(op, false, dispatch_mode);
             ids.push(u64::from_le_bytes(
                 bytecode[id_off..id_off + 8].try_into().unwrap(),
             ));
@@ -255,6 +252,18 @@ impl ImportTable {
 
     pub fn is_crt_startup(&self, entry: &ImportEntry) -> bool {
         is_crt_import_name(&entry.name)
+    }
+
+    #[cfg(test)]
+    fn from_entries_for_test(entries: Vec<ImportEntry>) -> Self {
+        let mut by_iat_rva = HashMap::new();
+        for (i, e) in entries.iter().enumerate() {
+            by_iat_rva.insert(e.iat_rva, i);
+        }
+        Self {
+            entries,
+            by_iat_rva,
+        }
     }
 }
 
@@ -393,12 +402,29 @@ impl PEFile {
                 return Some(e);
             }
         }
-        // nearest IAT slot within one pointer width (disassembly boundary slop)
-        imports
-            .entries()
-            .iter()
-            .min_by_key(|e| (target_rva as i64 - e.iat_rva as i64).unsigned_abs())
-            .filter(|e| (target_rva as i64 - e.iat_rva as i64).unsigned_abs() <= 8)
+        // Disassembly slop: unique nearest IAT slot strictly inside one pointer width.
+        // Equidistant neighbors (mid-slot RVAs) must not bind to an arbitrary import.
+        let mut best: Option<&ImportEntry> = None;
+        let mut best_dist = u64::MAX;
+        let mut tied = false;
+        for e in imports.entries() {
+            let dist = (target_rva as i64 - e.iat_rva as i64).unsigned_abs();
+            if dist == 0 || dist > 8 {
+                continue;
+            }
+            if dist < best_dist {
+                best_dist = dist;
+                best = Some(e);
+                tied = false;
+            } else if dist == best_dist {
+                tied = true;
+            }
+        }
+        if tied {
+            None
+        } else {
+            best
+        }
     }
 }
 
@@ -439,11 +465,17 @@ mod tests {
         assert_eq!(pe.import_directory_rva(), Some(0x3000));
         let import_off = pe.rva_to_file_offset(0x3000).unwrap();
         let ilt = u32::from_le_bytes(pe.data[import_off..import_off + 4].try_into().unwrap());
-        let iat = u32::from_le_bytes(pe.data[import_off + 16..import_off + 20].try_into().unwrap());
+        let iat = u32::from_le_bytes(
+            pe.data[import_off + 16..import_off + 20]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(ilt, 0x3028, "ILT RVA");
         assert_eq!(iat, 0x3038, "IAT RVA");
         let thunk = u64::from_le_bytes(
-            pe.data[pe.rva_to_file_offset(ilt).unwrap()..][..8].try_into().unwrap(),
+            pe.data[pe.rva_to_file_offset(ilt).unwrap()..][..8]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(thunk, 0x3058, "first thunk -> hint/name");
     }
@@ -500,12 +532,27 @@ mod tests {
 
     #[test]
     fn native_call_ids_in_threaded_bytecode_skip_rel32() {
-        use crate::pe::threaded::{embed_thread_targets, handler_offset_for_op, handler_offset_for_set_block_map};
+        use crate::pe::threaded::{
+            embed_thread_targets, handler_offset_for_op, handler_offset_for_set_block_map,
+        };
         use crate::pe::vm_stub::create_vm_interpreter_stub;
         use crate::vm::{BlockMapPlan, DispatchMode, OpCode, OpcodeMap};
 
         let map = OpcodeMap::from_seed(0x4C34_4100);
-        let (stub, _, _, _) = create_vm_interpreter_stub(0, 0, &map, DispatchMode::Table, 0, crate::vm::IsaMode::Reg, &crate::vm::BytecodeLayout::identity(), &[], &BlockMapPlan::default(), &[], &[], &crate::vm::NestedVmPlan::disabled());
+        let (stub, _, _, _) = create_vm_interpreter_stub(
+            0,
+            0,
+            &map,
+            DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
@@ -534,16 +581,14 @@ mod tests {
             vec![ptr_id],
             "threaded scan must read id after rel32, not handler offset bytes"
         );
-        assert!(
-            is_iat_ptr_native_call(
-                native_call_ids_in_bytecode_with_map_dispatch(
-                    &threaded,
-                    &map,
-                    DispatchMode::Threaded,
-                    None,
-                )[0],
-            )
-        );
+        assert!(is_iat_ptr_native_call(
+            native_call_ids_in_bytecode_with_map_dispatch(
+                &threaded,
+                &map,
+                DispatchMode::Threaded,
+                None,
+            )[0],
+        ));
     }
 
     #[test]
@@ -570,12 +615,13 @@ mod tests {
             &BlockMapPlan::default(),
             &[],
             &[],
-        &crate::vm::NestedVmPlan::disabled(),
-    );
+            &crate::vm::NestedVmPlan::disabled(),
+        );
         let ptr_id = native_call_iat_ptr_id(0x8260);
         let mut raw = vec![map.encode(OpCode::NativeCall)];
         raw.extend_from_slice(&ptr_id.to_le_bytes());
-        let laid = apply_layout_diversification(&raw, &layout, &map, &plan, crate::vm::IsaMode::Reg);
+        let laid =
+            apply_layout_diversification(&raw, &layout, &map, &plan, crate::vm::IsaMode::Reg);
         let set_map = handler_offset_for_set_block_map(&stub);
         let threaded = embed_thread_targets(
             &laid,
@@ -611,8 +657,17 @@ mod tests {
             return;
         }
         let mut pe = PEFile::from_bytes(std::fs::read(path).unwrap()).unwrap();
-        let packed = pack_function(&mut pe, None, Some(0x4C34_4100), false, DispatchMode::Threaded, 0, crate::vm::IsaMode::Reg, false)
-            .unwrap();
+        let packed = pack_function(
+            &mut pe,
+            None,
+            Some(0x4C34_4100),
+            false,
+            DispatchMode::Threaded,
+            0,
+            crate::vm::IsaMode::Reg,
+            false,
+        )
+        .unwrap();
         let ids = native_call_ids_in_bytecode_with_layout(
             &packed.bytecode,
             &packed.opcode_map,
@@ -645,5 +700,41 @@ mod tests {
         let resolved = pe.resolve_iat_target(&imports, puts.iat_rva);
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap().name, "puts");
+    }
+
+    #[test]
+    fn resolve_iat_target_rejects_equidistant_slots() {
+        let pe = PEFile::from_bytes(test_pe::create_minimal_pe64()).unwrap();
+        let imports = ImportTable::from_entries_for_test(vec![
+            ImportEntry {
+                dll_name: "a.dll".into(),
+                name: "Foo".into(),
+                iat_rva: 0x1000,
+            },
+            ImportEntry {
+                dll_name: "a.dll".into(),
+                name: "Bar".into(),
+                iat_rva: 0x1008,
+            },
+        ]);
+        assert_eq!(
+            pe.resolve_iat_target(&imports, 0x1000)
+                .map(|e| e.name.as_str()),
+            Some("Foo")
+        );
+        assert_eq!(
+            pe.resolve_iat_target(&imports, 0x1001)
+                .map(|e| e.name.as_str()),
+            Some("Foo")
+        );
+        assert_eq!(
+            pe.resolve_iat_target(&imports, 0x1007)
+                .map(|e| e.name.as_str()),
+            Some("Bar")
+        );
+        assert!(
+            pe.resolve_iat_target(&imports, 0x1004).is_none(),
+            "mid-slot RVA must not bind to an arbitrary neighbor"
+        );
     }
 }

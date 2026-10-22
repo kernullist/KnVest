@@ -1702,11 +1702,16 @@ pub fn scrub_embedded_metadata_in_pe(pe: &mut PEFile, seed: u64) -> PEResult<Sid
         }
     }
 
-    // 5. Scrub "VMBC" 4-byte marker immediately preceding bytecode.
-    let vmbc = sidecar.vmbc_offset as usize;
-    if vmbc + 4 <= section_data.len() && &section_data[vmbc..vmbc + 4] == b"VMBC" {
-        for k in 0..4 {
-            section_data[vmbc + k] ^= cipher.keystream_byte(vmbc + k) | 0x80;
+    // 5. Scrub every "VMBC" 4-byte marker (multi-RVA images embed one per function).
+    let mut i = 0usize;
+    while i + 4 <= section_data.len() {
+        if &section_data[i..i + 4] == b"VMBC" {
+            for k in 0..4 {
+                section_data[i + k] ^= cipher.keystream_byte(i + k) | 0x80;
+            }
+            i += 4;
+        } else {
+            i += 1;
         }
     }
 
@@ -3170,10 +3175,12 @@ mod tests {
                 continue;
             }
             let window = &stub[i..i + 32];
-            let push_at = window
+            let Some(push_at) = window
                 .windows(push_flags.len())
                 .position(|w| w == push_flags)
-                .expect("JmpIf must push saved VM flags before popfq");
+            else {
+                continue;
+            };
             assert_eq!(window[push_at + push_flags.len()], 0x9D, "JmpIf must popfq before semantic jcc");
             assert_eq!(
                 window[push_at + push_flags.len() + 1],

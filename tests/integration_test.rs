@@ -223,7 +223,7 @@ fn test_advancement_plan_remaining_items_end_to_end() {
         0x48, 0xC7, 0xC3, 0x80, 0x00, 0x00, 0x00, // mov rbx, 0x80
         0x0F, 0xB6, 0xC3,                         // movzx eax, bl -> 0x80
         0x0F, 0xBE, 0xCB,                         // movsx ecx, bl -> 0xFFFFFFFFFFFFFF80
-        0x48, 0x63, 0xD1,                         // movsxd rdx, ecx -> copy r1 to r2
+        0x48, 0x63, 0xD1,                         // movsxd rdx, ecx -> sign-extend r1 into r2
         0xC3,
     ];
     let dec_ext = disassemble_x64_simple(&raw_ext, 16);

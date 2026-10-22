@@ -4,6 +4,7 @@ use super::lifter::{
 };
 use super::packer::{
     extract_bytecode_from_packed, extract_pack_metadata_from_packed, pack_functions_l8,
+    scrub_embedded_metadata_in_pe,
 };
 use super::test_pe;
 use super::vm_stub::{create_vm_interpreter_stub_l8, StubExitMode};
@@ -98,7 +99,10 @@ fn l8_rolling_pack_is_idempotent_and_vm_executes_ciphertext() {
         seed,
     );
     let text = Instruction::pretty_print(&ir);
-    assert!(ir.len() > 2, "rolling IR should decode the lifted function:\n{text}");
+    assert!(
+        ir.len() > 2,
+        "rolling IR should decode the lifted function:\n{text}"
+    );
     assert!(!text.contains("unknown") || ir.iter().any(|i| i.opcode == OpCode::Exit));
 }
 
@@ -217,23 +221,64 @@ fn l8_stub_emits_rolling_decrypt_and_sse_opcodes() {
     let key = [0x69u8, 0xC9, 0xB9, 0x79, 0x37, 0x9E];
     assert!(rolling.windows(key.len()).any(|w| w == key));
     assert!(!plain.windows(key.len()).any(|w| w == key));
-    assert!(plain.windows(4).any(|w| w == [0xF2, 0x0F, 0x58, 0xC8]), "addsd");
-    assert!(plain.windows(5).any(|w| w == [0xF2, 0x48, 0x0F, 0x2A, 0xC8]), "cvtsi2sd");
-    assert!(plain.windows(5).any(|w| w == [0xF2, 0x48, 0x0F, 0x2C, 0xC0]), "cvttsd2si");
-    assert!(plain.windows(4).any(|w| w == [0xF3, 0x0F, 0x7E, 0xC8]), "movq");
-    assert!(plain.windows(4).any(|w| w == [0x66, 0x0F, 0x6E, 0xC8]), "movd");
+    assert!(
+        plain.windows(4).any(|w| w == [0xF2, 0x0F, 0x58, 0xC8]),
+        "addsd"
+    );
+    assert!(
+        plain
+            .windows(5)
+            .any(|w| w == [0xF2, 0x48, 0x0F, 0x2A, 0xC8]),
+        "cvtsi2sd"
+    );
+    assert!(
+        plain
+            .windows(5)
+            .any(|w| w == [0xF2, 0x48, 0x0F, 0x2C, 0xC0]),
+        "cvttsd2si"
+    );
+    assert!(
+        plain.windows(4).any(|w| w == [0xF3, 0x0F, 0x7E, 0xC8]),
+        "movq"
+    );
+    assert!(
+        plain.windows(4).any(|w| w == [0x66, 0x0F, 0x6E, 0xC8]),
+        "movd"
+    );
     assert!(plain.windows(3).any(|w| w == [0x0F, 0x2F, 0xC8]), "comiss");
-    assert!(plain.windows(4).any(|w| w == [0x66, 0x0F, 0x2F, 0xC8]), "comisd");
-    assert!(plain.windows(5).any(|w| w == [0xF3, 0x48, 0x0F, 0x2A, 0xC8]), "cvtsi2ss");
-    assert!(plain.windows(5).any(|w| w == [0xF3, 0x48, 0x0F, 0x2C, 0xC0]), "cvttss2si");
-    assert!(plain.windows(4).any(|w| w == [0xF3, 0x0F, 0x5A, 0xC8]), "cvtss2sd");
-    assert!(plain.windows(4).any(|w| w == [0xF2, 0x0F, 0x5A, 0xC8]), "cvtsd2ss");
+    assert!(
+        plain.windows(4).any(|w| w == [0x66, 0x0F, 0x2F, 0xC8]),
+        "comisd"
+    );
+    assert!(
+        plain
+            .windows(5)
+            .any(|w| w == [0xF3, 0x48, 0x0F, 0x2A, 0xC8]),
+        "cvtsi2ss"
+    );
+    assert!(
+        plain
+            .windows(5)
+            .any(|w| w == [0xF3, 0x48, 0x0F, 0x2C, 0xC0]),
+        "cvttss2si"
+    );
+    assert!(
+        plain.windows(4).any(|w| w == [0xF3, 0x0F, 0x5A, 0xC8]),
+        "cvtss2sd"
+    );
+    assert!(
+        plain.windows(4).any(|w| w == [0xF2, 0x0F, 0x5A, 0xC8]),
+        "cvtsd2ss"
+    );
 }
 
 #[test]
 fn l8_lifter_jmp_reg_and_sse_and_switch_cfg() {
     let jmp = disassemble_x64_simple(&[0xFF, 0xE0], 2);
-    assert!(matches!(jmp[0].kind, X64InstrKind::JmpReg { reg: X64Reg::Rax }));
+    assert!(matches!(
+        jmp[0].kind,
+        X64InstrKind::JmpReg { reg: X64Reg::Rax }
+    ));
     let lifted = lift_to_vm_bytecode(&jmp, 0);
     let id = encode_jmp_reg(0);
     assert!(
@@ -257,8 +302,18 @@ fn l8_lifter_jmp_reg_and_sse_and_switch_cfg() {
         (&[0x66, 0x0F, 0x6E, 0xC0], crate::vm::l8::XMM_MOVD_XM, 0, 0),
         (&[0x0F, 0x2F, 0xC1], crate::vm::l8::XMM_COMISS, 0, 1),
         (&[0x66, 0x0F, 0x2F, 0xC1], crate::vm::l8::XMM_COMISD, 0, 1),
-        (&[0xF3, 0x48, 0x0F, 0x2A, 0xC0], crate::vm::l8::XMM_CVTSI2SS, 0, 0),
-        (&[0xF3, 0x48, 0x0F, 0x2C, 0xC0], crate::vm::l8::XMM_CVTTSS2SI, 0, 0),
+        (
+            &[0xF3, 0x48, 0x0F, 0x2A, 0xC0],
+            crate::vm::l8::XMM_CVTSI2SS,
+            0,
+            0,
+        ),
+        (
+            &[0xF3, 0x48, 0x0F, 0x2C, 0xC0],
+            crate::vm::l8::XMM_CVTTSS2SI,
+            0,
+            0,
+        ),
         (&[0xF3, 0x0F, 0x5A, 0xC1], crate::vm::l8::XMM_CVTSS2SD, 0, 1),
         (&[0xF2, 0x0F, 0x5A, 0xC1], crate::vm::l8::XMM_CVTSD2SS, 0, 1),
     ];
@@ -279,8 +334,22 @@ fn l8_lifter_jmp_reg_and_sse_and_switch_cfg() {
 
     let instrs = vec![
         insn(0, 2, X64InstrKind::Ja { target_offset: 100 }),
-        insn(2, 3, X64InstrKind::CmpRegImm { reg: X64Reg::Rcx, imm: 1 }),
-        insn(6, 7, X64InstrKind::LeaRipRel { dst: X64Reg::Rax, offset: 15 }),
+        insn(
+            2,
+            3,
+            X64InstrKind::CmpRegImm {
+                reg: X64Reg::Rcx,
+                imm: 1,
+            },
+        ),
+        insn(
+            6,
+            7,
+            X64InstrKind::LeaRipRel {
+                dst: X64Reg::Rax,
+                offset: 15,
+            },
+        ),
         insn(
             13,
             4,
@@ -291,9 +360,18 @@ fn l8_lifter_jmp_reg_and_sse_and_switch_cfg() {
                 scale: 4,
                 disp: 0,
                 sign_extend32: true,
+                width: 32,
+                high_byte: false,
             },
         ),
-        insn(17, 3, X64InstrKind::AddRegReg { dst: X64Reg::Rdx, src: X64Reg::Rax }),
+        insn(
+            17,
+            3,
+            X64InstrKind::AddRegReg {
+                dst: X64Reg::Rdx,
+                src: X64Reg::Rax,
+            },
+        ),
         insn(20, 2, X64InstrKind::JmpReg { reg: X64Reg::Rdx }),
         insn(32, 1, X64InstrKind::Nop),
         insn(36, 1, X64InstrKind::Nop),
@@ -328,12 +406,15 @@ fn l8_multi_rva_installs_trampolines_and_return_to_caller() {
     )
     .unwrap();
     assert!(one.function_entries.is_empty());
-    assert_eq!(single.data[0x400], 0x55, "a single RVA must not patch a trampoline");
+    assert_eq!(
+        single.data[0x400], 0x55,
+        "a single RVA must not patch a trampoline"
+    );
 
     let mut bytes = test_pe::create_minimal_pe64();
     let second = [
-        0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x48,
-        0x83, 0xC4, 0x20, 0x5D, 0xC3,
+        0x55u8, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x20, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x83,
+        0xC4, 0x20, 0x5D, 0xC3,
     ];
     bytes[0x430..0x430 + second.len()].copy_from_slice(&second);
     let mut pe = PEFile::from_bytes(bytes).unwrap();
@@ -365,4 +446,15 @@ fn l8_multi_rva_installs_trampolines_and_return_to_caller() {
     assert_eq!(blob.windows(4).filter(|w| *w == b"VMBC").count(), 2);
     let ret_seq = [0x0Fu8, 0xB6, 0x0E, 0x48, 0x8B, 0x44, 0xCD, 0x80, 0xC9, 0xC3];
     assert!(blob.windows(ret_seq.len()).any(|w| w == ret_seq));
+
+    scrub_embedded_metadata_in_pe(&mut pe, packed.seed).unwrap();
+    let section = pe.get_section(".knvest").unwrap();
+    let start = section.pointer_to_raw_data as usize;
+    let end = start + section.size_of_raw_data as usize;
+    let blob = &pe.data[start..end];
+    assert_eq!(
+        blob.windows(4).filter(|w| *w == b"VMBC").count(),
+        0,
+        "strip-meta must scrub every VMBC marker in a multi-RVA image"
+    );
 }

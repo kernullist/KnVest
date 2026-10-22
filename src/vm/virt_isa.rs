@@ -1,10 +1,11 @@
-use super::opcode_map::handler_variant_count;
 use super::opcode::OpCode;
+use super::opcode_map::handler_variant_count;
 use super::OpcodeMap;
 use super::{active_encode, current_isa_mode, DispatchMode, IsaMode};
 use crate::pe::mba;
 
-/// Scratch register for L5a lift-time sub split (not used by MBA temps r14/r15).
+/// Scratch register for L5a lift-time sub split.
+/// Isolated from stack-spill allocation together with MBA temps r14/r15.
 pub const VIRT_ISA_SPLIT_TEMP: u8 = 13;
 
 const SUB_SPLIT_SALT: u64 = 0x53504954; // "SPIT" — split lift encoding salt
@@ -105,7 +106,9 @@ pub fn format_ir_header(map: &OpcodeMap, dispatch_mode: DispatchMode) -> String 
     }
     out.push_str("Lift-time patterns:\n");
     out.push_str("  merge | x86 xor/test r,r → load_imm r,0 (+ cmp r,0 for test)\n");
-    out.push_str("  split | x86 sub r,d → move r13,r ; sub r,r13,d (when sub_lift=split)\n");
+    out.push_str(
+        "  split | x86 sub r,d → move r13,r ; sub r,r13,d (when sub_lift=split; r13 is scratch)\n",
+    );
     out.push('\n');
     out
 }
