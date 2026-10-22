@@ -28,6 +28,11 @@ pub enum VMError {
 
 pub type VMResult<T> = Result<T, VMError>;
 
+enum MemLoc {
+    Data(usize),
+    Mem(usize),
+}
+
 pub const NUM_REGISTERS: usize = 32;
 const STACK_SIZE: usize = 4096;
 const MEMORY_SIZE: usize = 65536;
@@ -638,18 +643,8 @@ impl VirtualMachine {
                 let dst = self.read_u8()?;
                 let addr_reg = self.read_u8()?;
                 let addr = self.get_register(addr_reg)? as usize;
-
-                let byte_val = if addr < self.data_section.len() {
-                    self.data_section[addr]
-                } else if addr >= 0x10000 && addr < 0x10000 + self.memory.len() {
-                    self.memory[addr - 0x10000]
-                } else if addr < self.memory.len() {
-                    self.memory[addr]
-                } else {
-                    0
-                };
-
-                self.set_register(dst, byte_val as u64)?;
+                let byte_val = self.read_mem(addr, 1)?;
+                self.set_register(dst, byte_val)?;
             }
 
             OpCode::LoadStr => {
@@ -677,39 +672,57 @@ impl VirtualMachine {
         let divisor = self.get_register(divisor_reg)?;
         let lo = self.get_register(0)?;
         let hi = self.get_register(2)?;
-        match crate::vm::l8::exec_div(kind, lo, hi, divisor) {
-            Ok((quot, rem)) => {
+        match crate::vm::l8::exec_div_effect(kind, lo, hi, divisor) {
+            Ok(crate::vm::l8::DivWrite::Both(quot, rem)) => {
                 self.set_register(0, quot)?;
                 self.set_register(2, rem)?;
                 Ok(())
             }
+            Ok(crate::vm::l8::DivWrite::Rax(rax)) => self.set_register(0, rax),
             Err(()) => Err(VMError::DivisionByZero),
         }
     }
 
-    fn read_mem(&self, addr: usize, len: usize) -> VMResult<u64> {
-        if addr
+    /// Address windows shared by `LoadByte` and pointer micros:
+    /// `data_section`, then the `0x10000` alias of `memory`, then `memory` itself.
+    fn locate_mem(&self, addr: usize, len: usize) -> VMResult<MemLoc> {
+        let end = addr
             .checked_add(len)
-            .map(|end| end > self.memory.len())
-            .unwrap_or(true)
-        {
+            .ok_or(VMError::MemoryViolation(addr))?;
+        if !self.data_section.is_empty() && addr < self.data_section.len() {
+            if end <= self.data_section.len() {
+                return Ok(MemLoc::Data(addr));
+            }
             return Err(VMError::MemoryViolation(addr));
         }
+        if addr >= 0x10000 && end <= 0x10000 + self.memory.len() {
+            return Ok(MemLoc::Mem(addr - 0x10000));
+        }
+        if end <= self.memory.len() {
+            return Ok(MemLoc::Mem(addr));
+        }
+        Err(VMError::MemoryViolation(addr))
+    }
+
+    fn read_mem(&self, addr: usize, len: usize) -> VMResult<u64> {
         let mut bytes = [0u8; 8];
-        bytes[..len].copy_from_slice(&self.memory[addr..addr + len]);
+        match self.locate_mem(addr, len)? {
+            MemLoc::Data(off) => bytes[..len].copy_from_slice(&self.data_section[off..off + len]),
+            MemLoc::Mem(off) => bytes[..len].copy_from_slice(&self.memory[off..off + len]),
+        }
         Ok(u64::from_le_bytes(bytes))
     }
 
     fn write_mem(&mut self, addr: usize, value: u64, len: usize) -> VMResult<()> {
-        if addr
-            .checked_add(len)
-            .map(|end| end > self.memory.len())
-            .unwrap_or(true)
-        {
-            return Err(VMError::MemoryViolation(addr));
-        }
         let bytes = value.to_le_bytes();
-        self.memory[addr..addr + len].copy_from_slice(&bytes[..len]);
+        match self.locate_mem(addr, len)? {
+            MemLoc::Data(off) => {
+                self.data_section[off..off + len].copy_from_slice(&bytes[..len]);
+            }
+            MemLoc::Mem(off) => {
+                self.memory[off..off + len].copy_from_slice(&bytes[..len]);
+            }
+        }
         Ok(())
     }
 
@@ -731,6 +744,33 @@ impl VirtualMachine {
             crate::vm::l8::MEM_STORE32 => {
                 let value = self.get_register(data_reg)?;
                 self.write_mem(addr, value, 4)
+            }
+            crate::vm::l8::MEM_LOAD8 => {
+                let byte = self.read_mem(addr, 1)?;
+                let old = self.get_register(data_reg)?;
+                self.set_register(data_reg, (old & !0xFF) | (byte & 0xFF))
+            }
+            crate::vm::l8::MEM_STORE8 => {
+                let value = self.get_register(data_reg)?;
+                self.write_mem(addr, value, 1)
+            }
+            crate::vm::l8::MEM_LOAD16 => {
+                let word = self.read_mem(addr, 2)?;
+                let old = self.get_register(data_reg)?;
+                self.set_register(data_reg, (old & !0xFFFF) | (word & 0xFFFF))
+            }
+            crate::vm::l8::MEM_STORE16 => {
+                let value = self.get_register(data_reg)?;
+                self.write_mem(addr, value, 2)
+            }
+            crate::vm::l8::MEM_LOAD8_HI => {
+                let byte = self.read_mem(addr, 1)?;
+                let old = self.get_register(data_reg)?;
+                self.set_register(data_reg, (old & !0xFF00) | ((byte & 0xFF) << 8))
+            }
+            crate::vm::l8::MEM_STORE8_HI => {
+                let value = self.get_register(data_reg)? >> 8;
+                self.write_mem(addr, value, 1)
             }
             _ => Err(VMError::NativeCallError(format!("unknown mem op {op}"))),
         }
@@ -1013,5 +1053,31 @@ mod tests {
 
         let mut vm = VirtualMachine::with_block_maps(bytecode, base, plan);
         assert!(matches!(vm.run(), Err(VMError::InvalidOpcode(_))));
+    }
+
+    #[test]
+    fn load_byte_out_of_range_is_a_memory_violation() {
+        let mut bc = vec![OpCode::LoadImm as u8, 1];
+        bc.extend_from_slice(&0x2_0000u64.to_le_bytes());
+        bc.extend_from_slice(&[OpCode::LoadByte as u8, 0, 1, OpCode::Exit as u8, 0]);
+        let mut vm = VirtualMachine::new(bc);
+        assert!(matches!(vm.run(), Err(VMError::MemoryViolation(_))));
+    }
+
+    #[test]
+    fn byte_load_merges_data_section_into_ah() {
+        use crate::vm::l8::{encode_mem, MEM_LOAD8_HI};
+        let mut bc = vec![OpCode::LoadImm as u8, 0];
+        bc.extend_from_slice(&0x1122_u64.to_le_bytes());
+        bc.push(OpCode::LoadImm as u8);
+        bc.push(1);
+        bc.extend_from_slice(&0u64.to_le_bytes());
+        bc.push(OpCode::NativeCall as u8);
+        bc.extend_from_slice(&encode_mem(MEM_LOAD8_HI, 0, 1).to_le_bytes());
+        bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+        let mut vm = VirtualMachine::new(bc);
+        vm.data_section = vec![0xAB];
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(0).unwrap(), 0xAB22);
     }
 }

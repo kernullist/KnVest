@@ -34,11 +34,28 @@ pub const DIV_DIV32: u8 = 3;
 pub const DIV_CDQ: u8 = 4;
 /// `cqo`: `rdx = sext_fill(rax)`, `rax` unchanged, flags unchanged.
 pub const DIV_CQO: u8 = 5;
+/// 8-bit `idiv`: quotient in `al`, remainder in `ah`. Bits `[63:16]` of `rax` stay.
+pub const DIV_IDIV8: u8 = 6;
+/// 16-bit `idiv`: quotient in `ax`, remainder in `dx`. Bits `[63:16]` stay.
+pub const DIV_IDIV16: u8 = 7;
+/// 8-bit `div`. Same register merge as `DIV_IDIV8`.
+pub const DIV_DIV8: u8 = 8;
+/// 16-bit `div`. Same register merge as `DIV_IDIV16`.
+pub const DIV_DIV16: u8 = 9;
 
 pub const MEM_LOAD64: u8 = 0;
 pub const MEM_STORE64: u8 = 1;
 pub const MEM_LOAD32: u8 = 2;
 pub const MEM_STORE32: u8 = 3;
+/// Merge a byte into bits `[7:0]`. Upper bits of the data register stay.
+pub const MEM_LOAD8: u8 = 4;
+pub const MEM_STORE8: u8 = 5;
+/// Merge a word into bits `[15:0]`. Bits `[63:16]` stay.
+pub const MEM_LOAD16: u8 = 6;
+pub const MEM_STORE16: u8 = 7;
+/// Merge a byte into `ah` (bits `[15:8]`).
+pub const MEM_LOAD8_HI: u8 = 8;
+pub const MEM_STORE8_HI: u8 = 9;
 
 pub const XMM_MOVSS_XX: u8 = 0;
 pub const XMM_MOVSD_XX: u8 = 1;
@@ -242,6 +259,95 @@ pub fn exec_div(
     }
 }
 
+/// Where a `div`/`idiv` result is written. 8-bit forms keep the remainder in `ah`.
+pub enum DivWrite {
+    /// Quotient to `rax`, remainder to `rdx`.
+    Both(u64, u64),
+    /// Updated `rax` only (`rdx` is unchanged).
+    Rax(u64),
+}
+
+fn merge_low(old: u64, value: u64, bits: u32) -> u64 {
+    let mask = (1u64 << bits) - 1;
+    (old & !mask) | (value & mask)
+}
+
+fn div8(signed: bool, rax: u64, divisor: u64) -> Result<u64, ()> {
+    let ax = rax as u16;
+    let (quot, rem) = if signed {
+        let d = divisor as i8;
+        let n = ax as i16;
+        let q = n.checked_div(d as i16).ok_or(())?;
+        let r = n.checked_rem(d as i16).ok_or(())?;
+        if q > i8::MAX as i16 || q < i8::MIN as i16 {
+            return Err(());
+        }
+        (q as u8 as u16, r as u8 as u16)
+    } else {
+        let d = divisor as u8;
+        if d == 0 {
+            return Err(());
+        }
+        let q = ax / d as u16;
+        let r = ax % d as u16;
+        if q > u8::MAX as u16 {
+            return Err(());
+        }
+        (q, r)
+    };
+    Ok(merge_low(rax, u64::from((rem << 8) | quot), 16))
+}
+
+fn div16(signed: bool, rax: u64, rdx: u64, divisor: u64) -> Result<(u64, u64), ()> {
+    let ax = rax as u16;
+    let dx = rdx as u16;
+    if signed {
+        let n = ((dx as i16 as i32) << 16) | (ax as u16 as i32);
+        let d = divisor as i16;
+        let q = n.checked_div(d as i32).ok_or(())?;
+        let r = n.checked_rem(d as i32).ok_or(())?;
+        if q > i16::MAX as i32 || q < i16::MIN as i32 {
+            return Err(());
+        }
+        Ok((
+            merge_low(rax, q as u16 as u64, 16),
+            merge_low(rdx, r as u16 as u64, 16),
+        ))
+    } else {
+        let d = divisor as u16 as u32;
+        if d == 0 {
+            return Err(());
+        }
+        let n = ((dx as u32) << 16) | (ax as u32);
+        let q = n / d;
+        let r = n % d;
+        if q > u16::MAX as u32 {
+            return Err(());
+        }
+        Ok((merge_low(rax, q as u64, 16), merge_low(rdx, r as u64, 16)))
+    }
+}
+
+/// Apply `div`/`idiv`/`cdq`/`cqo`, including 8- and 16-bit partial-register merges.
+pub fn exec_div_effect(kind: u8, lo: u64, hi: u64, divisor: u64) -> Result<DivWrite, ()> {
+    match kind {
+        DIV_IDIV8 => Ok(DivWrite::Rax(div8(true, lo, divisor)?)),
+        DIV_DIV8 => Ok(DivWrite::Rax(div8(false, lo, divisor)?)),
+        DIV_IDIV16 => {
+            let (rax, rdx) = div16(true, lo, hi, divisor)?;
+            Ok(DivWrite::Both(rax, rdx))
+        }
+        DIV_DIV16 => {
+            let (rax, rdx) = div16(false, lo, hi, divisor)?;
+            Ok(DivWrite::Both(rax, rdx))
+        }
+        _ => {
+            let (q, r) = exec_div(kind, lo, hi, divisor)?;
+            Ok(DivWrite::Both(q, r))
+        }
+    }
+}
+
 pub fn xmm_mnemonic(subop: u8) -> &'static str {
     match subop {
         XMM_MOVSS_XX | XMM_MOVSS_XM | XMM_MOVSS_MX => "xmm_movss",
@@ -313,6 +419,10 @@ pub fn format_native_micro(func_id: u64) -> Option<String> {
             DIV_DIV32 => "div32",
             DIV_CDQ => return Some("cdq".to_string()),
             DIV_CQO => return Some("cqo".to_string()),
+            DIV_IDIV8 => "idiv8",
+            DIV_IDIV16 => "idiv16",
+            DIV_DIV8 => "div8",
+            DIV_DIV16 => "div16",
             _ => "div?",
         };
         return Some(format!("{name} r{reg}"));
@@ -323,6 +433,12 @@ pub fn format_native_micro(func_id: u64) -> Option<String> {
             MEM_STORE64 => "store64",
             MEM_LOAD32 => "load32",
             MEM_STORE32 => "store32",
+            MEM_LOAD8 => "load8",
+            MEM_STORE8 => "store8",
+            MEM_LOAD16 => "load16",
+            MEM_STORE16 => "store16",
+            MEM_LOAD8_HI => "load8hi",
+            MEM_STORE8_HI => "store8hi",
             _ => "mem?",
         };
         return Some(format!("{name} r{data}, [r{addr}]"));
@@ -664,5 +780,18 @@ mod tests {
             format_native_micro(encode_div(DIV_CQO, 0)).as_deref(),
             Some("cqo")
         );
+        // ax = 100, idiv cl=7 → al=14, ah=2. High rax bits stay.
+        match exec_div_effect(DIV_IDIV8, 0x1111_0000_0064, 0, 7).unwrap() {
+            DivWrite::Rax(rax) => assert_eq!(rax, 0x1111_0000_020E),
+            DivWrite::Both(_, _) => panic!("idiv r8 writes ah:al inside rax"),
+        }
+        // dx:ax = 1:0, div cx=10 → quot 0x1999, rem 6. High halves stay.
+        match exec_div_effect(DIV_DIV16, 0x2222_0000_0000, 0x3333_0000_0001, 10).unwrap() {
+            DivWrite::Both(rax, rdx) => {
+                assert_eq!(rax, 0x2222_0000_1999);
+                assert_eq!(rdx, 0x3333_0000_0006);
+            }
+            DivWrite::Rax(_) => panic!("div r16 writes ax and dx"),
+        }
     }
 }

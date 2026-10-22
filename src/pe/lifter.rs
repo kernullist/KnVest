@@ -322,7 +322,8 @@ pub enum X64InstrKind {
         scale: u8,
         disp: i32,
         sign_extend32: bool,
-        dword: bool,
+        width: u8,
+        high_byte: bool,
     },
     /// SSE/SSE2 scalar or xmm move. Operands are resolved to xmm indices or GP/memory.
     Xmm {
@@ -496,12 +497,19 @@ fn is_imm_operand(kind: OpKind) -> bool {
 }
 
 fn imm_u64(instr: &Instruction) -> u64 {
-    if instr.op0_kind() == OpKind::Immediate8 {
-        instr.immediate8() as u64
-    } else if instr.op0_kind() == OpKind::Immediate32 {
-        instr.immediate32() as u64
+    let kind = if is_imm_operand(instr.op1_kind()) || instr.op1_kind() == OpKind::Immediate32to64 {
+        instr.op1_kind()
     } else {
-        instr.immediate64()
+        instr.op0_kind()
+    };
+    match kind {
+        OpKind::Immediate8 => instr.immediate8() as u64,
+        OpKind::Immediate8to16 => instr.immediate8to16() as u16 as u64,
+        OpKind::Immediate8to32 => instr.immediate8to32() as u32 as u64,
+        OpKind::Immediate8to64 => instr.immediate8to64() as u64,
+        OpKind::Immediate32to64 => instr.immediate32to64() as u64,
+        OpKind::Immediate32 => instr.immediate32() as u64,
+        _ => instr.immediate64(),
     }
 }
 
@@ -682,7 +690,20 @@ fn classify_scaled_load(instr: &Instruction, sign_extend32: bool) -> Option<X64I
     if !matches!(scale, 1 | 2 | 4 | 8) {
         return None;
     }
-    let dword = sign_extend32 || instr.op0_register().size() == 4;
+    let high_byte = matches!(
+        instr.op0_register(),
+        Register::AH | Register::BH | Register::CH | Register::DH
+    );
+    let width = if sign_extend32 {
+        32
+    } else {
+        match instr.op0_register().size() {
+            1 => 8,
+            2 => 16,
+            4 => 32,
+            _ => 64,
+        }
+    };
     Some(X64InstrKind::MovRegScaledMem {
         dst,
         base,
@@ -690,7 +711,8 @@ fn classify_scaled_load(instr: &Instruction, sign_extend32: bool) -> Option<X64I
         scale,
         disp: instr.memory_displacement32() as i32,
         sign_extend32,
-        dword,
+        width,
+        high_byte,
     })
 }
 
@@ -1208,10 +1230,12 @@ fn classify_sar(instr: &Instruction) -> X64InstrKind {
 fn classify_div(instr: &Instruction, signed: bool) -> X64InstrKind {
     if instr.op0_kind() == OpKind::Register {
         if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
-            let bits = if instr.op0_register().size() == 8 {
-                64
-            } else {
-                32
+            let bits = match instr.op0_register().size() {
+                1 => 8,
+                2 => 16,
+                4 => 32,
+                8 => 64,
+                _ => return X64InstrKind::Unknown,
             };
             return X64InstrKind::IdivReg { reg, signed, bits };
         }
@@ -3022,11 +3046,16 @@ fn emit_extended_alu_or_test(
             );
         }
         X64InstrKind::IdivReg { reg, signed, bits } => {
-            let kind = match (*signed, *bits >= 64) {
-                (true, true) => crate::vm::l8::DIV_IDIV64,
-                (true, false) => crate::vm::l8::DIV_IDIV32,
-                (false, true) => crate::vm::l8::DIV_DIV64,
-                (false, false) => crate::vm::l8::DIV_DIV32,
+            let kind = match (*signed, *bits) {
+                (true, 64) => crate::vm::l8::DIV_IDIV64,
+                (true, 32) => crate::vm::l8::DIV_IDIV32,
+                (true, 16) => crate::vm::l8::DIV_IDIV16,
+                (true, 8) => crate::vm::l8::DIV_IDIV8,
+                (false, 64) => crate::vm::l8::DIV_DIV64,
+                (false, 32) => crate::vm::l8::DIV_DIV32,
+                (false, 16) => crate::vm::l8::DIV_DIV16,
+                (false, 8) => crate::vm::l8::DIV_DIV8,
+                _ => return,
             };
             emit_native_micro(bytecode, crate::vm::l8::encode_div(kind, reg.to_vm_reg()));
         }
@@ -3076,15 +3105,103 @@ fn emit_native_micro(bytecode: &mut Vec<u8>, func_id: u64) {
     bytecode.extend_from_slice(&func_id.to_le_bytes());
 }
 
-/// Pointer load/store. Rides on `native_call` so it stays inside the 21-opcode wire map.
-fn emit_ptr_mem(bytecode: &mut Vec<u8>, store: bool, dword: bool, data_reg: u8, addr_reg: u8) {
-    let op = match (store, dword) {
-        (false, false) => crate::vm::l8::MEM_LOAD64,
-        (true, false) => crate::vm::l8::MEM_STORE64,
-        (false, true) => crate::vm::l8::MEM_LOAD32,
-        (true, true) => crate::vm::l8::MEM_STORE32,
+/// Operand width of a GPR `mov` to or from memory, and whether the GPR is `ah`/`bh`/`ch`/`dh`.
+fn gpr_mem_width(bytes: &[u8]) -> (u8, bool) {
+    let mut i = 0;
+    let mut op16 = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x66 => {
+                op16 = true;
+                i += 1;
+            }
+            0xF0 | 0xF2 | 0xF3 | 0x67 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => i += 1,
+            _ => break,
+        }
+    }
+    let mut rex = false;
+    let mut rex_w = false;
+    if i < bytes.len() && (0x40..=0x4F).contains(&bytes[i]) {
+        rex = true;
+        rex_w = bytes[i] & 0x08 != 0;
+        i += 1;
+    }
+    let Some(&op) = bytes.get(i) else {
+        return (32, false);
     };
-    emit_native_micro(bytecode, crate::vm::l8::encode_mem(op, data_reg, addr_reg));
+    let reg = bytes.get(i + 1).map(|m| (m >> 3) & 7).unwrap_or(0);
+    match op {
+        0x88 | 0x8A => (8, !rex && reg >= 4),
+        0x63 => (32, false),
+        _ => {
+            if rex_w {
+                (64, false)
+            } else if op16 {
+                (16, false)
+            } else {
+                (32, false)
+            }
+        }
+    }
+}
+
+fn opcode_after_prefixes(bytes: &[u8]) -> Option<u8> {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x66 | 0xF0 | 0xF2 | 0xF3 | 0x67 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => i += 1,
+            0x40..=0x4F => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    bytes.get(i).copied()
+}
+
+/// Pointer load/store. Rides on `native_call` so it stays inside the 21-opcode wire map.
+fn emit_ptr_mem(
+    bytecode: &mut Vec<u8>,
+    store: bool,
+    width: u8,
+    high: bool,
+    data_reg: u8,
+    addr_reg: u8,
+) {
+    use crate::vm::l8::*;
+    let op = match (store, width, high) {
+        (false, 8, true) => MEM_LOAD8_HI,
+        (true, 8, true) => MEM_STORE8_HI,
+        (false, 8, false) => MEM_LOAD8,
+        (true, 8, false) => MEM_STORE8,
+        (false, 16, _) => MEM_LOAD16,
+        (true, 16, _) => MEM_STORE16,
+        (false, 32, _) => MEM_LOAD32,
+        (true, 32, _) => MEM_STORE32,
+        (true, _, _) => MEM_STORE64,
+        (false, _, _) => MEM_LOAD64,
+    };
+    emit_native_micro(bytecode, encode_mem(op, data_reg, addr_reg));
+}
+
+fn emit_load_gpr_mem(
+    bytecode: &mut Vec<u8>,
+    bytes: &[u8],
+    data_reg: u8,
+    addr_reg: u8,
+    pack_seed: u64,
+) {
+    let (width, high) = gpr_mem_width(bytes);
+    emit_ptr_mem(bytecode, false, width, high, data_reg, addr_reg);
+    if opcode_after_prefixes(bytes) == Some(0x63) {
+        emit_sign_extend_bits(bytecode, data_reg, data_reg, 32, pack_seed);
+    }
+}
+
+fn emit_store_gpr_mem(bytecode: &mut Vec<u8>, bytes: &[u8], data_reg: u8, addr_reg: u8) {
+    let (width, high) = gpr_mem_width(bytes);
+    emit_ptr_mem(bytecode, true, width, high, data_reg, addr_reg);
 }
 
 fn spill_mem_reg(
@@ -3187,7 +3304,8 @@ fn emit_scaled_mem(bytecode: &mut Vec<u8>, kind: &X64InstrKind, pack_seed: u64) 
         scale,
         disp,
         sign_extend32,
-        dword,
+        width,
+        high_byte,
     } = kind
     else {
         return;
@@ -3214,7 +3332,7 @@ fn emit_scaled_mem(bytecode: &mut Vec<u8>, kind: &X64InstrKind, pack_seed: u64) 
         bytecode.extend_from_slice(&((-*disp as i64) as u64).to_le_bytes());
         emit_sub_three(bytecode, 14, 14, 15, pack_seed);
     }
-    emit_ptr_mem(bytecode, false, *dword, dst_vm, 14);
+    emit_ptr_mem(bytecode, false, *width, *high_byte, dst_vm, 14);
     if *sign_extend32 {
         // movsxd does not write flags. The branchless sext uses and/xor/sub only.
         emit_sign_extend_bits(bytecode, dst_vm, dst_vm, 32, pack_seed);
@@ -3347,12 +3465,12 @@ fn lift_to_vm_bytecode_internal_with_image(
                     }
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
-                        emit_ptr_mem(
+                        emit_load_gpr_mem(
                             &mut bytecode,
-                            false,
-                            !has_rex_w(&instr.bytes),
+                            &instr.bytes,
                             dst.to_vm_reg(),
                             base.to_vm_reg(),
+                            pack_seed,
                         );
                     } else {
                         bytecode.push(active_encode(OpCode::Move));
@@ -3366,12 +3484,12 @@ fn lift_to_vm_bytecode_internal_with_image(
                             bytecode.extend_from_slice(&((-(*offset as i64)) as u64).to_le_bytes());
                             emit_sub_three(&mut bytecode, 14, 14, 15, pack_seed);
                         }
-                        emit_ptr_mem(
+                        emit_load_gpr_mem(
                             &mut bytecode,
-                            false,
-                            !has_rex_w(&instr.bytes),
+                            &instr.bytes,
                             dst.to_vm_reg(),
                             14,
+                            pack_seed,
                         );
                     }
                 }
@@ -3386,10 +3504,9 @@ fn lift_to_vm_bytecode_internal_with_image(
                     bytecode.push(src.to_vm_reg());
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
-                        emit_ptr_mem(
+                        emit_store_gpr_mem(
                             &mut bytecode,
-                            true,
-                            !has_rex_w(&instr.bytes),
+                            &instr.bytes,
                             src.to_vm_reg(),
                             base.to_vm_reg(),
                         );
@@ -3405,13 +3522,7 @@ fn lift_to_vm_bytecode_internal_with_image(
                             bytecode.extend_from_slice(&((-(*offset as i64)) as u64).to_le_bytes());
                             emit_sub_three(&mut bytecode, 14, 14, 15, pack_seed);
                         }
-                        emit_ptr_mem(
-                            &mut bytecode,
-                            true,
-                            !has_rex_w(&instr.bytes),
-                            src.to_vm_reg(),
-                            14,
-                        );
+                        emit_store_gpr_mem(&mut bytecode, &instr.bytes, src.to_vm_reg(), 14);
                     }
                 }
             }
@@ -4101,12 +4212,12 @@ fn lift_to_vm_bytecode_internal_with_main(
                     }
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
-                        emit_ptr_mem(
+                        emit_load_gpr_mem(
                             &mut bytecode,
-                            false,
-                            !has_rex_w(&instr.bytes),
+                            &instr.bytes,
                             dst.to_vm_reg(),
                             base.to_vm_reg(),
+                            pack_seed,
                         );
                     } else {
                         bytecode.push(active_encode(OpCode::Move));
@@ -4120,12 +4231,12 @@ fn lift_to_vm_bytecode_internal_with_main(
                             bytecode.extend_from_slice(&((-(*offset as i64)) as u64).to_le_bytes());
                             emit_sub_three(&mut bytecode, 14, 14, 15, pack_seed);
                         }
-                        emit_ptr_mem(
+                        emit_load_gpr_mem(
                             &mut bytecode,
-                            false,
-                            !has_rex_w(&instr.bytes),
+                            &instr.bytes,
                             dst.to_vm_reg(),
                             14,
+                            pack_seed,
                         );
                     }
                 }
@@ -4140,10 +4251,9 @@ fn lift_to_vm_bytecode_internal_with_main(
                     bytecode.push(src.to_vm_reg());
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
-                        emit_ptr_mem(
+                        emit_store_gpr_mem(
                             &mut bytecode,
-                            true,
-                            !has_rex_w(&instr.bytes),
+                            &instr.bytes,
                             src.to_vm_reg(),
                             base.to_vm_reg(),
                         );
@@ -4159,13 +4269,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                             bytecode.extend_from_slice(&((-(*offset as i64)) as u64).to_le_bytes());
                             emit_sub_three(&mut bytecode, 14, 14, 15, pack_seed);
                         }
-                        emit_ptr_mem(
-                            &mut bytecode,
-                            true,
-                            !has_rex_w(&instr.bytes),
-                            src.to_vm_reg(),
-                            14,
-                        );
+                        emit_store_gpr_mem(&mut bytecode, &instr.bytes, src.to_vm_reg(), 14);
                     }
                 }
             }
@@ -7094,5 +7198,92 @@ mod tests {
             9,
             "scaled movsxd must leave ZF intact"
         );
+    }
+
+    #[test]
+    fn narrow_gpr_mem_and_div_keep_unwritten_bits() {
+        // mov al, [rcx] merges the byte and leaves bits [63:8].
+        let al: &[u8] = &[
+            0xB9, 0x08, 0x00, 0x00, 0x00, // mov ecx, 8
+            0xBA, 0xAB, 0x00, 0x00, 0x00, // mov edx, 0xAB
+            0x88, 0x11, // mov [rcx], dl
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x8A,
+            0x01, // mov al, [rcx]
+            0xC3,
+        ];
+        assert_eq!(
+            run_lifted(al).get_register(0).unwrap(),
+            0x1122_3344_5566_77AB
+        );
+
+        let ah: &[u8] = &[
+            0xB9, 0x08, 0x00, 0x00, 0x00, 0xBA, 0xAB, 0x00, 0x00, 0x00, 0x88,
+            0x11, // mov [rcx], dl
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x8A,
+            0x21, // mov ah, [rcx]
+            0xC3,
+        ];
+        assert_eq!(
+            run_lifted(ah).get_register(0).unwrap(),
+            0x1122_3344_5566_AB88
+        );
+
+        let ax: &[u8] = &[
+            0xB9, 0x08, 0x00, 0x00, 0x00, 0xBA, 0xEF, 0xBE, 0x00, 0x00, // mov edx, 0xBEEF
+            0x66, 0x89, 0x11, // mov [rcx], dx
+            0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x66, 0x8B,
+            0x01, // mov ax, [rcx]
+            0xC3,
+        ];
+        assert_eq!(
+            run_lifted(ax).get_register(0).unwrap(),
+            0x1122_3344_5566_BEEF
+        );
+
+        // Byte store must not clobber the other seven bytes of a qword.
+        let store8: &[u8] = &[
+            0xB9, 0x08, 0x00, 0x00, 0x00, 0x48, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, // mov rax, -1
+            0x48, 0x89, 0x01, // mov [rcx], rax
+            0xB0, 0x10, // mov al, 0x10
+            0x88, 0x01, // mov [rcx], al
+            0x48, 0x8B, 0x01, // mov rax, [rcx]
+            0xC3,
+        ];
+        assert_eq!(
+            run_lifted(store8).get_register(0).unwrap(),
+            0xFFFF_FFFF_FFFF_FF10
+        );
+
+        // ax = 100, high rax = 0x1111, idiv cl → al=14, ah=2.
+        let idiv8: &[u8] = &[
+            0x48, 0xB8, 0x64, 0x00, 0x00, 0x00, 0x11, 0x11, 0x00, 0x00, 0xB1,
+            0x07, // mov cl, 7
+            0xF6, 0xF9, // idiv cl
+            0xC3,
+        ];
+        assert_eq!(run_lifted(idiv8).get_register(0).unwrap(), 0x1111_0000_020E);
+
+        // dx:ax = 1:0, div cx=10. High halves of rax and rdx stay.
+        let div16: &[u8] = &[
+            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22, 0x00, 0x00, 0x48, 0xBA, 0x01, 0x00,
+            0x00, 0x00, 0x33, 0x33, 0x00, 0x00, 0xB9, 0x0A, 0x00, 0x00, 0x00, 0x66, 0xF7,
+            0xF9, // div cx
+            0xC3,
+        ];
+        let vm = run_lifted(div16);
+        assert_eq!(vm.get_register(0).unwrap(), 0x2222_0000_1999);
+        assert_eq!(vm.get_register(2).unwrap(), 0x3333_0000_0006);
+
+        // movsxd rax, dword [rcx] of -1 sign-extends the full register.
+        let movsxd_mem: &[u8] = &[
+            0xB9, 0x08, 0x00, 0x00, 0x00, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x89, 0x01, 0x48, 0x63,
+            0x01, 0xC3,
+        ];
+        assert_eq!(run_lifted(movsxd_mem).get_register(0).unwrap(), u64::MAX);
+
+        // mov rax, imm32 sign-extends.
+        let sext_imm: &[u8] = &[0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
+        assert_eq!(run_lifted(sext_imm).get_register(0).unwrap(), u64::MAX);
     }
 }

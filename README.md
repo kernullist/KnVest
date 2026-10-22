@@ -148,7 +148,7 @@ Logical opcodes with multiple native x64 handler bodies selected deterministical
 ### Lifter & Condition Code Coverage (`L1` – `L6`)
 
 - **Data movement & stack frame**: `mov`, `movsxd`, `movzx`, `cdqe`, `lea`, `push`, `pop`, `[rbp±disp]` local/argument slots
-- **Arithmetic, bitwise, unary & shift**: `add`, `sub`, `imul`, `div`/`idiv` (`rdx:rax`, 32- and 64-bit), `cdq`, `cqo`, `inc`, `dec`, `and`, `or` (synthesized via MBA-compatible `(a ^ b) + (a & b)`), `xor`, `not`, `neg`, `shl`
+- **Arithmetic, bitwise, unary & shift**: `add`, `sub`, `imul`, `div`/`idiv` (8/16/32/64-bit; 8-bit remainder stays in `ah`), `cdq`, `cqo`, `inc`, `dec`, `and`, `or` (synthesized via MBA-compatible `(a ^ b) + (a & b)`), `xor`, `not`, `neg`, `shl`
 - **Comparisons & tests**: `cmp` (64-bit and 32-bit `cmp32` across registers, immediates, and `[rbp±disp]`), `test reg, reg`, `test reg, imm`
 - **Control flow & `jmp_if` condition codes (`1..=12`)**:
   - `1` = `JE`/`JZ`, `2` = `JNE`/`JNZ`
@@ -177,7 +177,7 @@ Eight MinGW-style C samples in `sample/`:
 cargo test
 ```
 
-The test suite (**293 tests**: 287 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L8 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `cdq`, `cqo`, `shr`, `sar`, `div`/`idiv`, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, and multi-RVA trampolines.
+The test suite (**296 tests**: 290 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L8 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `cdq`, `cqo`, `shr`, `sar`, `div`/`idiv`, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & `.knvmap` sidecar roundtrips, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, and multi-RVA trampolines.
 
 ## Project Structure
 

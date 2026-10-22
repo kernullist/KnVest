@@ -1899,6 +1899,18 @@ impl StubEmitter {
         self.jcc_rel32(0x84, "nc_div32");
         self.emit(&[0x83, 0xF8, 0x04]);
         self.jcc_rel32(0x84, "nc_cdq");
+        self.emit(&[0x83, 0xF8, 0x05]);
+        self.jcc_rel32(0x84, "nc_cqo");
+        self.emit(&[0x83, 0xF8, 0x06]);
+        self.jcc_rel32(0x84, "nc_idiv8");
+        self.emit(&[0x83, 0xF8, 0x07]);
+        self.jcc_rel32(0x84, "nc_idiv16");
+        self.emit(&[0x83, 0xF8, 0x08]);
+        self.jcc_rel32(0x84, "nc_div8");
+        self.emit(&[0x83, 0xF8, 0x09]);
+        self.jcc_rel32(0x84, "nc_div16");
+        self.jmp_rel32("nc_done");
+        self.label("nc_cqo");
         // cqo. Writes only VM r2; rax in the frame stays as it was.
         self.emit(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
         self.emit(&[0x48, 0x99]); // cqo
@@ -1934,6 +1946,44 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
         self.jmp_rel32("nc_done");
 
+        // 8/16-bit div keeps bits above the written partial register.
+        self.label("nc_idiv8");
+        self.emit(&[0x4C, 0x8B, 0x55, 0x80]); // mov r10, [rbp-0x80]
+        self.emit(&[0x41, 0x8B, 0xC2]); // mov eax, r10d
+        self.emit(&[0x41, 0xF6, 0xFB]); // idiv r11b
+        self.emit(&[0x66, 0x41, 0x89, 0xC2]); // mov r10w, ax
+        self.emit(&[0x4C, 0x89, 0x55, 0x80]); // mov [rbp-0x80], r10
+        self.jmp_rel32("nc_done");
+        self.label("nc_div8");
+        self.emit(&[0x4C, 0x8B, 0x55, 0x80]);
+        self.emit(&[0x41, 0x8B, 0xC2]);
+        self.emit(&[0x41, 0xF6, 0xF3]); // div r11b
+        self.emit(&[0x66, 0x41, 0x89, 0xC2]);
+        self.emit(&[0x4C, 0x89, 0x55, 0x80]);
+        self.jmp_rel32("nc_done");
+        self.label("nc_idiv16");
+        self.emit(&[0x4C, 0x8B, 0x55, 0x80]); // mov r10, [rbp-0x80]
+        self.emit(&[0x4C, 0x8B, 0x4D, 0x90]); // mov r9, [rbp-0x70]
+        self.emit(&[0x41, 0x8B, 0xC2]); // mov eax, r10d
+        self.emit(&[0x41, 0x8B, 0xD1]); // mov edx, r9d
+        self.emit(&[0x66, 0x41, 0xF7, 0xFB]); // idiv r11w
+        self.emit(&[0x66, 0x41, 0x89, 0xC2]); // mov r10w, ax
+        self.emit(&[0x66, 0x41, 0x89, 0xD1]); // mov r9w, dx
+        self.emit(&[0x4C, 0x89, 0x55, 0x80]);
+        self.emit(&[0x4C, 0x89, 0x4D, 0x90]);
+        self.jmp_rel32("nc_done");
+        self.label("nc_div16");
+        self.emit(&[0x4C, 0x8B, 0x55, 0x80]);
+        self.emit(&[0x4C, 0x8B, 0x4D, 0x90]);
+        self.emit(&[0x41, 0x8B, 0xC2]);
+        self.emit(&[0x41, 0x8B, 0xD1]);
+        self.emit(&[0x66, 0x41, 0xF7, 0xF3]); // div r11w
+        self.emit(&[0x66, 0x41, 0x89, 0xC2]);
+        self.emit(&[0x66, 0x41, 0x89, 0xD1]);
+        self.emit(&[0x4C, 0x89, 0x55, 0x80]);
+        self.emit(&[0x4C, 0x89, 0x4D, 0x90]);
+        self.jmp_rel32("nc_done");
+
         self.label("nc_mem");
         // r10 = func id, r11 = address, r8 = data reg, r9 = op
         self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
@@ -1943,6 +1993,7 @@ impl StubEmitter {
         self.emit(&[0xC1, 0xE8, 0x08]); // shr eax, 8
         self.emit(&[0x44, 0x0F, 0xB6, 0xC0]); // movzx r8d, al
         self.emit(&[0x4A, 0x8B, 0x44, 0xC5, 0x80]); // mov rax, [rbp+r8*8-0x80]
+        self.emit(&[0x49, 0x89, 0xC1]); // mov r9, rax — old value for partial merges
         self.emit(&[0x44, 0x89, 0xD1]); // mov ecx, r10d
         self.emit(&[0xC1, 0xE9, 0x10]); // shr ecx, 16
         self.emit(&[0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00]); // and ecx, 0xff
@@ -1952,8 +2003,46 @@ impl StubEmitter {
         self.jcc_rel32(0x84, "nc_store64");
         self.emit(&[0x83, 0xF9, 0x02]);
         self.jcc_rel32(0x84, "nc_load32");
+        self.emit(&[0x83, 0xF9, 0x03]);
+        self.jcc_rel32(0x84, "nc_store32");
+        self.emit(&[0x83, 0xF9, 0x04]);
+        self.jcc_rel32(0x84, "nc_load8");
+        self.emit(&[0x83, 0xF9, 0x05]);
+        self.jcc_rel32(0x84, "nc_store8");
+        self.emit(&[0x83, 0xF9, 0x06]);
+        self.jcc_rel32(0x84, "nc_load16");
+        self.emit(&[0x83, 0xF9, 0x07]);
+        self.jcc_rel32(0x84, "nc_store16");
+        self.emit(&[0x83, 0xF9, 0x08]);
+        self.jcc_rel32(0x84, "nc_load8hi");
+        self.emit(&[0x41, 0x88, 0x23]); // mov [r11], ah
+        self.jmp_rel32("nc_done");
+        self.label("nc_store32");
         self.emit(&[0x41, 0x89, 0x03]); // mov [r11], eax
         self.jmp_rel32("nc_done");
+        self.label("nc_load8");
+        self.emit(&[0x41, 0x0F, 0xB6, 0x03]); // movzx eax, byte [r11]
+        self.emit(&[0x41, 0x88, 0xC1]); // mov r9b, al
+        self.emit(&[0x4C, 0x89, 0xC8]); // mov rax, r9
+        self.jmp_rel32("nc_mem_writeback");
+        self.label("nc_store8");
+        self.emit(&[0x41, 0x88, 0x03]); // mov [r11], al
+        self.jmp_rel32("nc_done");
+        self.label("nc_load16");
+        self.emit(&[0x41, 0x0F, 0xB7, 0x03]); // movzx eax, word [r11]
+        self.emit(&[0x66, 0x41, 0x89, 0xC1]); // mov r9w, ax
+        self.emit(&[0x4C, 0x89, 0xC8]);
+        self.jmp_rel32("nc_mem_writeback");
+        self.label("nc_store16");
+        self.emit(&[0x66, 0x41, 0x89, 0x03]); // mov [r11], ax
+        self.jmp_rel32("nc_done");
+        self.label("nc_load8hi");
+        self.emit(&[0x41, 0x0F, 0xB6, 0x0B]); // movzx ecx, byte [r11]
+        self.emit(&[0xC1, 0xE1, 0x08]); // shl ecx, 8
+        self.emit(&[0x66, 0x41, 0x81, 0xE1, 0xFF, 0x00]); // and r9w, 0x00ff
+        self.emit(&[0x66, 0x41, 0x09, 0xC9]); // or r9w, cx
+        self.emit(&[0x4C, 0x89, 0xC8]);
+        self.jmp_rel32("nc_mem_writeback");
         self.label("nc_load64");
         self.emit(&[0x49, 0x8B, 0x03]); // mov rax, [r11]
         self.jmp_rel32("nc_mem_writeback");
@@ -4896,5 +4985,21 @@ invoke_once:
         assert!(stub.windows(3).any(|w| w == [0x49, 0xF7, 0xFB]), "idiv r11");
         assert!(stub.windows(3).any(|w| w == [0x41, 0xF7, 0xF3]), "div r11d");
         assert!(stub.windows(3).any(|w| w == [0x49, 0xF7, 0xF3]), "div r11");
+        assert!(
+            stub.windows(3).any(|w| w == [0x41, 0xF6, 0xFB]),
+            "idiv r11b"
+        );
+        assert!(
+            stub.windows(4).any(|w| w == [0x66, 0x41, 0xF7, 0xF3]),
+            "div r11w"
+        );
+        assert!(
+            stub.windows(4).any(|w| w == [0x41, 0x0F, 0xB6, 0x03]),
+            "movzx eax, byte [r11]"
+        );
+        assert!(
+            stub.windows(3).any(|w| w == [0x41, 0x88, 0x23]),
+            "mov [r11], ah"
+        );
     }
 }
