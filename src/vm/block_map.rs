@@ -166,16 +166,33 @@ impl BlockMapPlan {
         self.entries.iter().find(|e| e.bb_id == bb_id)
     }
 
+    /// Wire map for a transition that is actually in this plan.
+    /// An empty plan still synthesizes the legacy per-id map. A populated plan
+    /// returns `None` for an unknown id instead of inventing a wire alphabet
+    /// the reference VM would reject.
+    pub fn map_for_tx_or_legacy(&self, tx_id: u16, base: &OpcodeMap) -> Option<OpcodeMap> {
+        if let Some(entry) = self.map_for_tx(tx_id) {
+            return Some(OpcodeMap::from_parts(base.seed(), entry.wire));
+        }
+        if self.entries.is_empty() {
+            return Some(Self::block_opcode_map(base.seed(), tx_id as usize));
+        }
+        None
+    }
+
     pub fn map_for_tx_or_base(&self, tx_id: u16, base: &OpcodeMap) -> OpcodeMap {
-        self.map_for_tx(tx_id)
-            .map(|e| OpcodeMap::from_parts(base.seed(), e.wire))
-            .unwrap_or_else(|| Self::block_opcode_map(base.seed(), tx_id as usize))
+        self.map_for_tx_or_legacy(tx_id, base)
+            .unwrap_or_else(|| base.clone())
     }
 
     pub fn map_for_bb_or_base(&self, bb_id: u16, base: &OpcodeMap) -> OpcodeMap {
-        self.map_for_bb(bb_id)
-            .map(|e| OpcodeMap::from_parts(base.seed(), e.wire))
-            .unwrap_or_else(|| Self::block_opcode_map(base.seed(), bb_id as usize))
+        if let Some(entry) = self.map_for_bb(bb_id) {
+            return OpcodeMap::from_parts(base.seed(), entry.wire);
+        }
+        if self.entries.is_empty() {
+            return Self::block_opcode_map(base.seed(), bb_id as usize);
+        }
+        base.clone()
     }
 
     pub fn wire_map_hash(entry: &BlockMapEntry) -> u64 {

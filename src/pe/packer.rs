@@ -1512,6 +1512,30 @@ pub const KNVM_VERSION: u8 = 1;
 /// L7.1: Out-of-band sidecar metadata map (`.knvmap` / `KNVM`) that allows `knvest ir`
 /// and offline tooling to decode stripped packed binaries (`--strip-meta`) without any
 /// plaintext `KNV4`/`KNV5`/`KNV6`/`KNV7`/`VMBC` headers inside `.knvest`.
+/// One function image recorded by a `.knvmap`. Multi-RVA packs store every image.
+#[derive(Debug, Clone)]
+pub struct SidecarFunction {
+    pub pack_meta: PackMetadata,
+    pub partial_plan: PartialVirtPlan,
+    pub block_map_plan: BlockMapPlan,
+    pub layout_plan: BytecodeLayout,
+    pub vmbc_offset: u32,
+    pub bytecode_len: u32,
+}
+
+impl SidecarFunction {
+    pub fn bytecode_in<'a>(&self, section: &'a [u8]) -> PEResult<&'a [u8]> {
+        let start = (self.vmbc_offset as usize).saturating_add(4);
+        let end = start.saturating_add(self.bytecode_len as usize);
+        if end > section.len() {
+            return Err(PEError::InvalidPE(
+                "Sidecar bytecode bounds exceed .knvest section".to_string(),
+            ));
+        }
+        Ok(&section[start..end])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SidecarMap {
     pub pack_meta: PackMetadata,
@@ -1520,6 +1544,8 @@ pub struct SidecarMap {
     pub layout_plan: BytecodeLayout,
     pub vmbc_offset: u32,
     pub bytecode_len: u32,
+    /// Every function image. Index 0 mirrors the primary fields above.
+    pub functions: Vec<SidecarFunction>,
 }
 
 impl SidecarMap {
@@ -1557,13 +1583,28 @@ impl SidecarMap {
             .last()
             .map(|last| last.start + last.raw_len)
             .unwrap_or(bytecode.len());
+        let primary = SidecarFunction {
+            pack_meta: pack_meta.clone(),
+            partial_plan: partial_plan.clone(),
+            block_map_plan: block_map_plan.clone(),
+            layout_plan: layout_plan.clone(),
+            vmbc_offset,
+            bytecode_len: exact_bc_len.max(bytecode.len()) as u32,
+        };
+        let mut functions = vec![primary];
+        for extra in sidecar_functions_from_section(section_data) {
+            if extra.vmbc_offset != vmbc_offset {
+                functions.push(extra);
+            }
+        }
         Ok(Self {
             pack_meta,
             partial_plan,
             block_map_plan,
             layout_plan,
             vmbc_offset,
-            bytecode_len: exact_bc_len.max(bytecode.len()) as u32,
+            bytecode_len: functions[0].bytecode_len,
+            functions,
         })
     }
 
@@ -1584,6 +1625,25 @@ impl SidecarMap {
             out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
             out.extend_from_slice(blob);
         }
+        if self.functions.len() > 1 {
+            let extra = (self.functions.len() - 1) as u32;
+            out.extend_from_slice(&extra.to_le_bytes());
+            for func in &self.functions[1..] {
+                out.extend_from_slice(&func.vmbc_offset.to_le_bytes());
+                out.extend_from_slice(&func.bytecode_len.to_le_bytes());
+                let blobs = [
+                    func.pack_meta.to_embedded_bytes(),
+                    func.partial_plan.to_embedded_bytes(),
+                    func.block_map_plan
+                        .to_embedded_bytes_nested(func.pack_meta.nested_vm),
+                    func.layout_plan.to_embedded_bytes(),
+                ];
+                for blob in &blobs {
+                    out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+                    out.extend_from_slice(blob);
+                }
+            }
+        }
         out
     }
 
@@ -1594,23 +1654,10 @@ impl SidecarMap {
         let vmbc_offset = u32::from_le_bytes(data[5..9].try_into().unwrap());
         let bytecode_len = u32::from_le_bytes(data[9..13].try_into().unwrap());
         let mut cursor = 13usize;
-        let mut read_blob = || -> PEResult<&[u8]> {
-            if cursor + 4 > data.len() {
-                return Err(PEError::InvalidPE("Truncated KNVM sidecar".to_string()));
-            }
-            let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-            if cursor + len > data.len() {
-                return Err(PEError::InvalidPE("Truncated KNVM sidecar blob".to_string()));
-            }
-            let slice = &data[cursor..cursor + len];
-            cursor += len;
-            Ok(slice)
-        };
-        let knv4 = read_blob()?;
-        let knv5 = read_blob()?;
-        let knv6 = read_blob()?;
-        let knv7 = read_blob()?;
+        let knv4 = read_knvm_blob(data, &mut cursor)?;
+        let knv5 = read_knvm_blob(data, &mut cursor)?;
+        let knv6 = read_knvm_blob(data, &mut cursor)?;
+        let knv7 = read_knvm_blob(data, &mut cursor)?;
 
         let pack_meta = PackMetadata::from_embedded(knv4)
             .ok_or_else(|| PEError::InvalidPE("Corrupt KNV4 in sidecar".to_string()))?;
@@ -1621,6 +1668,54 @@ impl SidecarMap {
         let layout_plan = BytecodeLayout::from_embedded(knv7)
             .ok_or_else(|| PEError::InvalidPE("Corrupt KNV7 in sidecar".to_string()))?;
 
+        let primary = SidecarFunction {
+            pack_meta: pack_meta.clone(),
+            partial_plan: partial_plan.clone(),
+            block_map_plan: block_map_plan.clone(),
+            layout_plan: layout_plan.clone(),
+            vmbc_offset,
+            bytecode_len,
+        };
+        let mut functions = vec![primary];
+        if data.len() - cursor >= 4 {
+            let extra = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if extra > 64 {
+                return Err(PEError::InvalidPE(
+                    "KNVM sidecar lists too many functions".to_string(),
+                ));
+            }
+            for _ in 0..extra {
+                if cursor + 8 > data.len() {
+                    return Err(PEError::InvalidPE(
+                        "Truncated KNVM extra function".to_string(),
+                    ));
+                }
+                let fn_vmbc = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+                let fn_len = u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap());
+                cursor += 8;
+                let knv4 = read_knvm_blob(data, &mut cursor)?;
+                let knv5 = read_knvm_blob(data, &mut cursor)?;
+                let knv6 = read_knvm_blob(data, &mut cursor)?;
+                let knv7 = read_knvm_blob(data, &mut cursor)?;
+                functions.push(SidecarFunction {
+                    pack_meta: PackMetadata::from_embedded(knv4).ok_or_else(|| {
+                        PEError::InvalidPE("Corrupt KNV4 in sidecar function".to_string())
+                    })?,
+                    partial_plan: PartialVirtPlan::from_embedded(knv5).ok_or_else(|| {
+                        PEError::InvalidPE("Corrupt KNV5 in sidecar function".to_string())
+                    })?,
+                    block_map_plan: BlockMapPlan::from_embedded(knv6).ok_or_else(|| {
+                        PEError::InvalidPE("Corrupt KNV6 in sidecar function".to_string())
+                    })?,
+                    layout_plan: BytecodeLayout::from_embedded(knv7).ok_or_else(|| {
+                        PEError::InvalidPE("Corrupt KNV7 in sidecar function".to_string())
+                    })?,
+                    vmbc_offset: fn_vmbc,
+                    bytecode_len: fn_len,
+                });
+            }
+        }
         Ok(Self {
             pack_meta,
             partial_plan,
@@ -1628,6 +1723,7 @@ impl SidecarMap {
             layout_plan,
             vmbc_offset,
             bytecode_len,
+            functions,
         })
     }
 
@@ -1640,6 +1736,108 @@ impl SidecarMap {
             .map_err(|e| PEError::InvalidPE(format!("Failed to read sidecar: {e}")))?;
         Self::from_bytes(&bytes)
     }
+}
+
+fn read_knvm_blob<'a>(data: &'a [u8], cursor: &mut usize) -> PEResult<&'a [u8]> {
+    if *cursor + 4 > data.len() {
+        return Err(PEError::InvalidPE("Truncated KNVM sidecar".to_string()));
+    }
+    let len = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    *cursor += 4;
+    if *cursor + len > data.len() {
+        return Err(PEError::InvalidPE("Truncated KNVM sidecar blob".to_string()));
+    }
+    let slice = &data[*cursor..*cursor + len];
+    *cursor += len;
+    Ok(slice)
+}
+
+fn find_magic_parse<T>(data: &[u8], magic: &[u8], parse: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
+    for i in 0..data.len().saturating_sub(magic.len()) {
+        if &data[i..i + magic.len()] == magic {
+            if let Some(value) = parse(&data[i..]) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Every `VMBC` image in a `.knvest` section, paired with the KNV headers that
+/// precede it and the bytecode that follows it up to the next image.
+pub fn sidecar_functions_from_section(section: &[u8]) -> Vec<SidecarFunction> {
+    let mut vmbcs = Vec::new();
+    let mut knv4s = Vec::new();
+    for i in 0..section.len().saturating_sub(4) {
+        if &section[i..i + 4] == b"VMBC" {
+            vmbcs.push(i);
+        }
+        if &section[i..i + 4] == KNV4_MAGIC && PackMetadata::from_embedded(&section[i..]).is_some()
+        {
+            knv4s.push(i);
+        }
+    }
+    let mut out = Vec::new();
+    for &vmbc in &vmbcs {
+        let meta_start = knv4s
+            .iter()
+            .copied()
+            .filter(|off| *off < vmbc)
+            .max()
+            .unwrap_or(0);
+        let meta = &section[meta_start..vmbc];
+        let Some(pack_meta) = find_magic_parse(meta, KNV4_MAGIC, PackMetadata::from_embedded)
+        else {
+            continue;
+        };
+        let partial_plan =
+            find_magic_parse(meta, KNV5_MAGIC, PartialVirtPlan::from_embedded).unwrap_or_default();
+        let block_map_plan =
+            find_magic_parse(meta, KNV6_MAGIC, BlockMapPlan::from_embedded).unwrap_or_default();
+        let layout_plan = find_magic_parse(meta, KNV7_MAGIC, BytecodeLayout::from_embedded)
+            .unwrap_or_else(BytecodeLayout::identity);
+        let bc_start = vmbc + 4;
+        let bc_limit = knv4s
+            .iter()
+            .copied()
+            .find(|off| *off > vmbc)
+            .unwrap_or(section.len())
+            .min(section.len());
+        if bc_start > bc_limit || bc_start > section.len() {
+            continue;
+        }
+        let window = &section[bc_start..bc_limit];
+        let rolling = if pack_meta.rolling_cipher {
+            Some(pack_meta.seed())
+        } else {
+            None
+        };
+        let insns = crate::vm::layout::enumerate_raw_instructions_masked(
+            window,
+            &pack_meta.opcode_map,
+            &block_map_plan,
+            &layout_plan,
+            pack_meta.dispatch_mode,
+            pack_meta.isa_mode,
+            rolling,
+        );
+        let bytecode_len = insns
+            .last()
+            .map(|last| last.start + last.raw_len)
+            .unwrap_or(0) as u32;
+        if bytecode_len == 0 {
+            continue;
+        }
+        out.push(SidecarFunction {
+            pack_meta,
+            partial_plan,
+            block_map_plan,
+            layout_plan,
+            vmbc_offset: vmbc as u32,
+            bytecode_len,
+        });
+    }
+    out
 }
 
 /// L7.1: Scrub embedded static metadata headers (`KNV4`, `KNV5`, `KNV6` magic/key, `KNV7`, `VMBC`)
@@ -2023,7 +2221,10 @@ mod tests {
                     + layout.operands_offset(OpCode::SetBlockMap, true);
                 if meta_off + 2 <= bc.len() {
                     let tx_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
-                    current_map = plan.map_for_tx_or_base(tx_id, base_map);
+                    let Some(next_map) = plan.map_for_tx_or_legacy(tx_id, base_map) else {
+                        break;
+                    };
+                    current_map = next_map;
                     offset += layout.table_meta_len();
                     continue;
                 }
@@ -2062,7 +2263,10 @@ mod tests {
                     + layout.operands_offset(OpCode::SetBlockMap, true);
                 if meta_off + 2 <= bc.len() {
                     let tx_id = u16::from_le_bytes([bc[meta_off], bc[meta_off + 1]]);
-                    current_map = plan.map_for_tx_or_base(tx_id, base_map);
+                    let Some(next_map) = plan.map_for_tx_or_legacy(tx_id, base_map) else {
+                        break;
+                    };
+                    current_map = next_map;
                     offset += layout.table_meta_len();
                     continue;
                 }

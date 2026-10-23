@@ -447,7 +447,23 @@ fn l8_multi_rva_installs_trampolines_and_return_to_caller() {
     let ret_seq = [0x0Fu8, 0xB6, 0x0E, 0x48, 0x8B, 0x44, 0xCD, 0x80, 0xC9, 0xC3];
     assert!(blob.windows(ret_seq.len()).any(|w| w == ret_seq));
 
-    scrub_embedded_metadata_in_pe(&mut pe, packed.seed).unwrap();
+    let sidecar = scrub_embedded_metadata_in_pe(&mut pe, packed.seed).unwrap();
+    assert_eq!(
+        sidecar.functions.len(),
+        2,
+        "sidecar keeps every function image"
+    );
+    let round = super::packer::SidecarMap::from_bytes(&sidecar.to_bytes()).unwrap();
+    assert_eq!(round.functions.len(), 2);
+    assert!(round.functions[1].vmbc_offset > round.functions[0].vmbc_offset);
+    let section = pe.get_section(".knvest").unwrap();
+    let start = section.pointer_to_raw_data as usize;
+    let end = start + section.size_of_raw_data as usize;
+    let blob_for_bc = &pe.data[start..end];
+    let bc0 = round.functions[0].bytecode_in(blob_for_bc).unwrap();
+    let bc1 = round.functions[1].bytecode_in(blob_for_bc).unwrap();
+    assert!(!bc0.is_empty() && !bc1.is_empty());
+    assert_ne!(bc0, bc1);
     let section = pe.get_section(".knvest").unwrap();
     let start = section.pointer_to_raw_data as usize;
     let end = start + section.size_of_raw_data as usize;
