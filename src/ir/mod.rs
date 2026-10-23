@@ -135,7 +135,17 @@ impl Instruction {
                     let tx_id = u16::from_le_bytes([bytecode[offset], bytecode[offset + 1]]);
                     offset += META_OPERAND_LEN;
                     if let Some(plan) = block_plan {
-                        current_map = plan.map_for_tx_or_base(tx_id, base_map);
+                        match plan.map_for_tx_or_legacy(tx_id, base_map) {
+                            Some(map) => current_map = map,
+                            None => {
+                                instructions.push(Instruction {
+                                    offset: start_offset,
+                                    opcode: OpCode::SetBlockMap,
+                                    operands: vec![Operand::Immediate(u64::from(tx_id))],
+                                });
+                                break;
+                            }
+                        }
                     }
                     let mut operands = vec![Operand::Immediate(u64::from(tx_id))];
                     if let Some(plan) = block_plan {
@@ -891,5 +901,32 @@ mod tests {
         ];
         let out = Instruction::pretty_print_with_mba(&insns, 1);
         assert!(out.contains("(r1^r2)+2*(r1&r2)"));
+    }
+
+    #[test]
+    fn unknown_transition_does_not_invent_a_wire_map() {
+        use crate::vm::block_map::{BlockMapPlan, META_WIRE_BYTE};
+        use crate::vm::{BytecodeLayout, DispatchMode, OpCode};
+        let seed = 0xABCDu64;
+        let base = OpcodeMap::from_seed(seed);
+        let mut plan = BlockMapPlan::default();
+        plan.record_block(seed, 0);
+        let invented = BlockMapPlan::block_opcode_map(seed, 99);
+        let mut bc = vec![META_WIRE_BYTE, 99, 0];
+        bc.push(invented.encode(OpCode::LoadImm));
+        bc.push(0);
+        bc.extend_from_slice(&7u64.to_le_bytes());
+        let ins = Instruction::disassemble_with_layout(
+            &bc,
+            &base,
+            Some(&plan),
+            DispatchMode::Table,
+            &BytecodeLayout::identity(),
+        );
+        assert!(ins.iter().any(|i| i.opcode == OpCode::SetBlockMap));
+        assert!(
+            ins.iter().all(|i| i.opcode != OpCode::LoadImm),
+            "unknown tx must not decode later bytes under a synthetic map"
+        );
     }
 }

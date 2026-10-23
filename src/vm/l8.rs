@@ -459,10 +459,12 @@ fn f64_binop(dst: u64, src: u64, op: fn(f64, f64) -> f64) -> u64 {
     op(a, b).to_bits()
 }
 
-/// Flags matching `ucomiss`/`ucomisd`: ZF bit 6, CF bit 0. SF and OF stay clear.
+/// Flags matching `ucomiss`/`ucomisd` and `comiss`/`comisd`.
+/// ZF is bit 6, PF is bit 2, CF is bit 0. Unordered sets ZF, PF, and CF.
+/// SF and OF stay clear.
 pub fn ucomi_flags(dest_nan_or_less: bool, equal: bool, unordered: bool) -> u64 {
     if unordered {
-        return 0x40 | 0x01;
+        return 0x40 | 0x04 | 0x01;
     }
     if equal {
         return 0x40;
@@ -471,6 +473,45 @@ pub fn ucomi_flags(dest_nan_or_less: bool, equal: bool, unordered: bool) -> u64 
         return 0x01;
     }
     0
+}
+
+fn is_snan_f32(bits: u32) -> bool {
+    let exp = (bits >> 23) & 0xFF;
+    let frac = bits & 0x7F_FFFF;
+    exp == 0xFF && frac != 0 && (frac & 0x40_0000) == 0
+}
+
+fn is_snan_f64(bits: u64) -> bool {
+    let exp = (bits >> 52) & 0x7FF;
+    let frac = bits & ((1u64 << 52) - 1);
+    exp == 0x7FF && frac != 0 && (frac & (1u64 << 51)) == 0
+}
+
+/// Intel invalid-operation signaling for scalar compares.
+/// `comiss`/`comisd` signal on any NaN. `ucomiss`/`ucomisd` signal only on SNaN.
+/// Quiet NaNs do not signal for the unordered compares.
+pub fn compare_sets_invalid(subop: u8, dest: u64, src: u64) -> bool {
+    match subop {
+        XMM_COMISS | XMM_UCOMISS => {
+            let d = dest as u32;
+            let s = src as u32;
+            let nan = |b: u32| f32::from_bits(b).is_nan();
+            if subop == XMM_COMISS {
+                nan(d) || nan(s)
+            } else {
+                is_snan_f32(d) || is_snan_f32(s)
+            }
+        }
+        XMM_COMISD | XMM_UCOMISD => {
+            let nan = |b: u64| f64::from_bits(b).is_nan();
+            if subop == XMM_COMISD {
+                nan(dest) || nan(src)
+            } else {
+                is_snan_f64(dest) || is_snan_f64(src)
+            }
+        }
+        _ => false,
+    }
 }
 
 pub fn compare_f64_flags(dest: f64, src: f64) -> u64 {
@@ -793,5 +834,39 @@ mod tests {
             }
             DivWrite::Rax(_) => panic!("div r16 writes ax and dx"),
         }
+    }
+
+    #[test]
+    fn comiss_signals_qnan_and_unordered_sets_pf() {
+        let qnan = f32::NAN.to_bits() as u64;
+        let snan = 0x7F80_0001u64;
+        let one = 1.0f32.to_bits() as u64;
+        assert!(compare_sets_invalid(XMM_COMISS, qnan, one));
+        assert!(!compare_sets_invalid(XMM_UCOMISS, qnan, one));
+        assert!(compare_sets_invalid(XMM_COMISS, snan, one));
+        assert!(compare_sets_invalid(XMM_UCOMISS, snan, one));
+        assert!(!compare_sets_invalid(
+            XMM_UCOMISD,
+            1.0f64.to_bits(),
+            2.0f64.to_bits()
+        ));
+        let snan64 = 0x7FF0_0000_0000_0001u64;
+        assert!(compare_sets_invalid(XMM_UCOMISD, snan64, 1.0f64.to_bits()));
+        assert!(compare_sets_invalid(XMM_COMISD, snan64, 1.0f64.to_bits()));
+
+        let mut xmm = [0u64; XMM_SLOT_COUNT];
+        let mut gp = [0u64; 4];
+        xmm[0] = qnan;
+        xmm[1] = one;
+        let flags = exec_xmm(XMM_UCOMISS, 0, 1, &mut xmm, &mut gp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(flags & 0x45, 0x45, "unordered compare sets CF, PF, and ZF");
+        xmm[0] = one;
+        xmm[1] = one;
+        let flags = exec_xmm(XMM_COMISS, 0, 1, &mut xmm, &mut gp)
+            .unwrap()
+            .unwrap();
+        assert_eq!(flags & 0x04, 0, "ordered equal leaves PF clear");
     }
 }

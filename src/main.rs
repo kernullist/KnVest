@@ -192,8 +192,52 @@ fn handle_ir_command(
     let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
     
     println!("{}", output);
-    
+
+    if let Some(section) = knvest_bytes(&pe) {
+        let extras = if let Some(sc) = &loaded_sidecar {
+            sc.functions.clone()
+        } else {
+            packer::sidecar_functions_from_section(section)
+        };
+        for (index, func) in extras.iter().enumerate().skip(1) {
+            println!(
+                "--- function {index} vmbc={:#x} bytecode_len={} ---",
+                func.vmbc_offset, func.bytecode_len
+            );
+            print!(
+                "{}",
+                func.block_map_plan
+                    .format_ir_header(&func.pack_meta.opcode_map, func.pack_meta.dispatch_mode)
+            );
+            let Ok(bc) = func.bytecode_in(section) else {
+                println!("(bytecode bounds exceed .knvest)");
+                continue;
+            };
+            let fn_insns = ir::Instruction::disassemble_with_rolling(
+                bc,
+                &func.pack_meta.opcode_map,
+                Some(&func.block_map_plan),
+                func.pack_meta.dispatch_mode,
+                &func.layout_plan,
+                func.pack_meta.isa_mode,
+                func.pack_meta.rolling_cipher,
+                func.pack_meta.seed(),
+            );
+            println!(
+                "{}",
+                ir::Instruction::pretty_print_with_mba(&fn_insns, func.pack_meta.mba_level)
+            );
+        }
+    }
+
     Ok(())
+}
+
+fn knvest_bytes(pe: &PEFile) -> Option<&[u8]> {
+    let section = pe.get_section(".knvest").ok()?;
+    let start = section.pointer_to_raw_data as usize;
+    let end = start + section.size_of_raw_data as usize;
+    pe.data.get(start..end.min(pe.data.len()))
 }
 
 fn handle_pack_command(

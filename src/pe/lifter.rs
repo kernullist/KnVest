@@ -20,7 +20,7 @@ use crate::vm::{
     active_decode, active_encode, active_opcode_map_or, clear_active_map, emit_block_map_refresh,
     set_active_map, BlockMapPlan, IsaMode, OpcodeMap,
 };
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
 use std::cell::RefCell;
 use std::collections::HashSet;
 
@@ -244,9 +244,16 @@ pub enum X64InstrKind {
         reg: X64Reg,
         shift: u8,
     },
-    /// `div`/`idiv r/m`. `bits` is 32 or 64. Dividend is `rdx:rax`.
+    /// `div`/`idiv r/m`. Dividend is `rdx:rax`. `bits` is 8, 16, 32, or 64.
     IdivReg {
         reg: X64Reg,
+        signed: bool,
+        bits: u8,
+    },
+    /// `div`/`idiv` with a `[base+disp]` memory divisor.
+    IdivMem {
+        base: X64Reg,
+        offset: i32,
         signed: bool,
         bits: u8,
     },
@@ -1227,17 +1234,43 @@ fn classify_sar(instr: &Instruction) -> X64InstrKind {
     X64InstrKind::Unknown
 }
 
+fn div_operand_bits(instr: &Instruction) -> Option<u8> {
+    let from_mem = match instr.memory_size() {
+        MemorySize::UInt8 | MemorySize::Int8 => Some(8),
+        MemorySize::UInt16 | MemorySize::Int16 => Some(16),
+        MemorySize::UInt32 | MemorySize::Int32 => Some(32),
+        MemorySize::UInt64 | MemorySize::Int64 => Some(64),
+        _ => None,
+    };
+    if instr.op0_kind() == OpKind::Memory {
+        return from_mem;
+    }
+    match instr.op0_register().size() {
+        1 => Some(8),
+        2 => Some(16),
+        4 => Some(32),
+        8 => Some(64),
+        _ => from_mem,
+    }
+}
+
 fn classify_div(instr: &Instruction, signed: bool) -> X64InstrKind {
+    let Some(bits) = div_operand_bits(instr) else {
+        return X64InstrKind::Unknown;
+    };
     if instr.op0_kind() == OpKind::Register {
         if let Some(reg) = iced_reg_to_x64(instr.op0_register()) {
-            let bits = match instr.op0_register().size() {
-                1 => 8,
-                2 => 16,
-                4 => 32,
-                8 => 64,
-                _ => return X64InstrKind::Unknown,
-            };
             return X64InstrKind::IdivReg { reg, signed, bits };
+        }
+    }
+    if instr.op0_kind() == OpKind::Memory && instr.memory_index() == Register::None {
+        if let Some((base, offset)) = mem_base_offset(instr) {
+            return X64InstrKind::IdivMem {
+                base,
+                offset,
+                signed,
+                bits,
+            };
         }
     }
     X64InstrKind::Unknown
@@ -1650,50 +1683,76 @@ pub fn alloc_stack_spill_reg_seeded(next_stack_reg: &mut u8, seed: u64) -> u8 {
     }
 }
 
-/// True when the encoding is a REX prefix with REX.W set (`0x48..=0x4F`).
-fn has_rex_w(bytes: &[u8]) -> bool {
-    matches!(bytes.first().copied(), Some(b) if (b & 0xF8) == 0x48)
+struct PrefixScan {
+    index: usize,
+    op16: bool,
+    rex: bool,
+    rex_w: bool,
 }
 
-fn opcode_matches(bytes: &[u8], op: u8) -> bool {
-    match bytes.first().copied() {
-        Some(b) if (0x40..=0x4F).contains(&b) => bytes.get(1).copied() == Some(op),
-        Some(b) => b == op,
-        None => false,
+/// Skip legacy prefixes and one REX byte. `66` before REX.W is still REX.W.
+fn scan_prefixes(bytes: &[u8]) -> PrefixScan {
+    let mut i = 0;
+    let mut op16 = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x66 => {
+                op16 = true;
+                i += 1;
+            }
+            0xF0 | 0xF2 | 0xF3 | 0x67 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => i += 1,
+            _ => break,
+        }
+    }
+    let mut rex = false;
+    let mut rex_w = false;
+    if i < bytes.len() && (0x40..=0x4F).contains(&bytes[i]) {
+        rex = true;
+        rex_w = bytes[i] & 0x08 != 0;
+        i += 1;
+    }
+    PrefixScan {
+        index: i,
+        op16,
+        rex,
+        rex_w,
     }
 }
 
+/// True when a REX.W prefix is present, including after a legacy `66`/`F2`/`F3`.
+fn has_rex_w(bytes: &[u8]) -> bool {
+    scan_prefixes(bytes).rex_w
+}
+
+fn opcode_matches(bytes: &[u8], op: u8) -> bool {
+    let scan = scan_prefixes(bytes);
+    bytes.get(scan.index).copied() == Some(op)
+}
+
 fn opcode_matches_two(bytes: &[u8], b1: u8, b2: u8) -> bool {
-    let rest = match bytes.first().copied() {
-        Some(b) if (0x40..=0x4F).contains(&b) => bytes.get(1..),
-        _ => Some(bytes),
-    };
-    rest.filter(|r| r.len() >= 2 && r[0] == b1 && r[1] == b2)
-        .is_some()
+    let i = scan_prefixes(bytes).index;
+    bytes.get(i).copied() == Some(b1) && bytes.get(i + 1).copied() == Some(b2)
 }
 
-/// x86-32 `mov r32, [rbp+disp]` zero-extends into the 64-bit VM slot.
-fn is_x86_32bit_rbp_load(instr: &X64Instruction) -> bool {
-    matches!(
-        instr.kind,
-        X64InstrKind::MovRegMem {
-            base: X64Reg::Rbp | X64Reg::Ebp,
-            ..
-        }
-    ) && opcode_matches(&instr.bytes, 0x8B)
-        && !has_rex_w(&instr.bytes)
+/// GPR operand width from prefixes: REX.W is 64, `66` without REX.W is 16, else 32.
+fn prefix_width(bytes: &[u8]) -> u8 {
+    let scan = scan_prefixes(bytes);
+    if scan.rex_w {
+        64
+    } else if scan.op16 {
+        16
+    } else {
+        32
+    }
 }
 
-/// `imul r32, [rbp+disp]` without REX.W — 32-bit multiply.
-fn is_x86_32bit_imul_mem(instr: &X64Instruction) -> bool {
-    matches!(
-        instr.kind,
-        X64InstrKind::ImulRegMem {
-            base: X64Reg::Rbp | X64Reg::Ebp,
-            ..
-        }
-    ) && opcode_matches_two(&instr.bytes, 0x0F, 0xAF)
-        && !has_rex_w(&instr.bytes)
+/// `shl`/`shr`/`sar` width. Opcodes `C0`/`D0`/`D2` are 8-bit even without a prefix.
+fn gpr_shift_width(bytes: &[u8]) -> u8 {
+    let scan = scan_prefixes(bytes);
+    match bytes.get(scan.index).copied().unwrap_or(0) {
+        0xC0 | 0xD0 | 0xD2 => 8,
+        _ => prefix_width(bytes),
+    }
 }
 
 fn emit_32bit_imul(bytecode: &mut Vec<u8>, dst_vm: u8, src_vm: u8) {
@@ -1710,13 +1769,6 @@ fn emit_32bit_imul(bytecode: &mut Vec<u8>, dst_vm: u8, src_vm: u8) {
     };
     emit_mul_three(bytecode, dst_vm, dst_vm, src);
     emit_u32_zext(bytecode, dst_vm);
-}
-
-/// `imul r32, r32` without REX.W — 32-bit multiply.
-fn is_x86_32bit_imul_reg(instr: &X64Instruction) -> bool {
-    matches!(instr.kind, X64InstrKind::ImulRegReg { .. })
-        && opcode_matches_two(&instr.bytes, 0x0F, 0xAF)
-        && !has_rex_w(&instr.bytes)
 }
 
 pub fn emit_u32_zext(bytecode: &mut Vec<u8>, reg: u8) {
@@ -2847,11 +2899,16 @@ fn emit_general_lea(kind: &X64InstrKind, bytecode: &mut Vec<u8>, pack_seed: u64)
 }
 
 /// Emit `shr`/`sar` by copying bits `[shift, width)` into `[0, width-shift)` with
-/// optional sign fill. x86 masks the count (`& 31` for 32-bit, `& 63` for 64-bit).
-/// 32-bit results are zero-extended into the 64-bit VM slot (x64 r32 write rule).
+/// optional sign fill. x86 masks the count (`& 31` for 8/16/32-bit, `& 63` for 64-bit).
+/// 32-bit results are zero-extended. 8- and 16-bit results keep the unwritten high bits.
 fn emit_shift_right(bytecode: &mut Vec<u8>, dst: u8, shift: u8, arithmetic: bool, width_bits: u8) {
-    let width = if width_bits >= 64 { 64u8 } else { 32u8 };
-    let s = if width == 32 { shift & 31 } else { shift & 63 };
+    let width = match width_bits {
+        8 => 8u8,
+        16 => 16,
+        64 => 64,
+        _ => 32,
+    };
+    let s = if width == 64 { shift & 63 } else { shift & 31 };
     if s == 0 {
         if width == 32 {
             emit_u32_zext(bytecode, dst);
@@ -2896,7 +2953,12 @@ fn emit_shift_right(bytecode: &mut Vec<u8>, dst: u8, shift: u8, arithmetic: bool
     }
     if arithmetic {
         let sign_mask = 1u64 << (width - 1);
-        let width_mask = if width == 32 { 0xFFFF_FFFFu64 } else { !0u64 };
+        let width_mask = match width {
+            8 => 0xFFu64,
+            16 => 0xFFFFu64,
+            32 => 0xFFFF_FFFFu64,
+            _ => !0u64,
+        };
         let fill_mask = if s >= width {
             width_mask
         } else {
@@ -2929,6 +2991,20 @@ fn emit_shift_right(bytecode: &mut Vec<u8>, dst: u8, shift: u8, arithmetic: bool
     }
     if width == 32 {
         emit_u32_zext(bytecode, dst);
+    } else if width < 32 {
+        let low_mask = (1u64 << width) - 1;
+        // r14 still holds the pre-shift value. Put the shifted low bits back
+        // and keep bits above `width`.
+        let tmp = scratch_except(&[dst, 14]);
+        emit_load_imm_raw(bytecode, tmp, low_mask);
+        emit_raw_alu3(bytecode, OpCode::And, dst, dst, tmp);
+        bytecode.push(active_encode(OpCode::Push));
+        bytecode.push(dst);
+        emit_load_imm_raw(bytecode, tmp, !low_mask);
+        emit_raw_alu3(bytecode, OpCode::And, tmp, 14, tmp);
+        bytecode.push(active_encode(OpCode::Pop));
+        bytecode.push(dst);
+        emit_raw_alu3(bytecode, OpCode::Add, dst, dst, tmp);
     }
 }
 
@@ -3016,7 +3092,12 @@ fn emit_extended_alu_or_test(
         }
         X64InstrKind::ShlRegImm { reg, shift } => {
             let dst = reg.to_vm_reg();
-            let width64 = has_rex_w(instr_bytes);
+            let width = gpr_shift_width(instr_bytes);
+            if width <= 16 {
+                emit_shl_narrow(bytecode, dst, *shift, width);
+                return;
+            }
+            let width64 = width == 64;
             let s = if width64 { *shift & 63 } else { *shift & 31 };
             if !width64 {
                 emit_u32_zext(bytecode, dst);
@@ -3042,22 +3123,37 @@ fn emit_extended_alu_or_test(
                 reg.to_vm_reg(),
                 *shift,
                 matches!(kind, X64InstrKind::SarRegImm { .. }),
-                if has_rex_w(instr_bytes) { 64 } else { 32 },
+                gpr_shift_width(instr_bytes),
             );
         }
         X64InstrKind::IdivReg { reg, signed, bits } => {
-            let kind = match (*signed, *bits) {
-                (true, 64) => crate::vm::l8::DIV_IDIV64,
-                (true, 32) => crate::vm::l8::DIV_IDIV32,
-                (true, 16) => crate::vm::l8::DIV_IDIV16,
-                (true, 8) => crate::vm::l8::DIV_IDIV8,
-                (false, 64) => crate::vm::l8::DIV_DIV64,
-                (false, 32) => crate::vm::l8::DIV_DIV32,
-                (false, 16) => crate::vm::l8::DIV_DIV16,
-                (false, 8) => crate::vm::l8::DIV_DIV8,
-                _ => return,
+            let Some(kind) = div_kind(*signed, *bits) else {
+                return;
             };
             emit_native_micro(bytecode, crate::vm::l8::encode_div(kind, reg.to_vm_reg()));
+        }
+        X64InstrKind::IdivMem {
+            base,
+            offset,
+            signed,
+            bits,
+        } => {
+            let Some(kind) = div_kind(*signed, *bits) else {
+                return;
+            };
+            let divisor = if matches!(*base, X64Reg::Rbp | X64Reg::Ebp) {
+                *stack_map
+                    .entry(*offset)
+                    .or_insert_with(|| alloc_stack_spill_reg(next_stack_reg))
+            } else if matches!(*base, X64Reg::Rsp | X64Reg::Esp) {
+                return;
+            } else {
+                let addr = emit_address_reg(bytecode, base.to_vm_reg(), *offset, pack_seed);
+                let dest = if addr == 15 { 14 } else { 15 };
+                emit_ptr_mem(bytecode, false, *bits, false, dest, addr);
+                dest
+            };
+            emit_native_micro(bytecode, crate::vm::l8::encode_div(kind, divisor));
         }
         X64InstrKind::Cdq => {
             // Native cdq: edx is the sign fill of eax, rax and flags stay put.
@@ -3106,37 +3202,19 @@ fn emit_native_micro(bytecode: &mut Vec<u8>, func_id: u64) {
 }
 
 /// Operand width of a GPR `mov` to or from memory, and whether the GPR is `ah`/`bh`/`ch`/`dh`.
-fn gpr_mem_width(bytes: &[u8]) -> (u8, bool) {
-    let mut i = 0;
-    let mut op16 = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            0x66 => {
-                op16 = true;
-                i += 1;
-            }
-            0xF0 | 0xF2 | 0xF3 | 0x67 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => i += 1,
-            _ => break,
-        }
-    }
-    let mut rex = false;
-    let mut rex_w = false;
-    if i < bytes.len() && (0x40..=0x4F).contains(&bytes[i]) {
-        rex = true;
-        rex_w = bytes[i] & 0x08 != 0;
-        i += 1;
-    }
-    let Some(&op) = bytes.get(i) else {
+pub(crate) fn gpr_mem_width(bytes: &[u8]) -> (u8, bool) {
+    let scan = scan_prefixes(bytes);
+    let Some(&op) = bytes.get(scan.index) else {
         return (32, false);
     };
-    let reg = bytes.get(i + 1).map(|m| (m >> 3) & 7).unwrap_or(0);
+    let reg = bytes.get(scan.index + 1).map(|m| (m >> 3) & 7).unwrap_or(0);
     match op {
-        0x88 | 0x8A => (8, !rex && reg >= 4),
+        0x88 | 0x8A => (8, !scan.rex && reg >= 4),
         0x63 => (32, false),
         _ => {
-            if rex_w {
+            if scan.rex_w {
                 (64, false)
-            } else if op16 {
+            } else if scan.op16 {
                 (16, false)
             } else {
                 (32, false)
@@ -3146,18 +3224,181 @@ fn gpr_mem_width(bytes: &[u8]) -> (u8, bool) {
 }
 
 fn opcode_after_prefixes(bytes: &[u8]) -> Option<u8> {
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            0x66 | 0xF0 | 0xF2 | 0xF3 | 0x67 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => i += 1,
-            0x40..=0x4F => {
-                i += 1;
-                break;
-            }
-            _ => break,
+    bytes.get(scan_prefixes(bytes).index).copied()
+}
+
+fn scratch_except(used: &[u8]) -> u8 {
+    for temp in [15u8, 14] {
+        if !used.contains(&temp) {
+            return temp;
         }
     }
-    bytes.get(i).copied()
+    15
+}
+
+fn emit_raw_alu3(bytecode: &mut Vec<u8>, op: OpCode, dst: u8, src1: u8, src2: u8) {
+    if current_isa_mode().is_stack() {
+        bytecode.push(active_encode(OpCode::Push));
+        bytecode.push(src1);
+        bytecode.push(active_encode(OpCode::Push));
+        bytecode.push(src2);
+        bytecode.push(active_encode(op));
+        bytecode.push(dst);
+        return;
+    }
+    bytecode.push(active_encode(op));
+    bytecode.push(dst);
+    bytecode.push(src1);
+    bytecode.push(src2);
+}
+
+fn emit_load_imm_raw(bytecode: &mut Vec<u8>, reg: u8, imm: u64) {
+    bytecode.push(active_encode(OpCode::LoadImm));
+    bytecode.push(reg);
+    bytecode.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// `dst = (dst & !mask) | (src & mask)`. Bits outside `mask` stay in `dst`.
+fn emit_merge_masked(bytecode: &mut Vec<u8>, dst: u8, src: u8, mask: u64) {
+    if dst == src || mask == 0 {
+        return;
+    }
+    let tmp = scratch_except(&[dst, src]);
+    emit_load_imm_raw(bytecode, tmp, mask);
+    emit_raw_alu3(bytecode, OpCode::And, tmp, src, tmp);
+    bytecode.push(active_encode(OpCode::Push));
+    bytecode.push(tmp);
+    emit_load_imm_raw(bytecode, tmp, !mask);
+    emit_raw_alu3(bytecode, OpCode::And, dst, dst, tmp);
+    bytecode.push(active_encode(OpCode::Pop));
+    bytecode.push(tmp);
+    // The two halves are disjoint, so addition is a bitwise or.
+    emit_raw_alu3(bytecode, OpCode::Add, dst, dst, tmp);
+}
+
+fn emit_merge_ah(bytecode: &mut Vec<u8>, dst: u8, src: u8) {
+    let tmp = scratch_except(&[dst, src]);
+    emit_load_imm_raw(bytecode, tmp, 0xFF);
+    emit_raw_alu3(bytecode, OpCode::And, tmp, src, tmp);
+    for _ in 0..8 {
+        emit_raw_alu3(bytecode, OpCode::Add, tmp, tmp, tmp);
+    }
+    emit_merge_masked(bytecode, dst, tmp, 0xFF00);
+}
+
+fn emit_rbp_gpr_load(bytecode: &mut Vec<u8>, bytes: &[u8], dst: u8, spill: u8, pack_seed: u64) {
+    let (width, high) = gpr_mem_width(bytes);
+    match width {
+        64 => {
+            bytecode.push(active_encode(OpCode::Move));
+            bytecode.push(dst);
+            bytecode.push(spill);
+        }
+        32 => {
+            bytecode.push(active_encode(OpCode::Move));
+            bytecode.push(dst);
+            bytecode.push(spill);
+            if opcode_after_prefixes(bytes) == Some(0x63) {
+                emit_sign_extend_bits(bytecode, dst, dst, 32, pack_seed);
+            } else {
+                emit_u32_zext(bytecode, dst);
+            }
+        }
+        16 => emit_merge_masked(bytecode, dst, spill, 0xFFFF),
+        _ if high => emit_merge_ah(bytecode, dst, spill),
+        _ => emit_merge_masked(bytecode, dst, spill, 0xFF),
+    }
+}
+
+fn emit_rbp_gpr_store(bytecode: &mut Vec<u8>, bytes: &[u8], src: u8, spill: u8) {
+    let (width, high) = gpr_mem_width(bytes);
+    match width {
+        64 => {
+            bytecode.push(active_encode(OpCode::Move));
+            bytecode.push(spill);
+            bytecode.push(src);
+        }
+        32 => {
+            bytecode.push(active_encode(OpCode::Move));
+            bytecode.push(spill);
+            bytecode.push(src);
+            emit_u32_zext(bytecode, spill);
+        }
+        16 => emit_merge_masked(bytecode, spill, src, 0xFFFF),
+        _ if high => emit_merge_ah(bytecode, spill, src),
+        _ => emit_merge_masked(bytecode, spill, src, 0xFF),
+    }
+}
+
+fn emit_narrow_imul(bytecode: &mut Vec<u8>, dst: u8, src: u8, bits: u8) {
+    let mask = (1u64 << bits) - 1;
+    let tmp_a = scratch_except(&[dst, src]);
+    let tmp_b = scratch_except(&[dst, src, tmp_a]);
+    emit_load_imm_raw(bytecode, tmp_a, mask);
+    emit_raw_alu3(bytecode, OpCode::And, tmp_a, dst, tmp_a);
+    emit_load_imm_raw(bytecode, tmp_b, mask);
+    emit_raw_alu3(bytecode, OpCode::And, tmp_b, src, tmp_b);
+    emit_raw_alu3(bytecode, OpCode::Mul, tmp_a, tmp_a, tmp_b);
+    emit_load_imm_raw(bytecode, tmp_b, mask);
+    emit_raw_alu3(bytecode, OpCode::And, tmp_a, tmp_a, tmp_b);
+    emit_merge_masked(bytecode, dst, tmp_a, mask);
+}
+
+fn emit_gpr_imul(bytecode: &mut Vec<u8>, dst: u8, src: u8, bytes: &[u8]) {
+    match prefix_width(bytes) {
+        16 => emit_narrow_imul(bytecode, dst, src, 16),
+        32 => emit_32bit_imul(bytecode, dst, src),
+        _ => emit_mul_three(bytecode, dst, dst, src),
+    }
+}
+
+fn emit_shl_narrow(bytecode: &mut Vec<u8>, dst: u8, shift: u8, width: u8) {
+    let count = shift & 31;
+    if count == 0 {
+        return;
+    }
+    let mask = (1u64 << width) - 1;
+    let tmp = scratch_except(&[dst]);
+    emit_load_imm_raw(bytecode, tmp, mask);
+    emit_raw_alu3(bytecode, OpCode::And, tmp, dst, tmp);
+    for _ in 0..count {
+        emit_raw_alu3(bytecode, OpCode::Add, tmp, tmp, tmp);
+    }
+    let mask_reg = scratch_except(&[dst, tmp]);
+    emit_load_imm_raw(bytecode, mask_reg, mask);
+    emit_raw_alu3(bytecode, OpCode::And, tmp, tmp, mask_reg);
+    emit_merge_masked(bytecode, dst, tmp, mask);
+}
+
+fn emit_address_reg(bytecode: &mut Vec<u8>, base: u8, offset: i32, pack_seed: u64) -> u8 {
+    if offset == 0 {
+        return base;
+    }
+    bytecode.push(active_encode(OpCode::Move));
+    bytecode.push(14);
+    bytecode.push(base);
+    if offset > 0 {
+        emit_add_reg_imm(bytecode, 14, offset as u64);
+    } else {
+        emit_load_imm_raw(bytecode, 15, (-(offset as i64)) as u64);
+        emit_sub_three(bytecode, 14, 14, 15, pack_seed);
+    }
+    14
+}
+
+fn div_kind(signed: bool, bits: u8) -> Option<u8> {
+    use crate::vm::l8::*;
+    Some(match (signed, bits) {
+        (true, 64) => DIV_IDIV64,
+        (true, 32) => DIV_IDIV32,
+        (true, 16) => DIV_IDIV16,
+        (true, 8) => DIV_IDIV8,
+        (false, 64) => DIV_DIV64,
+        (false, 32) => DIV_DIV32,
+        (false, 16) => DIV_DIV16,
+        (false, 8) => DIV_DIV8,
+        _ => return None,
+    })
 }
 
 /// Pointer load/store. Rides on `native_call` so it stays inside the 21-opcode wire map.
@@ -3457,12 +3698,13 @@ fn lift_to_vm_bytecode_internal_with_image(
                     let stack_reg = *stack_map
                         .entry(*offset)
                         .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
-                    bytecode.push(active_encode(OpCode::Move));
-                    bytecode.push(dst.to_vm_reg());
-                    bytecode.push(stack_reg);
-                    if is_x86_32bit_rbp_load(instr) {
-                        emit_u32_zext(&mut bytecode, dst.to_vm_reg());
-                    }
+                    emit_rbp_gpr_load(
+                        &mut bytecode,
+                        &instr.bytes,
+                        dst.to_vm_reg(),
+                        stack_reg,
+                        pack_seed,
+                    );
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
                         emit_load_gpr_mem(
@@ -3499,9 +3741,7 @@ fn lift_to_vm_bytecode_internal_with_image(
                     let stack_reg = *stack_map
                         .entry(*offset)
                         .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
-                    bytecode.push(active_encode(OpCode::Move));
-                    bytecode.push(stack_reg);
-                    bytecode.push(src.to_vm_reg());
+                    emit_rbp_gpr_store(&mut bytecode, &instr.bytes, src.to_vm_reg(), stack_reg);
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
                         emit_store_gpr_mem(
@@ -3575,11 +3815,7 @@ fn lift_to_vm_bytecode_internal_with_image(
             X64InstrKind::ImulRegReg { dst, src } => {
                 let dst_vm = dst.to_vm_reg();
                 let src_vm = src.to_vm_reg();
-                if is_x86_32bit_imul_reg(instr) {
-                    emit_32bit_imul(&mut bytecode, dst_vm, src_vm);
-                } else {
-                    emit_mul_three(&mut bytecode, dst_vm, dst_vm, src_vm);
-                }
+                emit_gpr_imul(&mut bytecode, dst_vm, src_vm, &instr.bytes);
             }
             X64InstrKind::ImulRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
@@ -3587,11 +3823,7 @@ fn lift_to_vm_bytecode_internal_with_image(
                         .entry(*offset)
                         .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
                     let dst_vm = dst.to_vm_reg();
-                    if is_x86_32bit_imul_mem(instr) {
-                        emit_32bit_imul(&mut bytecode, dst_vm, stack_reg);
-                    } else {
-                        emit_mul_three(&mut bytecode, dst_vm, dst_vm, stack_reg);
-                    }
+                    emit_gpr_imul(&mut bytecode, dst_vm, stack_reg, &instr.bytes);
                 }
             }
             X64InstrKind::CmpRegReg { reg1, reg2 } => {
@@ -3797,6 +4029,7 @@ fn lift_to_vm_bytecode_internal_with_image(
             | X64InstrKind::ShrRegImm { .. }
             | X64InstrKind::SarRegImm { .. }
             | X64InstrKind::IdivReg { .. }
+            | X64InstrKind::IdivMem { .. }
             | X64InstrKind::Cdq
             | X64InstrKind::Cqo => {
                 emit_extended_alu_or_test(
@@ -4204,12 +4437,13 @@ fn lift_to_vm_bytecode_internal_with_main(
                     let stack_reg = *stack_map
                         .entry(*offset)
                         .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
-                    bytecode.push(active_encode(OpCode::Move));
-                    bytecode.push(dst.to_vm_reg());
-                    bytecode.push(stack_reg);
-                    if is_x86_32bit_rbp_load(instr) {
-                        emit_u32_zext(&mut bytecode, dst.to_vm_reg());
-                    }
+                    emit_rbp_gpr_load(
+                        &mut bytecode,
+                        &instr.bytes,
+                        dst.to_vm_reg(),
+                        stack_reg,
+                        pack_seed,
+                    );
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
                         emit_load_gpr_mem(
@@ -4246,9 +4480,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                     let stack_reg = *stack_map
                         .entry(*offset)
                         .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
-                    bytecode.push(active_encode(OpCode::Move));
-                    bytecode.push(stack_reg);
-                    bytecode.push(src.to_vm_reg());
+                    emit_rbp_gpr_store(&mut bytecode, &instr.bytes, src.to_vm_reg(), stack_reg);
                 } else if !matches!(base, X64Reg::Rsp | X64Reg::Esp) {
                     if *offset == 0 {
                         emit_store_gpr_mem(
@@ -4322,11 +4554,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             X64InstrKind::ImulRegReg { dst, src } => {
                 let dst_vm = dst.to_vm_reg();
                 let src_vm = src.to_vm_reg();
-                if is_x86_32bit_imul_reg(instr) {
-                    emit_32bit_imul(&mut bytecode, dst_vm, src_vm);
-                } else {
-                    emit_mul_three(&mut bytecode, dst_vm, dst_vm, src_vm);
-                }
+                emit_gpr_imul(&mut bytecode, dst_vm, src_vm, &instr.bytes);
             }
             X64InstrKind::ImulRegMem { dst, base, offset } => {
                 if *base == X64Reg::Rbp || *base == X64Reg::Ebp {
@@ -4334,11 +4562,7 @@ fn lift_to_vm_bytecode_internal_with_main(
                         .entry(*offset)
                         .or_insert_with(|| alloc_stack_spill_reg(&mut next_stack_reg));
                     let dst_vm = dst.to_vm_reg();
-                    if is_x86_32bit_imul_mem(instr) {
-                        emit_32bit_imul(&mut bytecode, dst_vm, stack_reg);
-                    } else {
-                        emit_mul_three(&mut bytecode, dst_vm, dst_vm, stack_reg);
-                    }
+                    emit_gpr_imul(&mut bytecode, dst_vm, stack_reg, &instr.bytes);
                 }
             }
             X64InstrKind::CmpRegReg { reg1, reg2 } => {
@@ -4694,6 +4918,7 @@ fn lift_to_vm_bytecode_internal_with_main(
             | X64InstrKind::ShrRegImm { .. }
             | X64InstrKind::SarRegImm { .. }
             | X64InstrKind::IdivReg { .. }
+            | X64InstrKind::IdivMem { .. }
             | X64InstrKind::Cdq
             | X64InstrKind::Cqo => {
                 emit_extended_alu_or_test(
@@ -7285,5 +7510,94 @@ mod tests {
         // mov rax, imm32 sign-extends.
         let sext_imm: &[u8] = &[0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3];
         assert_eq!(run_lifted(sext_imm).get_register(0).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn mem_div_partial_rbp_and_prefixed_shifts() {
+        let idiv_mem: &[u8] = &[
+            0xB9, 0x00, 0x02, 0x00, 0x00, // mov ecx, 0x200
+            0xBA, 0x07, 0x00, 0x00, 0x00, // mov edx, 7
+            0x89, 0x11, // mov [rcx], edx
+            0xB8, 0x64, 0x00, 0x00, 0x00, // mov eax, 100
+            0x31, 0xD2, // xor edx, edx
+            0xF7, 0x39, // idiv dword ptr [rcx]
+            0xC3,
+        ];
+        let idiv_instrs = disassemble_x64_simple(idiv_mem, 16);
+        assert!(idiv_instrs.iter().any(|i| matches!(
+            i.kind,
+            X64InstrKind::IdivMem {
+                bits: 32,
+                signed: true,
+                ..
+            }
+        )));
+        let vm = run_lifted(idiv_mem);
+        assert_eq!(vm.get_register(0).unwrap(), 14);
+        assert_eq!(vm.get_register(2).unwrap(), 2);
+
+        let idiv_rbp: &[u8] = &[
+            0xC7, 0x45, 0xFC, 0x07, 0x00, 0x00, 0x00, // mov dword [rbp-4], 7
+            0xB8, 0x64, 0x00, 0x00, 0x00, // mov eax, 100
+            0x31, 0xD2, // xor edx, edx
+            0xF7, 0x7D, 0xFC, // idiv dword ptr [rbp-4]
+            0xC3,
+        ];
+        let vm = run_lifted(idiv_rbp);
+        assert_eq!(vm.get_register(0).unwrap(), 14);
+        assert_eq!(vm.get_register(2).unwrap(), 2);
+
+        let store_byte: &[u8] = &[
+            0xC7, 0x45, 0xFC, 0xDD, 0xCC, 0xBB, 0xAA, // mov dword [rbp-4], 0xAABBCCDD
+            0xB8, 0x10, 0x00, 0x00, 0x00, // mov eax, 0x10
+            0x88, 0x45, 0xFC, // mov [rbp-4], al
+            0x8B, 0x45, 0xFC, // mov eax, [rbp-4]
+            0xC3,
+        ];
+        assert_eq!(run_lifted(store_byte).get_register(0).unwrap(), 0xAABB_CC10);
+
+        let load_al: &[u8] = &[
+            0xC7, 0x45, 0xFC, 0xDD, 0xCC, 0xBB, 0xAA, 0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44,
+            0x33, 0x22, 0x11, 0x8A, 0x45, 0xFC, // mov al, [rbp-4]
+            0xC3,
+        ];
+        assert_eq!(
+            run_lifted(load_al).get_register(0).unwrap(),
+            0x1122_3344_5566_77DD
+        );
+
+        let load_ax: &[u8] = &[
+            0xC7, 0x45, 0xFC, 0xDD, 0xCC, 0xBB, 0xAA, 0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44,
+            0x33, 0x22, 0x11, 0x66, 0x8B, 0x45, 0xFC, // mov ax, [rbp-4]
+            0xC3,
+        ];
+        assert_eq!(
+            run_lifted(load_ax).get_register(0).unwrap(),
+            0x1122_3344_5566_CCDD
+        );
+
+        // 66 before REX.W is still a 64-bit shl.
+        let shl64: &[u8] = &[
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x66, 0x48, 0xC1, 0xE0,
+            0x04, // shl rax, 4
+            0xC3,
+        ];
+        assert_eq!(run_lifted(shl64).get_register(0).unwrap(), 0x10_0000_0010);
+
+        // shl ax keeps bits above 16. rax = 0x0000_1111_0000_0001.
+        let shl16: &[u8] = &[
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x11, 0x11, 0x00, 0x00, 0x66, 0xC1, 0xE0,
+            0x04, // shl ax, 4
+            0xC3,
+        ];
+        assert_eq!(run_lifted(shl16).get_register(0).unwrap(), 0x1111_0000_0010);
+
+        // shr ax keeps bits above 16. rax = 0x0000_2222_0000_00F0.
+        let shr16: &[u8] = &[
+            0x48, 0xB8, 0xF0, 0x00, 0x00, 0x00, 0x22, 0x22, 0x00, 0x00, 0x66, 0xC1, 0xE8,
+            0x04, // shr ax, 4
+            0xC3,
+        ];
+        assert_eq!(run_lifted(shr16).get_register(0).unwrap(), 0x2222_0000_000F);
     }
 }

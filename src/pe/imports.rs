@@ -121,9 +121,15 @@ pub fn native_call_ids_in_bytecode_with_layout(
                 offset + layout.operands_offset_dispatch(OpCode::SetBlockMap, true, dispatch_mode);
             if meta_off + META_OPERAND_LEN <= bytecode.len() {
                 let bb_id = u16::from_le_bytes([bytecode[meta_off], bytecode[meta_off + 1]]);
-                current_map = block_plan
-                    .map(|p| p.map_for_tx_or_base(bb_id, map))
-                    .unwrap_or_else(|| BlockMapPlan::block_opcode_map(map.seed(), bb_id as usize));
+                let Some(next_map) = block_plan
+                    .map(|p| p.map_for_tx_or_legacy(bb_id, map))
+                    .unwrap_or_else(|| {
+                        Some(BlockMapPlan::block_opcode_map(map.seed(), bb_id as usize))
+                    })
+                else {
+                    break;
+                };
+                current_map = next_map;
                 offset +=
                     layout.insn_len(OpCode::SetBlockMap, META_OPERAND_LEN, dispatch_mode, true);
                 continue;

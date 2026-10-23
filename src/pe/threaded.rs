@@ -52,9 +52,14 @@ fn enumerate_instructions(
             offset += total;
             continue;
         }
-        let map = current_bb
-            .map(|id| block_plan.map_for_tx_or_base(id, base_map))
-            .unwrap_or_else(|| base_map.clone());
+        let map = if let Some(id) = current_bb {
+            match block_plan.map_for_tx_or_legacy(id, base_map) {
+                Some(map) => map,
+                None => break,
+            }
+        } else {
+            base_map.clone()
+        };
         let op = match map.decode(wire) {
             Some(op) => op,
             None => break,

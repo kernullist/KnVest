@@ -64,6 +64,12 @@ pub struct VirtualMachine {
     rolling_seed: u64,
     /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
     pub direct_calls: Vec<u32>,
+    /// MXCSR. Reset value masks invalid/denormal/div0/overflow/underflow/precision.
+    mxcsr: u32,
+    /// Native sled image referenced by `RunNative` / `BailNative` offsets.
+    native_sleds: Vec<u8>,
+    /// `(rbp disp, VM spill reg)` pairs copied around a native sled, matching the stub.
+    native_sync: Vec<(i32, u8)>,
 }
 
 impl VirtualMachine {
@@ -90,7 +96,25 @@ impl VirtualMachine {
             rolling_cipher: false,
             rolling_seed: 0,
             direct_calls: Vec::new(),
+            mxcsr: 0x1F80,
+            native_sleds: Vec::new(),
+            native_sync: Vec::new(),
         }
+    }
+
+    /// Attach the packed native-sled image so `RunNative` / `BailNative` apply it.
+    pub fn with_native_sleds(mut self, sleds: Vec<u8>, sync: Vec<(i32, u8)>) -> Self {
+        self.native_sleds = sleds;
+        self.native_sync = sync;
+        self
+    }
+
+    pub fn mxcsr(&self) -> u32 {
+        self.mxcsr
+    }
+
+    pub fn set_mxcsr(&mut self, mxcsr: u32) {
+        self.mxcsr = mxcsr;
     }
 
     /// Fetch-time idempotent rolling decryption. The bytecode image stays ciphertext.
@@ -660,8 +684,11 @@ impl VirtualMachine {
             }
 
             OpCode::RunNative | OpCode::BailNative => {
-                let _sled_offset = self.read_u64()?;
+                let sled_offset = self.read_u64()? as usize;
                 let _orig_rva = self.read_u64()?;
+                if !self.native_sleds.is_empty() {
+                    self.exec_native_sled(sled_offset)?;
+                }
             }
         }
 
@@ -777,6 +804,8 @@ impl VirtualMachine {
     }
 
     fn exec_xmm_micro(&mut self, subop: u8, dst: u8, src: u8) -> VMResult<()> {
+        let dest_bits = self.xmm_registers.get(dst as usize).copied().unwrap_or(0);
+        let src_bits = self.xmm_registers.get(src as usize).copied().unwrap_or(0);
         let mut regs = self.registers;
         let mut xmm = self.xmm_registers;
         match crate::vm::l8::exec_xmm(subop, dst, src, &mut xmm, &mut regs) {
@@ -786,6 +815,14 @@ impl VirtualMachine {
                 if let Some(flags) = flags {
                     self.flags = flags;
                 }
+                if crate::vm::l8::compare_sets_invalid(subop, dest_bits, src_bits) {
+                    self.mxcsr |= 1;
+                    if self.mxcsr & 0x80 == 0 {
+                        return Err(VMError::NativeCallError(
+                            "xmm invalid-operation exception".to_string(),
+                        ));
+                    }
+                }
                 Ok(())
             }
             Err(()) => Err(VMError::NativeCallError(format!(
@@ -793,6 +830,150 @@ impl VirtualMachine {
             ))),
         }
     }
+
+    /// Apply one native sled to VM registers and rbp spill slots.
+    /// Loop-counter sleds are `[rbp+disp]` updates. Recognized GPR ops update VM
+    /// registers. An unrecognized instruction is an error instead of a silent skip.
+    fn exec_native_sled(&mut self, sled_offset: usize) -> VMResult<()> {
+        if sled_offset >= self.native_sleds.len() {
+            return Err(VMError::NativeCallError(format!(
+                "native sled offset {sled_offset:#x} is past the sled image"
+            )));
+        }
+        let bytes = &self.native_sleds[sled_offset..];
+        let instrs = crate::pe::lifter::disassemble_x64_simple(bytes, 64);
+        let sync = self.native_sync.clone();
+        let mut frame: HashMap<i32, u8> = HashMap::new();
+        for &(disp, reg) in &sync {
+            let value = self.get_register(reg)? as u32;
+            frame_write(&mut frame, disp, value as u64, 4);
+        }
+        for insn in &instrs {
+            if matches!(insn.kind, crate::pe::lifter::X64InstrKind::Ret) {
+                break;
+            }
+            self.apply_sled_insn(insn, &mut frame)?;
+        }
+        for &(disp, reg) in &sync {
+            self.set_register(reg, frame_read(&frame, disp, 4))?;
+        }
+        Ok(())
+    }
+
+    fn apply_sled_insn(
+        &mut self,
+        insn: &crate::pe::lifter::X64Instruction,
+        frame: &mut HashMap<i32, u8>,
+    ) -> VMResult<()> {
+        use crate::pe::lifter::{gpr_mem_width, X64InstrKind, X64Reg};
+        let mem_width = |bytes: &[u8]| {
+            let (width, _) = gpr_mem_width(bytes);
+            width.max(1) as usize
+        };
+        match &insn.kind {
+            X64InstrKind::Nop => Ok(()),
+            X64InstrKind::MovRegImm { reg, imm } => self.set_register(reg.to_vm_reg(), *imm),
+            X64InstrKind::MovRegMem { dst, base, offset }
+                if matches!(base, X64Reg::Rbp | X64Reg::Ebp) =>
+            {
+                let width = mem_width(&insn.bytes);
+                let loaded = frame_read(frame, *offset, width);
+                let reg = dst.to_vm_reg();
+                let old = self.get_register(reg)?;
+                let (w, high) = gpr_mem_width(&insn.bytes);
+                let value = match (w, high) {
+                    (8, true) => (old & !0xFF00) | ((loaded & 0xFF) << 8),
+                    (8, _) => (old & !0xFF) | (loaded & 0xFF),
+                    (16, _) => (old & !0xFFFF) | (loaded & 0xFFFF),
+                    (32, _) => loaded & 0xFFFF_FFFF,
+                    _ => loaded,
+                };
+                self.set_register(reg, value)
+            }
+            X64InstrKind::MovMemReg { base, offset, src }
+                if matches!(base, X64Reg::Rbp | X64Reg::Ebp) =>
+            {
+                let width = mem_width(&insn.bytes);
+                let value = self.get_register(src.to_vm_reg())?;
+                frame_write(frame, *offset, value, width);
+                Ok(())
+            }
+            X64InstrKind::MovMemImm { base, offset, imm }
+                if matches!(base, X64Reg::Rbp | X64Reg::Ebp) =>
+            {
+                let width = mem_width(&insn.bytes).min(4);
+                frame_write(frame, *offset, *imm as u64, width);
+                Ok(())
+            }
+            X64InstrKind::AddMemImm { base, offset, imm }
+                if matches!(base, X64Reg::Rbp | X64Reg::Ebp) =>
+            {
+                let cur = frame_read(frame, *offset, 4) as u32;
+                let next = cur.wrapping_add(*imm);
+                frame_write(frame, *offset, next as u64, 4);
+                self.flags = flags_from_add32(cur, *imm);
+                Ok(())
+            }
+            X64InstrKind::SubMemImm { base, offset, imm }
+                if matches!(base, X64Reg::Rbp | X64Reg::Ebp) =>
+            {
+                let cur = frame_read(frame, *offset, 4) as u32;
+                let next = cur.wrapping_sub(*imm);
+                frame_write(frame, *offset, next as u64, 4);
+                self.flags = flags_from_sub32(cur, *imm);
+                Ok(())
+            }
+            X64InstrKind::CmpMemImm { base, offset, imm }
+                if matches!(base, X64Reg::Rbp | X64Reg::Ebp) =>
+            {
+                let cur = frame_read(frame, *offset, 4) as u32;
+                self.flags = flags_from_sub32(cur, *imm);
+                Ok(())
+            }
+            other => Err(VMError::NativeCallError(format!(
+                "native sled instruction is not executable in the reference VM: {other:?}"
+            ))),
+        }
+    }
+}
+
+fn frame_write(frame: &mut HashMap<i32, u8>, disp: i32, value: u64, len: usize) {
+    let bytes = value.to_le_bytes();
+    for i in 0..len {
+        frame.insert(disp + i as i32, bytes[i]);
+    }
+}
+
+fn frame_read(frame: &HashMap<i32, u8>, disp: i32, len: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    for i in 0..len.min(8) {
+        bytes[i] = frame.get(&(disp + i as i32)).copied().unwrap_or(0);
+    }
+    u64::from_le_bytes(bytes)
+}
+
+fn flags_from_sub32(a: u32, b: u32) -> u64 {
+    let result = a.wrapping_sub(b);
+    let zf = a == b;
+    let sf = (result as i32) < 0;
+    let cf = a < b;
+    let of = ((a ^ b) & (a ^ result)) >> 31 != 0;
+    (if zf { 0x40 } else { 0 })
+        | (if sf { 0x80 } else { 0 })
+        | (if cf { 0x01 } else { 0 })
+        | (if of { 0x800 } else { 0 })
+}
+
+fn flags_from_add32(a: u32, b: u32) -> u64 {
+    let result = a.wrapping_add(b);
+    let zf = result == 0;
+    let sf = (result as i32) < 0;
+    let cf = result < a;
+    let of = ((a ^ result) & (b ^ result)) >> 31 != 0;
+    (if zf { 0x40 } else { 0 })
+        | (if sf { 0x80 } else { 0 })
+        | (if cf { 0x01 } else { 0 })
+        | (if of { 0x800 } else { 0 })
 }
 
 #[cfg(test)]
@@ -1079,5 +1260,56 @@ mod tests {
         vm.data_section = vec![0xAB];
         vm.run().unwrap();
         assert_eq!(vm.get_register(0).unwrap(), 0xAB22);
+    }
+
+    #[test]
+    fn comiss_qnan_sets_mxcsr_ie_and_ucomiss_does_not() {
+        use crate::vm::l8::{encode_xmm, XMM_COMISS, XMM_UCOMISS};
+        let mut bc = vec![OpCode::NativeCall as u8];
+        bc.extend_from_slice(&encode_xmm(XMM_COMISS, 0, 1).to_le_bytes());
+        bc.extend_from_slice(&[OpCode::Exit as u8, 0]);
+        let mut vm = VirtualMachine::new(bc.clone());
+        vm.set_xmm(0, f32::NAN.to_bits() as u64).unwrap();
+        vm.set_xmm(1, 1.0f32.to_bits() as u64).unwrap();
+        vm.run().unwrap();
+        assert_eq!(vm.mxcsr() & 1, 1, "comiss on QNaN sets IE");
+        assert_eq!(
+            vm.mxcsr() & 0x80,
+            0x80,
+            "default MXCSR keeps invalid masked"
+        );
+
+        let mut quiet = vec![OpCode::NativeCall as u8];
+        quiet.extend_from_slice(&encode_xmm(XMM_UCOMISS, 0, 1).to_le_bytes());
+        quiet.extend_from_slice(&[OpCode::Exit as u8, 0]);
+        let mut vm = VirtualMachine::new(quiet);
+        vm.set_xmm(0, f32::NAN.to_bits() as u64).unwrap();
+        vm.set_xmm(1, 1.0f32.to_bits() as u64).unwrap();
+        vm.run().unwrap();
+        assert_eq!(vm.mxcsr() & 1, 0, "ucomiss on QNaN does not set IE");
+
+        let mut vm = VirtualMachine::new(bc);
+        vm.set_mxcsr(0);
+        vm.set_xmm(0, f32::NAN.to_bits() as u64).unwrap();
+        vm.set_xmm(1, 1.0f32.to_bits() as u64).unwrap();
+        assert!(
+            vm.run().is_err(),
+            "unmasked comiss on QNaN is an invalid operation"
+        );
+    }
+
+    #[test]
+    fn run_native_applies_rbp_sled_to_spill_slot() {
+        let mut bc = vec![OpCode::LoadImm as u8, 10];
+        bc.extend_from_slice(&5u64.to_le_bytes());
+        bc.push(OpCode::RunNative as u8);
+        bc.extend_from_slice(&0u64.to_le_bytes());
+        bc.extend_from_slice(&0u64.to_le_bytes());
+        bc.extend_from_slice(&[OpCode::Exit as u8, 10]);
+        // sub dword ptr [rbp-4], 1; ret
+        let sled = vec![0x83, 0x6D, 0xFC, 0x01, 0xC3];
+        let mut vm = VirtualMachine::new(bc).with_native_sleds(sled, vec![(-4, 10)]);
+        vm.run().unwrap();
+        assert_eq!(vm.get_register(10).unwrap(), 4);
     }
 }
