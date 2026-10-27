@@ -21,7 +21,7 @@ This is an educational project, not a commercial protector. It does NOT include:
 - Full x64 ISA or packed SIMD coverage (L8 adds scalar SSE/SSE2 only: `movss`/`movsd`/`movq`/`movd`, `movaps`/`movups`, scalar add/sub/mul/div, `ucomi`/`comi`, `cvtsi2sd`/`cvtsi2ss`, `cvttsd2si`/`cvttss2si`, `cvtss2sd`/`cvtsd2ss`, `xorps`/`xorpd`)
 - Decompilation or LLVM/MLIR bitcode lifting
 
-## Architecture & Protection Layers (L1 – L8)
+## Architecture & Protection Layers (L1 – L9)
 
 | Layer | Feature | Trailer / Module | Summary |
 |-------|---------|------------------|---------|
@@ -38,6 +38,7 @@ This is an educational project, not a commercial protector. It does NOT include:
 | **L6** | Extended x64 lifter & branch semantics | `lifter.rs`, `cfg.rs`, `machine.rs`, `vm_stub.rs` | Lifts bitwise/unary/shift ops (`AND`, `OR`, `XOR`, `NOT`, `NEG`, `SHL`, `TEST reg, imm`) and register extension moves (`MOVZX`, `MOVSX`, `MOVSXD`, `CDQE`, plus 32-bit zero-extension `emit_u32_zext`) across register, immediate, and `[rbp±disp]` stack slots, and supports signed, unsigned, and sign conditional jumps (`JE`, `JNE`, `JG`, `JL`, `JGE`, `JLE`, `JA`, `JAE`, `JB`, `JBE`, `JS`, `JNS`) |
 | **L7** | Metadata scrubbing / `.knvmap` sidecar, 32-reg frame & scratch isolation, universal Win64 ABI & caller-return stub, rolling stream cipher | `packer.rs` (`KNVM`), `lifter.rs`, `vm_stub.rs`, `layout.rs` | `--strip-meta` and `--sidecar <PATH>` scrub `KNV4`..`KNV7` & every `VMBC` marker and emit `.knvmap`; XOR-encodes all PEB/API strings in `vm_stub` and immediately zero-wipes the stack buffer after `GetProcAddress`; expands VM to 32 registers (`r13` virt-ISA split scratch, `r14..r15` isolated for MBA/lifter, 19 local slots `r10..r12` & `r16..r31`); adds `shr`, `sar`, `div`/`idiv` (`rdx:rax`, including `[base+disp]` with no index), `cdq`/`cqo`, scaled `lea`, general pointer `[reg+disp]` load/store, partial byte/word `[rbp+disp]` moves, and `--strict` (`validate_strict_lift`); supports generic Win64 IAT calls (`rcx, rdx, r8, r9` + 5th/6th stack args `[rsp+0x20]=r4`, `[rsp+0x28]=r5` + `rax -> r0`) and `--return-mode` (`StubExitMode::ReturnToCaller`); integrates `BytecodeCipher` rolling SplitMix64 keystream & register slot permutation (`VirtualMachine::with_cipher_decrypted`, `alloc_stack_spill_reg_seeded`) |
 | **L8** | Fetch-time rolling wire decrypt, `jmp reg` / switch tables, scalar XMM, multi-function packing | `l8.rs`, `vm_stub.rs`, `lifter.rs`, `cfg.rs`, `machine.rs`, `packer.rs`, `ir` | `--rolling-cipher` XORs each instruction-start wire with `rolling_wire_mask(seed, offset)` (`KNV4` v5 flag `0x02`) and decrypts it in the three native dispatch loops, the Rust VM, and `knvest ir`. `jmp reg` and compiler switch tables lift to a `Cmp`/`JmpIf` chain plus `native_call` `jmp_reg`. Scalar SSE rides on `native_call` immediates (`xmm_addsd`, `ucomiss`, `comiss`, `movq`, `movd`, `cvtsi2ss`, `cvtss2sd`, …) with a 16-slot XMM file at `[rbp-0x4B0]`. Repeated `--rva` / `--rvas` pack several functions: each gets a stub and bytecode entry, non-primary stubs `leave; ret`, and a 5-byte `E9` trampoline is written only when more than one RVA is packed. `.knvmap` stores every function image (a single-function file stays v1-compatible) and `knvest ir` prints the extras. `comiss`/`comisd` set PF when unordered and signal invalid on any NaN; `ucomiss`/`ucomisd` signal only on SNaN. A populated block map does not invent a wire alphabet for an unknown transition |
+| **L9** | Per-slot register-file XOR and a mul+add superoperator | `l9.rs`, `vm_stub.rs`, `machine.rs`, `packer.rs`, `ir` | `--reg-encrypt` stores each virtual register as `plaintext XOR reg_slot_key(seed, slot)` (`KNV4` v5 flag `0x04`). The stub keeps the 32 keys beside the bytecode image; the prologue copies them into the register file (a logical zero is the key itself) and each handler decodes a slot only for the instruction that reads or writes it. The VM data stack and guest memory stay plaintext. `--superops` fuses an adjacent register-ISA `mul` + `add` into one `native_call` (`madd`, tag `0x7_0000_0000`, `dst = a * b + c`) before layout padding, when the product is overwritten by the add or is dead before the next branch, call, or native micro-op, and when nothing jumps onto the `add`. Stack ISA bytecode is left unchanged. Both flags default off, and that stub is byte-identical to the L8 stub. The canonical opcode count stays 21 |
 
 ## Build
 
@@ -65,6 +66,8 @@ knvest pack input.exe -o output.exe
 | `--rva <HEX>` | auto-detect `main` | Function RVA to protect. Repeat the flag or pass a comma-separated list (`--rva 0x1000,0x1030`) |
 | `--rvas <HEX>` | *(none)* | Comma-separated RVAs, combined with `--rva` |
 | `--rolling-cipher` | `false` | L8: encrypt each bytecode wire with a position/seed key and decrypt it at fetch time |
+| `--reg-encrypt` | `false` | L9: XOR-encode each virtual register slot with a per-slot pack-time key |
+| `--superops` | `false` | L9: fuse adjacent register-ISA `mul`+`add` into one `madd` `native_call` |
 | `--seed <SEED>` | random per pack | 64-bit seed (hex `0x...` or decimal) controlling wire permutation, handler variants, layout padding, MBA catalog selection, and nested tables |
 | `--dispatch <MODE>` | `table` | Dispatch mode: `table` (256-entry handler table) or `threaded` (inline `rel32` handler targets) |
 | `--partial` | `false` | Enable L4d partial BB virtualization (`run_native` / `bail_native` sleds) |
@@ -90,6 +93,9 @@ knvest pack input.exe -o output.exe --seed 0xfeedface --nested --partial
 
 # L8: two functions, rolling wire cipher, caller-return on the non-primary stub
 knvest pack input.exe -o output.exe --seed 0x4c380001 --rva 0x1000,0x1030 --rolling-cipher
+
+# L9: per-slot register encoding and mul+add fusion
+knvest pack input.exe -o output.exe --seed 0x4c390001 --reg-encrypt --superops
 ```
 
 ### View IR
@@ -177,7 +183,7 @@ Eight MinGW-style C samples in `sample/`:
 cargo test
 ```
 
-The test suite (**301 tests**: 295 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser, 296 binary tests) runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L8 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `cdq`, `cqo`, `shr`, `sar`, `div`/`idiv` including `[base+disp]`, partial `[rbp+disp]` moves, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `comiss`/`ucomiss`, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & multi-function `.knvmap` sidecar roundtrips, reference-VM native sleds, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, and multi-RVA trampolines.
+The test suite (**308 tests** where the two Linux mmap harnesses are built: 302 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser). `cargo test` on Windows ran 300 library tests, 301 binary tests, and 6 integration tests. The suite runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L9 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `cdq`, `cqo`, `shr`, `sar`, `div`/`idiv` including `[base+disp]`, partial `[rbp+disp]` moves, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `comiss`/`ucomiss`, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & multi-function `.knvmap` sidecar roundtrips, reference-VM native sleds, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, multi-RVA trampolines, L9 per-slot register encoding, and `madd` fusion.
 
 ## Project Structure
 
@@ -192,6 +198,8 @@ src/
 │   ├── layout.rs      - L5c post-wire dead-byte padding plan (KNV7)
 │   ├── isa_mode.rs    - L5e reg vs. stack virtual ISA mode
 │   ├── nested_vm.rs   - L5f outer-decode + inner-execute plan
+│   ├── l8.rs          - L8 rolling wire key and native-call micro-op names
+│   ├── l9.rs          - L9 register-slot keys and madd fusion
 │   └── machine.rs     - Reference Rust VM interpreter
 ├── ir/                - Layout/transition/ISA-aware bytecode disassembler & printer
 ├── pe/

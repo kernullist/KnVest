@@ -397,6 +397,9 @@ fn operand_name(subop: u8, idx: u8, is_dst: bool) -> String {
 
 /// Pretty operand text for an L8 `native_call` immediate, if it is one.
 pub fn format_native_micro(func_id: u64) -> Option<String> {
+    if let Some(text) = super::l9::format_madd(func_id) {
+        return Some(text);
+    }
     if let Some((subop, dst, src)) = decode_xmm(func_id) {
         return Some(format!(
             "{} {}, {}",

@@ -62,6 +62,7 @@ pub fn derive_stub_string_xor_key(seed: u64) -> u8 {
 //   data stack     [rbp + idx*8 - 0x380]         (idx 16 must stay below ret[0] at -0x200)
 //   nc_iat spill   [rbp-0x500..-0x510]          (VM r10..r12; below ret/data — no overlap)
 //   VM frame save  [rbp-0x118]                  (run_native re-anchors VM base from here)
+//   L9 key base    [rbp-0x548]                  (pointer to reg_keys; between API wipe and XMM)
 //   native side    native_frame_ptr in .knvest   (prologue cache; handler uses direct lea r14)
 pub fn create_vm_interpreter_stub(
     _image_base: u64,
@@ -129,6 +130,43 @@ pub fn create_vm_interpreter_stub_with_exit_mode(
 
 /// Same as [`create_vm_interpreter_stub_with_exit_mode`], plus L8 rolling wire decryption.
 pub fn create_vm_interpreter_stub_l8(
+    image_base: u64,
+    section_rva: u32,
+    map: &OpcodeMap,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    layout_plan: &BytecodeLayout,
+    knv5: &[u8],
+    block_map_plan: &BlockMapPlan,
+    native_sleds: &[u8],
+    native_sync: &[(i32, u8)],
+    nested_plan: &NestedVmPlan,
+    exit_mode: StubExitMode,
+    rolling_cipher: bool,
+) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
+    create_vm_interpreter_stub_l9(
+        image_base,
+        section_rva,
+        map,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        layout_plan,
+        knv5,
+        block_map_plan,
+        native_sleds,
+        native_sync,
+        nested_plan,
+        exit_mode,
+        rolling_cipher,
+        false,
+        false,
+    )
+}
+
+/// L8 stub plus L9 register-file encoding and the madd superoperator handler.
+pub fn create_vm_interpreter_stub_l9(
     _image_base: u64,
     _section_rva: u32,
     map: &OpcodeMap,
@@ -143,6 +181,8 @@ pub fn create_vm_interpreter_stub_l8(
     nested_plan: &NestedVmPlan,
     exit_mode: StubExitMode,
     rolling_cipher: bool,
+    reg_encrypt: bool,
+    superops: bool,
 ) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
     let mut e = StubEmitter::new(
         map,
@@ -156,6 +196,7 @@ pub fn create_vm_interpreter_stub_l8(
         exit_mode,
     );
     e.set_rolling_cipher(rolling_cipher, map.seed());
+    e.set_l9(reg_encrypt, superops);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
@@ -185,6 +226,18 @@ struct StubEmitter {
     /// L8: decrypt the fetched wire byte with `rolling_wire_mask(seed, rsi-bytecode)`.
     rolling_cipher: bool,
     rolling_key32: u32,
+    /// L9 register-file XOR and madd superoperator.
+    reg_encrypt: bool,
+    superops: bool,
+    reg_seed: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SlotIdx {
+    Rcx,
+    Rdx,
+    Rdi,
+    R8,
 }
 
 impl StubEmitter {
@@ -220,7 +273,15 @@ impl StubEmitter {
             string_xor_key,
             rolling_cipher: false,
             rolling_key32: 0,
+            reg_encrypt: false,
+            superops: false,
+            reg_seed: map.seed(),
         }
+    }
+
+    fn set_l9(&mut self, reg_encrypt: bool, superops: bool) {
+        self.reg_encrypt = reg_encrypt;
+        self.superops = superops;
     }
 
     fn set_rolling_cipher(&mut self, enabled: bool, seed: u64) {
@@ -230,6 +291,155 @@ impl StubEmitter {
         } else {
             0
         };
+    }
+
+    /// `mov r11, key[index]` using the prologue pointer at `[rbp-0x548]`. Clobbers r11.
+    fn emit_load_slot_key_r11(&mut self, idx: SlotIdx) {
+        // mov r11, [rbp-0x548]
+        self.emit(&[0x4C, 0x8B, 0x9D, 0xB8, 0xFA, 0xFF, 0xFF]);
+        let sib = match idx {
+            SlotIdx::Rcx => [0x4D, 0x8B, 0x1C, 0xCB],
+            SlotIdx::Rdx => [0x4D, 0x8B, 0x1C, 0xD3],
+            SlotIdx::Rdi => [0x4D, 0x8B, 0x1C, 0xFB],
+            SlotIdx::R8 => [0x4F, 0x8B, 0x1C, 0xC3],
+        };
+        self.emit(&sib);
+    }
+
+    fn emit_xor_rax_r11(&mut self) {
+        self.emit(&[0x49, 0x33, 0xC3]);
+    }
+
+    fn emit_xor_rbx_r11(&mut self) {
+        self.emit(&[0x49, 0x33, 0xDB]);
+    }
+
+    fn emit_decrypt_rax(&mut self, idx: SlotIdx) {
+        if !self.reg_encrypt {
+            return;
+        }
+        self.emit_load_slot_key_r11(idx);
+        self.emit_xor_rax_r11();
+    }
+
+    fn emit_decrypt_rbx(&mut self, idx: SlotIdx) {
+        if !self.reg_encrypt {
+            return;
+        }
+        self.emit_load_slot_key_r11(idx);
+        self.emit_xor_rbx_r11();
+    }
+
+    fn emit_encrypt_rax(&mut self, idx: SlotIdx) {
+        self.emit_decrypt_rax(idx);
+    }
+
+    /// Decrypt r11, whose slot index is still in rcx. Clobbers rax.
+    fn emit_decrypt_r11_indexed_by_rcx(&mut self) {
+        if !self.reg_encrypt {
+            return;
+        }
+        // mov rax, [rbp-0x548]; mov rax, [rax+rcx*8]; xor r11, rax
+        self.emit(&[0x48, 0x8B, 0x85, 0xB8, 0xFA, 0xFF, 0xFF]);
+        self.emit(&[0x48, 0x8B, 0x04, 0xC8]);
+        self.emit(&[0x4C, 0x33, 0xD8]);
+    }
+
+    fn emit_xor_gpr_const_key(&mut self, gpr: u8, slot: u8) {
+        if !self.reg_encrypt {
+            return;
+        }
+        let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot);
+        // mov r10, imm64
+        self.emit(&[0x49, 0xBA]);
+        self.emit(&key.to_le_bytes());
+        // xor gpr, r10
+        let (rex, modrm) = match gpr {
+            0 => (0x49, 0xC2), // xor rax, r10
+            1 => (0x49, 0xCA), // xor rcx, r10
+            2 => (0x49, 0xD2), // xor rdx, r10
+            8 => (0x4D, 0xC2), // xor r8, r10
+            9 => (0x4D, 0xCA), // xor r9, r10
+            10 => (0x4D, 0xD2), // xor r10, r10 — not used
+            _ => (0x49, 0xC2),
+        };
+        self.emit(&[rex, 0x33, modrm]);
+    }
+
+    fn emit_xor_eax_slot_low(&mut self, slot: u8) {
+        if !self.reg_encrypt {
+            return;
+        }
+        let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot) as u32;
+        self.emit(&[0x35]);
+        self.emit(&key.to_le_bytes());
+    }
+
+    fn emit_xor_edx_slot_low(&mut self, slot: u8) {
+        if !self.reg_encrypt {
+            return;
+        }
+        let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot) as u32;
+        self.emit(&[0x81, 0xF2]);
+        self.emit(&key.to_le_bytes());
+    }
+
+    /// `xor r10, key`. Clobbers rax.
+    fn emit_xor_r10_const(&mut self, slot: u8) {
+        if !self.reg_encrypt {
+            return;
+        }
+        let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot);
+        self.emit(&[0x48, 0xB8]);
+        self.emit(&key.to_le_bytes());
+        self.emit(&[0x4C, 0x33, 0xD0]); // xor r10, rax
+    }
+
+    /// `xor r9, key`. Clobbers rax.
+    fn emit_xor_r9_const(&mut self, slot: u8) {
+        if !self.reg_encrypt {
+            return;
+        }
+        let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot);
+        self.emit(&[0x48, 0xB8]);
+        self.emit(&key.to_le_bytes());
+        self.emit(&[0x4C, 0x33, 0xC8]); // xor r9, rax
+    }
+
+    fn emit_xor_ecx_slot_low(&mut self, slot: u8) {
+        if !self.reg_encrypt {
+            return;
+        }
+        let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot) as u32;
+        self.emit(&[0x81, 0xF1]);
+        self.emit(&key.to_le_bytes());
+    }
+
+    /// Memory-form ALU on `[rbp+rdx*8-0x80]`, or a register form after a decrypting load.
+    fn emit_rhs_rdx(&mut self, mem_form: &[u8], reg_form: &[u8]) {
+        if self.reg_encrypt {
+            self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]);
+            self.emit_decrypt_rbx(SlotIdx::Rdx);
+            self.emit(reg_form);
+        } else {
+            self.emit(mem_form);
+        }
+    }
+
+    fn emit_init_reg_file(&mut self) {
+        if !self.reg_encrypt {
+            return;
+        }
+        // lea r11, [rip+reg_keys]; mov [rbp-0x548], r11
+        self.lea_rip_rel32(0x4C, 3, "reg_keys");
+        self.emit_mov_qword_to_rbp_from_reg(11, -0x548);
+        self.emit(&[0x31, 0xC9]);
+        self.label("reg_init_loop");
+        self.emit(&[0x49, 0x8B, 0x04, 0xCB]); // mov rax, [r11+rcx*8]
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
+        self.emit(&[0xFF, 0xC1]); // inc ecx
+        self.emit(&[0x83, 0xF9, 0x20]); // cmp ecx, 32
+        self.jcc_rel32_short(0x72, "reg_init_loop");
     }
 
     fn knv6_entry_stride(&self) -> u32 {
@@ -579,6 +789,7 @@ impl StubEmitter {
                 self.emit_init_nested_bb0_outer_decode();
             }
         }
+        self.emit_init_reg_file();
         self.lea_rip_rel32(0x48, 6, "bytecode");
         self.emit(&[0x48, 0x89, 0xF6]);
         self.jmp_rel32("dispatch");
@@ -874,6 +1085,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x06]);
         self.emit(&[0x48, 0x83, 0xC6, 0x08]);
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
     }
@@ -886,6 +1098,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x16]); // mov rdx, [rsi]
         self.emit(&[0x48, 0x8D, 0x76, 0x08]); // lea rsi, [rsi+8]
         self.emit(&[0x48, 0x89, 0xD0]); // mov rax, rdx
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
@@ -906,6 +1119,8 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rdi);
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
     }
@@ -918,7 +1133,9 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x5C, 0xFD, 0x80]); // mov rbx, [rbp+rdi*8-0x80]
+        self.emit_decrypt_rbx(SlotIdx::Rdi);
         self.emit(&[0x48, 0x89, 0xD8]); // mov rax, rbx
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
@@ -932,6 +1149,7 @@ impl StubEmitter {
         match self.opcode_map.add_handler_variant() {
             0 => self.emit_handler_add_v0(),
             1 => self.emit_handler_add_v1(),
+            _ if self.reg_encrypt => self.emit_handler_add_v1(),
             _ => self.emit_handler_add_v2(),
         }
     }
@@ -946,7 +1164,8 @@ impl StubEmitter {
     fn emit_handler_add_v0(&mut self) {
         self.emit_add_operand_reads();
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
-        self.emit(&[0x48, 0x03, 0x44, 0xD5, 0x80]); // add rax, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
+        self.emit_rhs_rdx(&[0x48, 0x03, 0x44, 0xD5, 0x80], &[0x48, 0x03, 0xC3]);
         self.emit_add_store_and_dispatch();
     }
 
@@ -954,7 +1173,9 @@ impl StubEmitter {
     fn emit_handler_add_v1(&mut self) {
         self.emit_add_operand_reads();
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rbx(SlotIdx::Rdx);
         self.emit(&[0x48, 0x8D, 0x04, 0x03]); // lea rax, [rbx+rax]
         self.emit_add_store_and_dispatch();
     }
@@ -1012,6 +1233,7 @@ impl StubEmitter {
     }
 
     fn emit_alu_store_and_dispatch(&mut self) {
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]); // mov [rbp+rcx*8-0x80], rax
         self.jmp_to_dispatch();
     }
@@ -1038,7 +1260,8 @@ impl StubEmitter {
     fn emit_handler_sub_v0(&mut self) {
         self.emit_alu_operand_reads(OpCode::Sub);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
-        self.emit(&[0x48, 0x2B, 0x44, 0xD5, 0x80]); // sub rax, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
+        self.emit_rhs_rdx(&[0x48, 0x2B, 0x44, 0xD5, 0x80], &[0x48, 0x2B, 0xC3]);
         self.emit_alu_store_and_dispatch();
     }
 
@@ -1046,7 +1269,9 @@ impl StubEmitter {
     fn emit_handler_sub_v1(&mut self) {
         self.emit_alu_operand_reads(OpCode::Sub);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rbx(SlotIdx::Rdx);
         self.emit(&[0x48, 0x29, 0xD8]); // sub rax, rbx
         self.emit_alu_store_and_dispatch();
     }
@@ -1069,7 +1294,8 @@ impl StubEmitter {
     fn emit_handler_mul_v0(&mut self) {
         self.emit_alu_operand_reads(OpCode::Mul);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
-        self.emit(&[0x48, 0x0F, 0xAF, 0x44, 0xD5, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rdi);
+        self.emit_rhs_rdx(&[0x48, 0x0F, 0xAF, 0x44, 0xD5, 0x80], &[0x48, 0x0F, 0xAF, 0xC3]);
         self.emit_alu_store_and_dispatch();
     }
 
@@ -1077,7 +1303,9 @@ impl StubEmitter {
     fn emit_handler_mul_v1(&mut self) {
         self.emit_alu_operand_reads(OpCode::Mul);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rbx(SlotIdx::Rdx);
         self.emit(&[0x48, 0x0F, 0xAF, 0xC3]); // imul rax, rbx
         self.emit_alu_store_and_dispatch();
     }
@@ -1100,7 +1328,8 @@ impl StubEmitter {
     fn emit_handler_and_v0(&mut self) {
         self.emit_alu_operand_reads(OpCode::And);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
-        self.emit(&[0x48, 0x23, 0x44, 0xD5, 0x80]); // and rax, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
+        self.emit_rhs_rdx(&[0x48, 0x23, 0x44, 0xD5, 0x80], &[0x48, 0x21, 0xD8]);
         self.emit_alu_store_and_dispatch();
     }
 
@@ -1108,7 +1337,9 @@ impl StubEmitter {
     fn emit_handler_and_v1(&mut self) {
         self.emit_alu_operand_reads(OpCode::And);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rbx(SlotIdx::Rdx);
         self.emit(&[0x48, 0x21, 0xD8]); // and rax, rbx
         self.emit_alu_store_and_dispatch();
     }
@@ -1131,7 +1362,8 @@ impl StubEmitter {
     fn emit_handler_xor_v0(&mut self) {
         self.emit_alu_operand_reads(OpCode::Xor);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
-        self.emit(&[0x48, 0x33, 0x44, 0xD5, 0x80]); // xor rax, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
+        self.emit_rhs_rdx(&[0x48, 0x33, 0x44, 0xD5, 0x80], &[0x48, 0x31, 0xD8]);
         self.emit_alu_store_and_dispatch();
     }
 
@@ -1139,7 +1371,9 @@ impl StubEmitter {
     fn emit_handler_xor_v1(&mut self) {
         self.emit_alu_operand_reads(OpCode::Xor);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]); // mov rax, [rbp+rdi*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rdi);
         self.emit(&[0x48, 0x8B, 0x5C, 0xD5, 0x80]); // mov rbx, [rbp+rdx*8-0x80]
+        self.emit_decrypt_rbx(SlotIdx::Rdx);
         self.emit(&[0x48, 0x31, 0xD8]); // xor rax, rbx
         self.emit_alu_store_and_dispatch();
     }
@@ -1316,9 +1550,11 @@ impl StubEmitter {
             self.emit(&[0x41, 0x8B, 0x87]); // mov eax, dword [r15+disp32]
             self.emit(&disp.to_le_bytes());
         }
+        self.emit_xor_eax_slot_low(spill_reg);
     }
 
     fn emit_mov_dword_to_r15_spill(&mut self, spill_reg: u8) {
+        self.emit_xor_eax_slot_low(spill_reg);
         let disp = (spill_reg as i32) * 8 - 0x80;
         if (-128..=127).contains(&disp) {
             self.emit(&[0x41, 0x89, 0x47, disp as u8]); // mov dword [r15+disp8], eax
@@ -1409,7 +1645,14 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
-        self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rcx);
+        if self.reg_encrypt {
+            self.emit(&[0x48, 0x8B, 0x5C, 0xFD, 0x80]); // mov rbx, [rbp+rdi*8-0x80]
+            self.emit_decrypt_rbx(SlotIdx::Rdi);
+            self.emit(&[0x48, 0x3B, 0xC3]); // cmp rax, rbx
+        } else {
+            self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
+        }
         self.emit(&[0x9C]);
         self.emit(&[0x58]);
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
@@ -1425,7 +1668,14 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
-        self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rcx);
+        if self.reg_encrypt {
+            self.emit(&[0x48, 0x8B, 0x5C, 0xFD, 0x80]);
+            self.emit_decrypt_rbx(SlotIdx::Rdi);
+            self.emit(&[0x48, 0x3B, 0xC3]);
+        } else {
+            self.emit(&[0x48, 0x3B, 0x44, 0xFD, 0x80]);
+        }
         self.emit(&[0x9C]); // pushfq
         self.emit(&[0x5A]); // pop rdx
         self.emit(&[0x81, 0xE2, 0xC1, 0x08, 0x00, 0x00]); // and edx, 0x8C1
@@ -1453,8 +1703,16 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
-        self.emit(&[0x8B, 0x44, 0xCD, 0x80]); // mov eax, dword [rbp+rcx*8-0x80]
-        self.emit(&[0x3B, 0x44, 0xFD, 0x80]); // cmp eax, dword [rbp+rdi*8-0x80]
+        if self.reg_encrypt {
+            self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+            self.emit_decrypt_rax(SlotIdx::Rcx);
+            self.emit(&[0x48, 0x8B, 0x5C, 0xFD, 0x80]);
+            self.emit_decrypt_rbx(SlotIdx::Rdi);
+            self.emit(&[0x3B, 0xC3]); // cmp eax, ebx
+        } else {
+            self.emit(&[0x8B, 0x44, 0xCD, 0x80]); // mov eax, dword [rbp+rcx*8-0x80]
+            self.emit(&[0x3B, 0x44, 0xFD, 0x80]); // cmp eax, dword [rbp+rdi*8-0x80]
+        }
         self.emit(&[0x9C]);
         self.emit(&[0x58]);
         self.emit(&[0x48, 0x25, 0xC1, 0x08, 0x00, 0x00]);
@@ -1545,6 +1803,7 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x0E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x8B, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF]);
         self.emit(&[0x48, 0xFF, 0xC2]);
@@ -1561,6 +1820,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0xFF, 0xCA]);
         self.emit(&[0x48, 0x89, 0x95, 0x18, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x8B, 0x84, 0xD5, 0x80, 0xFC, 0xFF, 0xFF]);
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
     }
@@ -1573,9 +1833,11 @@ impl StubEmitter {
         self.emit(&[0x0F, 0xB6, 0x3E]);
         self.emit(&[0x48, 0xFF, 0xC6]);
         self.emit(&[0x48, 0x8B, 0x44, 0xFD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rdi);
         self.lea_rip_rel32(0x48, 2, "bytecode");
         self.emit(&[0x48, 0x01, 0xD0]);
         self.emit(&[0x0F, 0xB6, 0x00]);
+        self.emit_encrypt_rax(SlotIdx::Rcx);
         self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
         self.jmp_to_dispatch();
     }
@@ -1586,7 +1848,13 @@ impl StubEmitter {
         match self.exit_mode {
             StubExitMode::ExitProcess => {
                 self.emit(&[0x0F, 0xB6, 0x0E]);
-                self.emit(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
+                if self.reg_encrypt {
+                    self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+                    self.emit_decrypt_rax(SlotIdx::Rcx);
+                    self.emit(&[0x48, 0x89, 0xC1]); // mov rcx, rax
+                } else {
+                    self.emit(&[0x48, 0x8B, 0x4C, 0xCD, 0x80]);
+                }
                 self.emit(&[0x48, 0x83, 0xEC, 0x20]);
                 self.emit(&[0xFF, 0x95, 0x58, 0xFF, 0xFF, 0xFF]);
                 self.emit(&[0x48, 0x83, 0xC4, 0x20]);
@@ -1601,6 +1869,7 @@ impl StubEmitter {
                 self.emit(&[0x48, 0x89, 0x45, 0x08]); // mov [rbp+8], rax
                 self.emit(&[0x0F, 0xB6, 0x0E]); // movzx ecx, byte [rsi]
                 self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]); // mov rax, [rbp+rcx*8-0x80]
+                self.emit_decrypt_rax(SlotIdx::Rcx);
                 self.emit(&[0xC9]); // leave (mov rsp, rbp; pop rbp)
                 self.emit(&[0xC3]); // ret
             }
@@ -1697,6 +1966,12 @@ impl StubEmitter {
         // Save bytecode pointer past func id at L2 rsi slot [rbp-0x98].
         self.emit(&[0x48, 0x89, 0xB5, 0x68, 0xFF, 0xFF, 0xFF]);
 
+        if self.superops {
+            // L9 madd: func_id >= 0x7_0000_0000, before the 0x6 mem window.
+            self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00]);
+            self.emit(&[0x48, 0x39, 0xC8]);
+            self.jcc_rel32(0x83, "nc_madd");
+        }
         // Pointer mem (0x6) and div/idiv (0x5) before direct-call (0x4).
         self.emit(&[0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00]);
         self.emit(&[0x48, 0x39, 0xC8]);
@@ -1729,6 +2004,7 @@ impl StubEmitter {
 
         self.label("nc_func2");
         self.emit(&[0x48, 0x8B, 0x45, 0x90]); // VM r2 at [rbp-0x70] (disp8 0x90); lifter leaves int in r2
+        self.emit_xor_gpr_const_key(0, 2);
         self.emit(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x3D, 0x64, 0x00, 0x00, 0x00]);
         self.jcc_rel32(0x83, "nc_three_digit");
@@ -1785,9 +2061,11 @@ impl StubEmitter {
         self.emit(&[0x48, 0x8B, 0x8D, 0x60, 0xFF, 0xFF, 0xFF]);
         self.lea_rip_rel32(0x48, 2, "bytecode");
         self.emit(&[0x48, 0x8B, 0x45, 0x80]);
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x01, 0xD0]);
         self.emit(&[0x48, 0x89, 0xC2]);
-        self.emit(&[0x4C, 0x8B, 0x45, 0x88]);
+        self.emit(&[0x4C, 0x8B, 0x45, 0x88]); // VM r1 length
+        self.emit_xor_gpr_const_key(8, 1);
         self.emit(&[0x4C, 0x8D, 0x8D, 0x30, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x48, 0x83, 0xEC, 0x28]);
         self.emit(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
@@ -1797,6 +2075,7 @@ impl StubEmitter {
 
         self.label("nc_func3");
         self.emit(&[0x48, 0x8B, 0x45, 0x80]);
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x8D, 0x8D, 0x10, 0xFF, 0xFF, 0xFF]);
         self.emit(&[0x88, 0x01]);
         self.emit(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]);
@@ -1822,9 +2101,13 @@ impl StubEmitter {
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x80]); // test r11d, 0x80000000
         self.jcc_rel32(0x84, "nc_iat_putchar"); // jz — putchar or generic non-ptr IAT
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] offset
+        self.emit_xor_ecx_slot_low(0);
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
+        self.emit_xor_gpr_const_key(2, 1);
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
+        self.emit_xor_gpr_const_key(8, 2);
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
+        self.emit_xor_gpr_const_key(9, 3);
         self.lea_rip_rel32(0x48, 0, "bytecode"); // lea rax, [bytecode]
         self.emit(&[0x48, 0x01, 0xC1]); // add rcx, rax (48 01 C1; NOT 49 01 D1 = add r9,rdx)
         self.jmp_rel32("nc_iat_call");
@@ -1833,14 +2116,19 @@ impl StubEmitter {
         self.emit(&[0x41, 0xF7, 0xC3, 0x00, 0x00, 0x00, 0x40]); // test r11d, 0x40000000
         self.jcc_rel32(0x85, "nc_iat_generic"); // jnz nc_iat_generic
         self.emit(&[0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // mov ecx, [rbp-0x80] char in VM r0
+        self.emit_xor_ecx_slot_low(0);
         self.emit(&[0x83, 0xE1, 0xFF]); // and ecx, 0xff — single-byte putchar arg
         self.jmp_rel32("nc_iat_call");
         self.label("nc_iat_generic");
         self.emit(&[0x90, 0x90]); // pad so backward rel32 offsets never equal -0x50 (B0 FF FF FF)
         self.emit(&[0x48, 0x8B, 0x8D, 0x80, 0xFF, 0xFF, 0xFF]); // rcx <- VM r0 [rbp-0x80]
+        self.emit_xor_gpr_const_key(1, 0);
         self.emit(&[0x48, 0x8B, 0x95, 0x88, 0xFF, 0xFF, 0xFF]); // rdx <- VM r1 [rbp-0x78]
+        self.emit_xor_gpr_const_key(2, 1);
         self.emit(&[0x4C, 0x8B, 0x85, 0x90, 0xFF, 0xFF, 0xFF]); // r8  <- VM r2 [rbp-0x70]
+        self.emit_xor_gpr_const_key(8, 2);
         self.emit(&[0x4C, 0x8B, 0x8D, 0x98, 0xFF, 0xFF, 0xFF]); // r9  <- VM r3 [rbp-0x68]
+        self.emit_xor_gpr_const_key(9, 3);
         self.label("nc_iat_call");
         // Preserve VM r10..r12 in frame scratch below ret/data stacks (not [-0x200,-0x80]).
         self.emit(&[0x48, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x30] VM r10
@@ -1854,12 +2142,15 @@ impl StubEmitter {
         self.emit(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
                                               // Marshal Win64 5th arg ([rsp+0x20] <- VM r4 [rbp-0x60]) and 6th arg ([rsp+0x28] <- VM r5 [rbp-0x58]).
         self.emit(&[0x48, 0x8B, 0x85, 0xA0, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x60] (VM r4)
+        self.emit_xor_gpr_const_key(0, 4);
         self.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+0x20], rax
         self.emit(&[0x48, 0x8B, 0x85, 0xA8, 0xFF, 0xFF, 0xFF]); // mov rax, [rbp-0x58] (VM r5)
+        self.emit_xor_gpr_const_key(0, 5);
         self.emit(&[0x48, 0x89, 0x44, 0x24, 0x28]); // mov [rsp+0x28], rax
         self.emit(&[0xFF, 0xD3]); // call rbx
         self.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
                                               // Store Win64 return value rax into VM r0 [rbp-0x80] before restoring r10..r12 via rax.
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x89, 0x85, 0x80, 0xFF, 0xFF, 0xFF]); // mov [rbp-0x80], rax
         self.emit(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 0x10
         self.emit(&[0x48, 0x8B, 0x85, 0xF0, 0xFA, 0xFF, 0xFF]); // mov rax, [rbp-0x510]
@@ -1880,12 +2171,43 @@ impl StubEmitter {
     const XMM_FRAME_BASE: i32 = -0x4B0;
     const XMM_SCRATCH: i32 = -0x4C0;
 
+    fn emit_nc_madd(&mut self) {
+        self.label("nc_madd");
+        self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
+        self.emit(&[0x41, 0x0F, 0xB6, 0xCA]); // movzx ecx, r10b — c
+        self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rcx);
+        self.emit(&[0x49, 0x89, 0xC1]); // mov r9, rax
+        self.emit(&[0x44, 0x89, 0xD1]); // mov ecx, r10d
+        self.emit(&[0xC1, 0xE9, 0x08]);
+        self.emit(&[0x0F, 0xB6, 0xC9]); // b
+        self.emit(&[0x48, 0x8B, 0x5C, 0xCD, 0x80]);
+        self.emit_decrypt_rbx(SlotIdx::Rcx);
+        self.emit(&[0x44, 0x89, 0xD1]);
+        self.emit(&[0xC1, 0xE9, 0x10]);
+        self.emit(&[0x0F, 0xB6, 0xC9]); // a
+        self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::Rcx);
+        self.emit(&[0x48, 0x0F, 0xAF, 0xC3]); // imul rax, rbx
+        self.emit(&[0x4C, 0x01, 0xC8]); // add rax, r9
+        self.emit(&[0x44, 0x89, 0xD1]);
+        self.emit(&[0xC1, 0xE9, 0x18]);
+        self.emit(&[0x0F, 0xB6, 0xC9]); // dst
+        self.emit_encrypt_rax(SlotIdx::Rcx);
+        self.emit(&[0x48, 0x89, 0x44, 0xCD, 0x80]);
+        self.jmp_rel32("nc_done");
+    }
+
     fn emit_l8_native_micro_handlers(&mut self) {
+        if self.superops {
+            self.emit_nc_madd();
+        }
         self.label("nc_div");
         // r10 = func id, r11 = divisor, kind = bits[15:8]
         self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
         self.emit(&[0x41, 0x0F, 0xB6, 0xCA]); // movzx ecx, r10b
         self.emit(&[0x4C, 0x8B, 0x5C, 0xCD, 0x80]); // mov r11, [rbp+rcx*8-0x80]
+        self.emit_decrypt_r11_indexed_by_rcx();
         self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
         self.emit(&[0xC1, 0xE8, 0x08]); // shr eax, 8
         self.emit(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
@@ -1913,74 +2235,100 @@ impl StubEmitter {
         self.label("nc_cqo");
         // cqo. Writes only VM r2; rax in the frame stays as it was.
         self.emit(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x99]); // cqo
+        self.emit_xor_gpr_const_key(2, 2);
         self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
         self.jmp_rel32("nc_done");
         self.label("nc_cdq");
         // cdq reads eax and writes edx. Do not store rax: a 32-bit mov would clear bits [63:32].
         self.emit(&[0x8B, 0x45, 0x80]); // mov eax, [rbp-0x80]
+        self.emit_xor_eax_slot_low(0);
         self.emit(&[0x99]); // cdq
+        self.emit_xor_gpr_const_key(2, 2);
         self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
         self.jmp_rel32("nc_done");
         self.label("nc_div32");
         self.emit(&[0x8B, 0x45, 0x80]); // mov eax, [rbp-0x80]
+        self.emit_xor_eax_slot_low(0);
         self.emit(&[0x8B, 0x55, 0x90]); // mov edx, [rbp-0x70]
+        self.emit_xor_edx_slot_low(2);
         self.emit(&[0x41, 0xF7, 0xF3]); // div r11d
         self.jmp_rel32("nc_div_store");
         self.label("nc_idiv64");
         self.emit(&[0x48, 0x8B, 0x45, 0x80]); // mov rax, [rbp-0x80]
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x8B, 0x55, 0x90]); // mov rdx, [rbp-0x70]
+        self.emit_xor_gpr_const_key(2, 2);
         self.emit(&[0x49, 0xF7, 0xFB]); // idiv r11
         self.jmp_rel32("nc_div_store");
         self.label("nc_idiv32");
         self.emit(&[0x8B, 0x45, 0x80]);
+        self.emit_xor_eax_slot_low(0);
         self.emit(&[0x8B, 0x55, 0x90]);
+        self.emit_xor_edx_slot_low(2);
         self.emit(&[0x41, 0xF7, 0xFB]); // idiv r11d
         self.jmp_rel32("nc_div_store");
         self.label("nc_div64");
         self.emit(&[0x48, 0x8B, 0x45, 0x80]);
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x8B, 0x55, 0x90]);
+        self.emit_xor_gpr_const_key(2, 2);
         self.emit(&[0x49, 0xF7, 0xF3]); // div r11
         self.label("nc_div_store");
+        self.emit_xor_gpr_const_key(0, 0);
         self.emit(&[0x48, 0x89, 0x45, 0x80]); // mov [rbp-0x80], rax
+        self.emit_xor_gpr_const_key(2, 2);
         self.emit(&[0x48, 0x89, 0x55, 0x90]); // mov [rbp-0x70], rdx
         self.jmp_rel32("nc_done");
 
         // 8/16-bit div keeps bits above the written partial register.
         self.label("nc_idiv8");
         self.emit(&[0x4C, 0x8B, 0x55, 0x80]); // mov r10, [rbp-0x80]
+        self.emit_xor_r10_const(0);
         self.emit(&[0x41, 0x8B, 0xC2]); // mov eax, r10d
         self.emit(&[0x41, 0xF6, 0xFB]); // idiv r11b
         self.emit(&[0x66, 0x41, 0x89, 0xC2]); // mov r10w, ax
+        self.emit_xor_r10_const(0);
         self.emit(&[0x4C, 0x89, 0x55, 0x80]); // mov [rbp-0x80], r10
         self.jmp_rel32("nc_done");
         self.label("nc_div8");
         self.emit(&[0x4C, 0x8B, 0x55, 0x80]);
+        self.emit_xor_r10_const(0);
         self.emit(&[0x41, 0x8B, 0xC2]);
         self.emit(&[0x41, 0xF6, 0xF3]); // div r11b
         self.emit(&[0x66, 0x41, 0x89, 0xC2]);
+        self.emit_xor_r10_const(0);
         self.emit(&[0x4C, 0x89, 0x55, 0x80]);
         self.jmp_rel32("nc_done");
         self.label("nc_idiv16");
         self.emit(&[0x4C, 0x8B, 0x55, 0x80]); // mov r10, [rbp-0x80]
+        self.emit_xor_r10_const(0);
         self.emit(&[0x4C, 0x8B, 0x4D, 0x90]); // mov r9, [rbp-0x70]
+        self.emit_xor_r9_const(2);
         self.emit(&[0x41, 0x8B, 0xC2]); // mov eax, r10d
         self.emit(&[0x41, 0x8B, 0xD1]); // mov edx, r9d
         self.emit(&[0x66, 0x41, 0xF7, 0xFB]); // idiv r11w
         self.emit(&[0x66, 0x41, 0x89, 0xC2]); // mov r10w, ax
         self.emit(&[0x66, 0x41, 0x89, 0xD1]); // mov r9w, dx
+        self.emit_xor_r10_const(0);
         self.emit(&[0x4C, 0x89, 0x55, 0x80]);
+        self.emit_xor_r9_const(2);
         self.emit(&[0x4C, 0x89, 0x4D, 0x90]);
         self.jmp_rel32("nc_done");
         self.label("nc_div16");
         self.emit(&[0x4C, 0x8B, 0x55, 0x80]);
+        self.emit_xor_r10_const(0);
         self.emit(&[0x4C, 0x8B, 0x4D, 0x90]);
+        self.emit_xor_r9_const(2);
         self.emit(&[0x41, 0x8B, 0xC2]);
         self.emit(&[0x41, 0x8B, 0xD1]);
         self.emit(&[0x66, 0x41, 0xF7, 0xF3]); // div r11w
         self.emit(&[0x66, 0x41, 0x89, 0xC2]);
         self.emit(&[0x66, 0x41, 0x89, 0xD1]);
+        self.emit_xor_r10_const(0);
         self.emit(&[0x4C, 0x89, 0x55, 0x80]);
+        self.emit_xor_r9_const(2);
         self.emit(&[0x4C, 0x89, 0x4D, 0x90]);
         self.jmp_rel32("nc_done");
 
@@ -1989,10 +2337,12 @@ impl StubEmitter {
         self.emit(&[0x49, 0x89, 0xC2]); // mov r10, rax
         self.emit(&[0x41, 0x0F, 0xB6, 0xCA]); // movzx ecx, r10b
         self.emit(&[0x4C, 0x8B, 0x5C, 0xCD, 0x80]); // mov r11, [rbp+rcx*8-0x80]
+        self.emit_decrypt_r11_indexed_by_rcx();
         self.emit(&[0x44, 0x89, 0xD0]); // mov eax, r10d
         self.emit(&[0xC1, 0xE8, 0x08]); // shr eax, 8
         self.emit(&[0x44, 0x0F, 0xB6, 0xC0]); // movzx r8d, al
         self.emit(&[0x4A, 0x8B, 0x44, 0xC5, 0x80]); // mov rax, [rbp+r8*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::R8);
         self.emit(&[0x49, 0x89, 0xC1]); // mov r9, rax — old value for partial merges
         self.emit(&[0x44, 0x89, 0xD1]); // mov ecx, r10d
         self.emit(&[0xC1, 0xE9, 0x10]); // shr ecx, 16
@@ -2053,6 +2403,7 @@ impl StubEmitter {
         self.emit(&[0x49, 0x89, 0x03]); // mov [r11], rax
         self.jmp_rel32("nc_done");
         self.label("nc_mem_writeback");
+        self.emit_encrypt_rax(SlotIdx::R8);
         self.emit(&[0x4A, 0x89, 0x44, 0xC5, 0x80]); // mov [rbp+r8*8-0x80], rax
         self.jmp_rel32("nc_done");
 
@@ -2069,6 +2420,7 @@ impl StubEmitter {
         // rsi = bytecode_base + VM[reg]
         self.emit(&[0x0F, 0xB6, 0xC8]); // movzx ecx, al
         self.emit(&[0x48, 0x8B, 0x44, 0xCD, 0x80]); // mov rax, [rbp+rcx*8-0x80]
+        self.emit_decrypt_rax(SlotIdx::Rcx);
         self.lea_rip_rel32(0x48, 6, "bytecode");
         self.emit(&[0x48, 0x01, 0xC6]); // add rsi, rax
         self.jmp_to_dispatch();
@@ -2260,9 +2612,11 @@ impl StubEmitter {
     fn emit_gp_from_r8(&mut self) {
         // mov rax, [rbp+r8*8-0x80]
         self.emit(&[0x4A, 0x8B, 0x44, 0xC5, 0x80]);
+        self.emit_decrypt_rax(SlotIdx::R8);
     }
 
     fn emit_gp_to_rdx(&mut self) {
+        self.emit_encrypt_rax(SlotIdx::Rdx);
         // mov [rbp+rdx*8-0x80], rax
         self.emit(&[0x48, 0x89, 0x44, 0xD5, 0x80]);
     }
@@ -2491,6 +2845,7 @@ impl StubEmitter {
             isa_mode: self.isa_mode,
             nested_vm: self.nested_plan.enabled,
             rolling_cipher: self.rolling_cipher,
+            reg_encrypt: self.reg_encrypt,
         };
         self.emit(&pack_meta.to_embedded_bytes());
         self.emit(knv5);
@@ -2524,6 +2879,13 @@ impl StubEmitter {
             self.emit(&[0x00]);
         }
         self.label("native_stack_top");
+        if self.reg_encrypt {
+            self.label("reg_keys");
+            for slot in 0..32u8 {
+                let key = crate::vm::l9::reg_slot_key(self.reg_seed, slot);
+                self.emit(&key.to_le_bytes());
+            }
+        }
         self.emit(b"VMBC");
         self.label("bytecode");
     }
@@ -2567,6 +2929,122 @@ mod tests {
     use crate::vm::block_map::{
         KNV6_ENTRY_HANDLER_TABLE_OFF, KNV6_ENTRY_SIZE, KNV6_HEADER_SIZE, KNV6_MAGIC,
     };
+
+    fn l9_stub(reg_encrypt: bool, superops: bool) -> Vec<u8> {
+        let (stub, _, _, _) = super::create_vm_interpreter_stub_l9(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0x4C39_0001),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+            super::StubExitMode::ExitProcess,
+            false,
+            reg_encrypt,
+            superops,
+        );
+        stub
+    }
+
+    #[test]
+    fn l9_flags_off_match_l8_and_on_adds_keys_and_madd() {
+        let (l8, _, _, _) = super::create_vm_interpreter_stub_l8(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0x4C39_0001),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+            super::StubExitMode::ExitProcess,
+            false,
+        );
+        let off = l9_stub(false, false);
+        assert_eq!(off, l8);
+
+        let enc = l9_stub(true, false);
+        assert!(enc.len() > off.len());
+        let key0 = crate::vm::l9::reg_slot_key(0x4C39_0001, 0).to_le_bytes();
+        assert!(enc.windows(8).any(|w| w == key0));
+
+        let fused = l9_stub(false, true);
+        let madd_cmp = [
+            0x48u8, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
+        ];
+        assert!(fused.windows(10).any(|w| w == madd_cmp));
+        assert!(!off.windows(10).any(|w| w == madd_cmp));
+    }
+
+    #[test]
+    fn l9_key_load_encodings_decode() {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+        let samples: &[(&[u8], Mnemonic, Register, Register)] = &[
+            (
+                &[0x4D, 0x8B, 0x1C, 0xCB],
+                Mnemonic::Mov,
+                Register::R11,
+                Register::RCX,
+            ),
+            (
+                &[0x4D, 0x8B, 0x1C, 0xD3],
+                Mnemonic::Mov,
+                Register::R11,
+                Register::RDX,
+            ),
+            (
+                &[0x4D, 0x8B, 0x1C, 0xFB],
+                Mnemonic::Mov,
+                Register::R11,
+                Register::RDI,
+            ),
+            (
+                &[0x4F, 0x8B, 0x1C, 0xC3],
+                Mnemonic::Mov,
+                Register::R11,
+                Register::R8,
+            ),
+            (&[0x49, 0x33, 0xC3], Mnemonic::Xor, Register::RAX, Register::R11),
+            (&[0x49, 0x33, 0xDB], Mnemonic::Xor, Register::RBX, Register::R11),
+            (&[0x4C, 0x33, 0xD8], Mnemonic::Xor, Register::R11, Register::RAX),
+            (&[0x49, 0x33, 0xC2], Mnemonic::Xor, Register::RAX, Register::R10),
+            (&[0x4D, 0x33, 0xC2], Mnemonic::Xor, Register::R8, Register::R10),
+            (&[0x4D, 0x33, 0xCA], Mnemonic::Xor, Register::R9, Register::R10),
+            (&[0x4C, 0x33, 0xD0], Mnemonic::Xor, Register::R10, Register::RAX),
+            (&[0x4C, 0x33, 0xC8], Mnemonic::Xor, Register::R9, Register::RAX),
+            (&[0x48, 0x0F, 0xAF, 0xC3], Mnemonic::Imul, Register::RAX, Register::RBX),
+            (&[0x4C, 0x01, 0xC8], Mnemonic::Add, Register::RAX, Register::R9),
+            (&[0x48, 0x21, 0xD8], Mnemonic::And, Register::RAX, Register::RBX),
+            (&[0x48, 0x31, 0xD8], Mnemonic::Xor, Register::RAX, Register::RBX),
+            (&[0x3B, 0xC3], Mnemonic::Cmp, Register::EAX, Register::EBX),
+        ];
+        for (bytes, mnemonic, dst, other) in samples {
+            let mut dec = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+            let insn = dec.decode();
+            assert_eq!(insn.mnemonic(), *mnemonic, "{bytes:02x?}");
+            assert_eq!(insn.len(), bytes.len(), "{bytes:02x?}");
+            let hit = insn.op0_register() == *dst
+                || insn.op1_register() == *dst
+                || insn.memory_index() == *other;
+            assert!(
+                hit && (insn.op0_register() == *other
+                    || insn.op1_register() == *other
+                    || insn.memory_index() == *other
+                    || insn.memory_base() == Register::R11),
+                "{bytes:02x?} decoded {insn:?}"
+            );
+        }
+    }
 
     /// InLoadOrderModuleList walk must advance `rcx = [rcx]` once per iteration (at
     /// `module_next`), not again at `module_loop` entry — double-advance skips kernel32.

@@ -31,6 +31,8 @@ fn main() -> Result<()> {
             return_mode,
             rvas,
             rolling_cipher,
+            reg_encrypt,
+            superops,
         } => {
             let rva_values = cli::parse_rva_list(&rva, rvas.as_deref())?;
             let seed_value = if let Some(seed_str) = seed {
@@ -58,6 +60,8 @@ fn main() -> Result<()> {
                 strict,
                 return_mode,
                 rolling_cipher,
+                reg_encrypt,
+                superops,
             )?;
         }
     }
@@ -166,6 +170,9 @@ fn handle_ir_command(
             crate::vm::rolling_wire_key32(pack_seed)
         );
     }
+    if pack_meta.reg_encrypt {
+        println!("L9 reg_encrypt=on seed={pack_seed:#x}");
+    }
 
     if pack_meta.nested_vm {
         let nested_plan = crate::vm::NestedVmPlan::from_seed(
@@ -255,8 +262,10 @@ fn handle_pack_command(
     strict: bool,
     return_mode: bool,
     rolling_cipher: bool,
+    reg_encrypt: bool,
+    superops: bool,
 ) -> Result<()> {
-    pack::pack_executable_l8(
+    pack::pack_executable_l9(
         &input,
         &output,
         rvas,
@@ -271,6 +280,8 @@ fn handle_pack_command(
         strict,
         return_mode,
         rolling_cipher,
+        reg_encrypt,
+        superops,
     )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())

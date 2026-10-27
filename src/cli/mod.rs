@@ -48,6 +48,16 @@ pub enum Commands {
             help = "L8: XOR each bytecode wire with a position/seed rolling key inside the VM fetch loop"
         )]
         rolling_cipher: bool,
+        #[arg(
+            long,
+            help = "L9: XOR-encode each virtual register slot with a per-slot pack-time key"
+        )]
+        reg_encrypt: bool,
+        #[arg(
+            long,
+            help = "L9: fuse adjacent mul+add into one madd native_call"
+        )]
+        superops: bool,
         #[arg(long, help = "Opcode shuffle seed (u64); random per pack if omitted")]
         seed: Option<String>,
         #[arg(

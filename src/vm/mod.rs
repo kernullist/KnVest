@@ -8,12 +8,14 @@ pub mod virt_isa;
 pub mod isa_mode;
 pub mod nested_vm;
 pub mod l8;
+pub mod l9;
 
 pub use opcode::OpCode;
 pub use l8::{
     encode_direct_call, encode_jmp_reg, encode_xmm, format_native_micro, rolling_wire_key32,
     rolling_wire_mask, NATIVE_CALL_DIRECT_BASE, NATIVE_CALL_JMP_REG_BASE, NATIVE_CALL_XMM_BASE,
 };
+pub use l9::{decode_madd, encode_madd, fuse_madd, reg_slot_key, NATIVE_CALL_MADD_BASE};
 pub use dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 pub use block_map::{
     BlockMapEntry, BlockMapPlan, ENTRY_PRED_BB, HandlerRedirectPlan, KNV6_MAGIC, META_OPERAND_LEN,

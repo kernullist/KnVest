@@ -110,10 +110,49 @@ pub fn pack_executable_l8<P: AsRef<Path>, Q: AsRef<Path>>(
     return_mode: bool,
     rolling_cipher: bool,
 ) -> Result<OpcodeMap> {
+    pack_executable_l9(
+        input_path,
+        output_path,
+        rvas,
+        seed,
+        partial,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+        strip_meta,
+        sidecar_path,
+        strict,
+        return_mode,
+        rolling_cipher,
+        false,
+        false,
+    )
+}
+
+/// [`pack_executable_l8`] plus L9 register-file encoding and madd fusion.
+pub fn pack_executable_l9<P: AsRef<Path>, Q: AsRef<Path>>(
+    input_path: P,
+    output_path: Q,
+    rvas: &[u32],
+    seed: Option<u64>,
+    partial: bool,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_vm: bool,
+    strip_meta: bool,
+    sidecar_path: Option<&Path>,
+    strict: bool,
+    return_mode: bool,
+    rolling_cipher: bool,
+    reg_encrypt: bool,
+    superops: bool,
+) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
 
-    let pack_result = packer::pack_functions_l8(
+    let pack_result = packer::pack_functions_l9(
         &mut pe,
         rvas,
         seed,
@@ -125,6 +164,8 @@ pub fn pack_executable_l8<P: AsRef<Path>, Q: AsRef<Path>>(
         strict,
         return_mode,
         rolling_cipher,
+        reg_encrypt,
+        superops,
     )
         .context("Failed to pack function")?;
 
@@ -148,7 +189,7 @@ pub fn pack_executable_l8<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     eprintln!(
-        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={}, nested={}, strip_meta={})",
+        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={}, nested={}, strip_meta={}, reg_encrypt={}, superops={})",
         pack_result.bytecode.len(),
         pack_result.seed,
         pack_result.dispatch_mode,
@@ -156,6 +197,8 @@ pub fn pack_executable_l8<P: AsRef<Path>, Q: AsRef<Path>>(
         isa_mode,
         nested_vm,
         strip_meta,
+        reg_encrypt,
+        superops,
     );
 
     pe.write_to_file(&output_path)

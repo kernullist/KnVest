@@ -62,6 +62,9 @@ pub struct VirtualMachine {
     /// When set, the opcode wire byte is XOR-decrypted with `rolling_wire_mask(seed, pc)`.
     rolling_cipher: bool,
     rolling_seed: u64,
+    /// L9: virtual register slots hold `plaintext XOR reg_slot_key(seed, slot)`.
+    reg_encrypt: bool,
+    reg_encrypt_seed: u64,
     /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
     pub direct_calls: Vec<u32>,
     /// MXCSR. Reset value masks invalid/denormal/div0/overflow/underflow/precision.
@@ -95,6 +98,8 @@ impl VirtualMachine {
             xmm_registers: [0; crate::vm::l8::XMM_SLOT_COUNT],
             rolling_cipher: false,
             rolling_seed: 0,
+            reg_encrypt: false,
+            reg_encrypt_seed: 0,
             direct_calls: Vec::new(),
             mxcsr: 0x1F80,
             native_sleds: Vec::new(),
@@ -121,6 +126,17 @@ impl VirtualMachine {
     pub fn with_rolling_cipher(mut self, seed: u64) -> Self {
         self.rolling_cipher = true;
         self.rolling_seed = seed;
+        self
+    }
+
+    /// Store every virtual register as `plaintext XOR reg_slot_key(seed, slot)`.
+    /// Logical zeros are the keys themselves. Call this before writing registers.
+    pub fn with_reg_encrypt(mut self, seed: u64) -> Self {
+        self.reg_encrypt = true;
+        self.reg_encrypt_seed = seed;
+        for slot in 0..NUM_REGISTERS {
+            self.registers[slot] = crate::vm::l9::reg_slot_key(seed, slot as u8);
+        }
         self
     }
 
@@ -216,6 +232,39 @@ impl VirtualMachine {
 
     pub fn get_register(&self, reg: u8) -> VMResult<u64> {
         if (reg as usize) < NUM_REGISTERS {
+            let raw = self.registers[reg as usize];
+            Ok(if self.reg_encrypt {
+                raw ^ crate::vm::l9::reg_slot_key(self.reg_encrypt_seed, reg)
+            } else {
+                raw
+            })
+        } else {
+            Err(VMError::InvalidRegister(reg))
+        }
+    }
+
+    fn plaintext_registers(&self) -> [u64; NUM_REGISTERS] {
+        let mut regs = self.registers;
+        if self.reg_encrypt {
+            for (slot, value) in regs.iter_mut().enumerate() {
+                *value ^= crate::vm::l9::reg_slot_key(self.reg_encrypt_seed, slot as u8);
+            }
+        }
+        regs
+    }
+
+    fn store_plaintext_registers(&mut self, mut regs: [u64; NUM_REGISTERS]) {
+        if self.reg_encrypt {
+            for (slot, value) in regs.iter_mut().enumerate() {
+                *value ^= crate::vm::l9::reg_slot_key(self.reg_encrypt_seed, slot as u8);
+            }
+        }
+        self.registers = regs;
+    }
+
+    /// Slot image before register-file decoding. Equals [`get_register`] when L9 is off.
+    pub fn raw_register(&self, reg: u8) -> VMResult<u64> {
+        if (reg as usize) < NUM_REGISTERS {
             Ok(self.registers[reg as usize])
         } else {
             Err(VMError::InvalidRegister(reg))
@@ -224,7 +273,11 @@ impl VirtualMachine {
 
     pub fn set_register(&mut self, reg: u8, value: u64) -> VMResult<()> {
         if (reg as usize) < NUM_REGISTERS {
-            self.registers[reg as usize] = value;
+            self.registers[reg as usize] = if self.reg_encrypt {
+                value ^ crate::vm::l9::reg_slot_key(self.reg_encrypt_seed, reg)
+            } else {
+                value
+            };
             Ok(())
         } else {
             Err(VMError::InvalidRegister(reg))
@@ -626,6 +679,13 @@ impl VirtualMachine {
                     self.exec_div_micro(kind, reg)?;
                 } else if let Some((op, data, addr)) = crate::vm::l8::decode_mem(func_id) {
                     self.exec_mem_micro(op, data, addr)?;
+                } else if let Some((dst, a, b, c)) = crate::vm::l9::decode_madd(func_id) {
+                    let product = crate::vm::l9::exec_madd(
+                        self.get_register(a)?,
+                        self.get_register(b)?,
+                        self.get_register(c)?,
+                    );
+                    self.set_register(dst, product)?;
                 } else if let Some(rva) = crate::vm::l8::decode_direct_call(func_id) {
                     self.direct_calls.push(rva);
                     if let Some(func) = self.native_functions.get(&func_id).copied() {
@@ -806,11 +866,11 @@ impl VirtualMachine {
     fn exec_xmm_micro(&mut self, subop: u8, dst: u8, src: u8) -> VMResult<()> {
         let dest_bits = self.xmm_registers.get(dst as usize).copied().unwrap_or(0);
         let src_bits = self.xmm_registers.get(src as usize).copied().unwrap_or(0);
-        let mut regs = self.registers;
+        let mut regs = self.plaintext_registers();
         let mut xmm = self.xmm_registers;
         match crate::vm::l8::exec_xmm(subop, dst, src, &mut xmm, &mut regs) {
             Ok(flags) => {
-                self.registers = regs;
+                self.store_plaintext_registers(regs);
                 self.xmm_registers = xmm;
                 if let Some(flags) = flags {
                     self.flags = flags;

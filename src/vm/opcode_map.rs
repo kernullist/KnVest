@@ -18,6 +18,8 @@ pub const KNV4_HEADER_SIZE_V5: usize = 4 + 1 + 1 + 1 + 1 + 1 + 8 + CANONICAL_OPC
 pub const KNV4_NESTED_FLAG: u8 = 0x01;
 /// L8: bit 1 of the KNV4 v5 flag byte. Position-keyed rolling wire cipher is enabled.
 pub const KNV4_ROLLING_CIPHER_FLAG: u8 = 0x02;
+/// L9: bit 2 of the KNV4 v5 flag byte. Virtual register slots are XOR-encoded.
+pub const KNV4_REG_ENCRYPT_FLAG: u8 = 0x04;
 pub const KNV4_MBA_FLAG_ENABLED: u8 = 0x01;
 pub const KNV4_MBA_LEVEL2: u8 = 0x02;
 
@@ -164,6 +166,7 @@ impl OpcodeMap {
             isa_mode: IsaMode::Reg,
             nested_vm: false,
             rolling_cipher: false,
+            reg_encrypt: false,
         }
             .to_embedded_bytes()
     }
@@ -186,6 +189,8 @@ pub struct PackMetadata {
     pub nested_vm: bool,
     /// L8: XOR each bytecode wire byte with `rolling_wire_mask(seed, insn_start)`.
     pub rolling_cipher: bool,
+    /// L9: XOR-encode each virtual register slot with `reg_slot_key(seed, slot)`.
+    pub reg_encrypt: bool,
 }
 
 impl PackMetadata {
@@ -197,6 +202,7 @@ impl PackMetadata {
             isa_mode: IsaMode::Reg,
             nested_vm: false,
             rolling_cipher: false,
+            reg_encrypt: false,
         }
     }
 
@@ -209,13 +215,16 @@ impl PackMetadata {
     }
 
     pub fn to_embedded_bytes(&self) -> Vec<u8> {
-        if self.nested_vm || self.rolling_cipher {
+        if self.nested_vm || self.rolling_cipher || self.reg_encrypt {
             let mut flags = 0u8;
             if self.nested_vm {
                 flags |= KNV4_NESTED_FLAG;
             }
             if self.rolling_cipher {
                 flags |= KNV4_ROLLING_CIPHER_FLAG;
+            }
+            if self.reg_encrypt {
+                flags |= KNV4_REG_ENCRYPT_FLAG;
             }
             let mut out = Vec::with_capacity(KNV4_HEADER_SIZE_V5);
             out.extend_from_slice(KNV4_MAGIC);
@@ -279,6 +288,7 @@ impl PackMetadata {
                     isa_mode: IsaMode::Reg,
                     nested_vm: false,
                     rolling_cipher: false,
+                    reg_encrypt: false,
                 })
             }
             KNV4_VERSION => {
@@ -299,6 +309,7 @@ impl PackMetadata {
                     isa_mode: IsaMode::Reg,
                     nested_vm: false,
                     rolling_cipher: false,
+                    reg_encrypt: false,
                 })
             }
             KNV4_VERSION_V3 => {
@@ -320,6 +331,7 @@ impl PackMetadata {
                     isa_mode: IsaMode::Reg,
                     nested_vm: false,
                     rolling_cipher: false,
+                    reg_encrypt: false,
                 })
             }
             KNV4_VERSION_V4 => {
@@ -342,6 +354,7 @@ impl PackMetadata {
                     isa_mode,
                     nested_vm: false,
                     rolling_cipher: false,
+                    reg_encrypt: false,
                 })
             }
             KNV4_VERSION_V5 => {
@@ -353,6 +366,7 @@ impl PackMetadata {
                 let isa_mode = IsaMode::from_wire(data[7])?;
                 let nested_vm = data[8] & KNV4_NESTED_FLAG != 0;
                 let rolling_cipher = data[8] & KNV4_ROLLING_CIPHER_FLAG != 0;
+                let reg_encrypt = data[8] & KNV4_REG_ENCRYPT_FLAG != 0;
                 let seed = u64::from_le_bytes(data[9..17].try_into().unwrap());
                 let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
                 wire.copy_from_slice(&data[17..17 + CANONICAL_OPCODE_COUNT]);
@@ -366,6 +380,7 @@ impl PackMetadata {
                     isa_mode,
                     nested_vm,
                     rolling_cipher,
+                    reg_encrypt,
                 })
             }
             _ => None,
@@ -570,6 +585,7 @@ mod tests {
             isa_mode: IsaMode::Reg,
             nested_vm: false,
             rolling_cipher: false,
+            reg_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V3);
@@ -588,6 +604,7 @@ mod tests {
             isa_mode: IsaMode::Reg,
             nested_vm: true,
             rolling_cipher: false,
+            reg_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V5);
@@ -607,6 +624,7 @@ mod tests {
             isa_mode: IsaMode::Reg,
             nested_vm: false,
             rolling_cipher: true,
+            reg_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V5);
@@ -614,6 +632,17 @@ mod tests {
         let parsed = PackMetadata::from_embedded(&bytes).unwrap();
         assert!(parsed.rolling_cipher);
         assert!(!parsed.nested_vm);
+        assert!(!parsed.reg_encrypt);
+        let encoded = PackMetadata {
+            reg_encrypt: true,
+            rolling_cipher: false,
+            nested_vm: false,
+            ..meta.clone()
+        };
+        let bytes = encoded.to_embedded_bytes();
+        assert_eq!(bytes[8], KNV4_REG_ENCRYPT_FLAG);
+        let parsed = PackMetadata::from_embedded(&bytes).unwrap();
+        assert!(parsed.reg_encrypt);
         let both = PackMetadata {
             rolling_cipher: true,
             nested_vm: true,
@@ -635,6 +664,7 @@ mod tests {
             isa_mode: IsaMode::Stack,
             nested_vm: false,
             rolling_cipher: false,
+            reg_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V4);
@@ -653,6 +683,7 @@ mod tests {
             isa_mode: IsaMode::Reg,
             nested_vm: false,
             rolling_cipher: false,
+            reg_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[6], KNV4_MBA_FLAG_ENABLED | KNV4_MBA_LEVEL2);

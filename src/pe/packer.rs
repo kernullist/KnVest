@@ -89,6 +89,10 @@ pub struct PackResult {
     /// without trampolines; populated for every RVA when more than one was requested.
     pub function_entries: Vec<FunctionVmEntry>,
     pub rolling_cipher: bool,
+    /// L9 per-slot register-file XOR. Default off keeps the stub byte-identical.
+    pub reg_encrypt: bool,
+    /// L9 mul+add fusion. The fused op is a NativeCall immediate, not a metadata bit.
+    pub superops: bool,
 }
 
 pub fn pack_function(
@@ -159,6 +163,39 @@ pub fn pack_functions_l8(
     return_mode: bool,
     rolling_cipher: bool,
 ) -> PEResult<PackResult> {
+    pack_functions_l9(
+        pe,
+        rvas,
+        seed,
+        partial_enabled,
+        dispatch_mode,
+        mba_level,
+        isa_mode,
+        nested_vm,
+        strict,
+        return_mode,
+        rolling_cipher,
+        false,
+        false,
+    )
+}
+
+/// [`pack_functions_l8`] plus L9 register-file encoding and madd fusion.
+pub fn pack_functions_l9(
+    pe: &mut PEFile,
+    rvas: &[u32],
+    seed: Option<u64>,
+    partial_enabled: bool,
+    dispatch_mode: DispatchMode,
+    mba_level: u8,
+    isa_mode: IsaMode,
+    nested_vm: bool,
+    strict: bool,
+    return_mode: bool,
+    rolling_cipher: bool,
+    reg_encrypt: bool,
+    superops: bool,
+) -> PEResult<PackResult> {
     if nested_vm && dispatch_mode == DispatchMode::Threaded {
         return Err(PEError::InvalidPE(
             "L5f --nested requires table dispatch (not threaded)".to_string(),
@@ -216,6 +253,8 @@ pub fn pack_functions_l8(
                 exit_mode,
                 rolling_cipher,
                 pack_seed,
+                reg_encrypt,
+                superops,
             )?;
             let mut image = section_bytecode.stub;
             image.extend_from_slice(&section_bytecode.bytecode);
@@ -274,6 +313,8 @@ pub fn pack_functions_l8(
         native_sync: primary.native_sync,
         function_entries,
         rolling_cipher,
+        reg_encrypt,
+        superops,
     })
 }
 
@@ -323,6 +364,8 @@ fn build_section_bytecode(
         StubExitMode::ExitProcess,
         false,
         0,
+        false,
+        false,
     )
 }
 
@@ -341,10 +384,12 @@ fn build_section_bytecode_with_exit_mode(
     exit_mode: StubExitMode,
     rolling_cipher: bool,
     rolling_seed: u64,
+    reg_encrypt: bool,
+    superops: bool,
 ) -> PEResult<SectionBytecode> {
     let knv5 = partial_plan.to_embedded_bytes();
     // Pass 1: finalize stub and capture L4a redirect plan from emitter labels (not read-back).
-    let (_scratch_stub, _, _, handler_plan) = crate::pe::vm_stub::create_vm_interpreter_stub_l8(
+    let (_scratch_stub, _, _, handler_plan) = crate::pe::vm_stub::create_vm_interpreter_stub_l9(
         0,
         0,
         opcode_map,
@@ -359,6 +404,8 @@ fn build_section_bytecode_with_exit_mode(
         nested_plan,
         exit_mode,
         rolling_cipher,
+        reg_encrypt,
+        superops,
     );
     if nested_plan.enabled {
         block_map_plan.fill_nested_handler_tables(&handler_plan, &nested_plan.inner_map);
@@ -366,7 +413,7 @@ fn build_section_bytecode_with_exit_mode(
         block_map_plan.fill_handler_tables(&handler_plan);
     }
     // Pass 2: embed filled KNV6 at the labeled blob offset (not a magic scan).
-    let (mut vm_stub, _, knv6_offset, _) = crate::pe::vm_stub::create_vm_interpreter_stub_l8(
+    let (mut vm_stub, _, knv6_offset, _) = crate::pe::vm_stub::create_vm_interpreter_stub_l9(
         0,
         0,
         opcode_map,
@@ -381,13 +428,20 @@ fn build_section_bytecode_with_exit_mode(
         nested_plan,
         exit_mode,
         rolling_cipher,
+        reg_encrypt,
+        superops,
     );
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan, nested_plan.enabled);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
     validate_live_handler_table_image(&vm_stub, block_map_plan);
     set_isa_mode(isa_mode);
+    let fused = if superops {
+        crate::vm::l9::fuse_madd(bytecode, opcode_map, block_map_plan, isa_mode)
+    } else {
+        bytecode.to_vec()
+    };
     let laid_out = apply_layout_diversification(
-        bytecode,
+        &fused,
         layout_plan,
         opcode_map,
         block_map_plan,
