@@ -58,6 +58,11 @@ pub enum Commands {
             help = "L9: fuse adjacent mul+add into one madd native_call"
         )]
         superops: bool,
+        #[arg(
+            long,
+            help = "L10: XOR each qword immediate with a position key; handlers decrypt in a register"
+        )]
+        imm_cipher: bool,
         #[arg(long, help = "Opcode shuffle seed (u64); random per pack if omitted")]
         seed: Option<String>,
         #[arg(

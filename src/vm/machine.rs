@@ -65,6 +65,9 @@ pub struct VirtualMachine {
     /// L9: virtual register slots hold `plaintext XOR reg_slot_key(seed, slot)`.
     reg_encrypt: bool,
     reg_encrypt_seed: u64,
+    /// L10: XOR qword immediates with `imm_cipher_mask(seed, offset)` on read.
+    imm_cipher: bool,
+    imm_seed: u64,
     /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
     pub direct_calls: Vec<u32>,
     /// MXCSR. Reset value masks invalid/denormal/div0/overflow/underflow/precision.
@@ -100,6 +103,8 @@ impl VirtualMachine {
             rolling_seed: 0,
             reg_encrypt: false,
             reg_encrypt_seed: 0,
+            imm_cipher: false,
+            imm_seed: 0,
             direct_calls: Vec::new(),
             mxcsr: 0x1F80,
             native_sleds: Vec::new(),
@@ -137,6 +142,13 @@ impl VirtualMachine {
         for slot in 0..NUM_REGISTERS {
             self.registers[slot] = crate::vm::l9::reg_slot_key(seed, slot as u8);
         }
+        self
+    }
+
+    /// Decrypt qword immediates while reading. The bytecode image stays ciphertext.
+    pub fn with_imm_cipher(mut self, seed: u64) -> Self {
+        self.imm_cipher = true;
+        self.imm_seed = seed;
         self
     }
 
@@ -327,9 +339,14 @@ impl VirtualMachine {
             return Err(VMError::PCOutOfBounds);
         }
         let mut bytes = [0u8; 8];
+        let offset = self.pc;
         bytes.copy_from_slice(&self.bytecode[self.pc..self.pc + 8]);
         self.pc += 8;
-        Ok(u64::from_le_bytes(bytes))
+        let mut value = u64::from_le_bytes(bytes);
+        if self.imm_cipher {
+            value ^= crate::vm::l10::imm_cipher_mask(self.imm_seed, offset);
+        }
+        Ok(value)
     }
 
     fn push_stack(&mut self, value: u64) -> VMResult<()> {

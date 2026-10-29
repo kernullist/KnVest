@@ -40,6 +40,21 @@ impl fmt::Display for Operand {
     }
 }
 
+fn take_qword(bytecode: &[u8], offset: &mut usize, imm_cipher: bool, seed: u64) -> Option<u64> {
+    if *offset + 8 > bytecode.len() {
+        return None;
+    }
+    let site = *offset;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&bytecode[site..site + 8]);
+    *offset += 8;
+    let mut value = u64::from_le_bytes(bytes);
+    if imm_cipher {
+        value ^= crate::vm::l10::imm_cipher_mask(seed, site);
+    }
+    Some(value)
+}
+
 impl Instruction {
     pub fn disassemble(
         bytecode: &[u8],
@@ -89,13 +104,14 @@ impl Instruction {
         layout: &BytecodeLayout,
         isa_mode: IsaMode,
     ) -> Vec<Self> {
-        Self::disassemble_with_rolling(
+        Self::disassemble_with_ciphers(
             bytecode,
             base_map,
             block_plan,
             dispatch_mode,
             layout,
             isa_mode,
+            false,
             false,
             0,
         )
@@ -110,6 +126,31 @@ impl Instruction {
         layout: &BytecodeLayout,
         isa_mode: IsaMode,
         rolling: bool,
+        seed: u64,
+    ) -> Vec<Self> {
+        Self::disassemble_with_ciphers(
+            bytecode,
+            base_map,
+            block_plan,
+            dispatch_mode,
+            layout,
+            isa_mode,
+            rolling,
+            false,
+            seed,
+        )
+    }
+
+    /// Decrypt the opcode wire and qword immediates. Register-index bytes stay as stored.
+    pub fn disassemble_with_ciphers(
+        bytecode: &[u8],
+        base_map: &OpcodeMap,
+        block_plan: Option<&BlockMapPlan>,
+        dispatch_mode: DispatchMode,
+        layout: &BytecodeLayout,
+        isa_mode: IsaMode,
+        rolling: bool,
+        imm_cipher: bool,
         seed: u64,
     ) -> Vec<Self> {
         let mut instructions = Vec::new();
@@ -192,11 +233,8 @@ impl Instruction {
                         operands.push(Operand::Register(bytecode[offset]));
                         offset += 1;
                     }
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
                 }
 
@@ -238,11 +276,8 @@ impl Instruction {
                 }
 
                 OpCode::Jmp => {
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
                 }
 
@@ -251,20 +286,14 @@ impl Instruction {
                         operands.push(Operand::Immediate(u64::from(bytecode[offset])));
                         offset += 1;
                     }
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
                 }
 
                 OpCode::Call | OpCode::NativeCall => {
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
                 }
 
@@ -293,26 +322,17 @@ impl Instruction {
                         operands.push(Operand::Register(bytecode[offset]));
                         offset += 1;
                     }
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
                 }
 
                 OpCode::RunNative | OpCode::BailNative => {
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
-                    if offset + 8 <= bytecode.len() {
-                        let mut bytes = [0u8; 8];
-                        bytes.copy_from_slice(&bytecode[offset..offset + 8]);
-                        operands.push(Operand::Immediate(u64::from_le_bytes(bytes)));
-                        offset += 8;
+                    if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
+                        operands.push(Operand::Immediate(value));
                     }
                 }
             }
@@ -928,5 +948,53 @@ mod tests {
             ins.iter().all(|i| i.opcode != OpCode::LoadImm),
             "unknown tx must not decode later bytes under a synthetic map"
         );
+    }
+
+    #[test]
+    fn imm_cipher_prints_the_plaintext_constant() {
+        use crate::vm::{BytecodeLayout, DispatchMode, OpCode};
+        let seed = 0x4C31_u64;
+        let map = OpcodeMap::from_seed(seed);
+        let mut bc = vec![map.encode(OpCode::LoadImm), 1];
+        bc.extend_from_slice(&42u64.to_le_bytes());
+        crate::vm::l10::apply_imm_cipher(
+            &mut bc,
+            seed,
+            &map,
+            &crate::vm::BlockMapPlan::default(),
+            &BytecodeLayout::identity(),
+            DispatchMode::Table,
+            crate::vm::IsaMode::Reg,
+            false,
+        );
+        let hidden = Instruction::disassemble_with_rolling(
+            &bc,
+            &map,
+            None,
+            DispatchMode::Table,
+            &BytecodeLayout::identity(),
+            crate::vm::IsaMode::Reg,
+            false,
+            seed,
+        );
+        let shown = Instruction::disassemble_with_ciphers(
+            &bc,
+            &map,
+            None,
+            DispatchMode::Table,
+            &BytecodeLayout::identity(),
+            crate::vm::IsaMode::Reg,
+            false,
+            true,
+            seed,
+        );
+        match &hidden[0].operands[1] {
+            Operand::Immediate(v) => assert_ne!(*v, 42),
+            other => panic!("expected immediate, got {other:?}"),
+        }
+        match &shown[0].operands[1] {
+            Operand::Immediate(v) => assert_eq!(*v, 42),
+            other => panic!("expected immediate, got {other:?}"),
+        }
     }
 }

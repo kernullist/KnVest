@@ -33,6 +33,7 @@ fn main() -> Result<()> {
             rolling_cipher,
             reg_encrypt,
             superops,
+            imm_cipher,
         } => {
             let rva_values = cli::parse_rva_list(&rva, rvas.as_deref())?;
             let seed_value = if let Some(seed_str) = seed {
@@ -62,6 +63,7 @@ fn main() -> Result<()> {
                 rolling_cipher,
                 reg_encrypt,
                 superops,
+                imm_cipher,
             )?;
         }
     }
@@ -173,6 +175,9 @@ fn handle_ir_command(
     if pack_meta.reg_encrypt {
         println!("L9 reg_encrypt=on seed={pack_seed:#x}");
     }
+    if pack_meta.imm_cipher {
+        println!("L10 imm_cipher=on seed={pack_seed:#x}");
+    }
 
     if pack_meta.nested_vm {
         let nested_plan = crate::vm::NestedVmPlan::from_seed(
@@ -186,7 +191,7 @@ fn handle_ir_command(
         print!("{}", nested_plan.format_ir_header(&opcode_map));
     }
     
-    let instructions = ir::Instruction::disassemble_with_rolling(
+    let instructions = ir::Instruction::disassemble_with_ciphers(
         &bytecode,
         &opcode_map,
         block_plan.as_ref(),
@@ -194,6 +199,7 @@ fn handle_ir_command(
         &layout_plan,
         pack_meta.isa_mode,
         pack_meta.rolling_cipher,
+        pack_meta.imm_cipher,
         pack_seed,
     );
     let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
@@ -220,7 +226,7 @@ fn handle_ir_command(
                 println!("(bytecode bounds exceed .knvest)");
                 continue;
             };
-            let fn_insns = ir::Instruction::disassemble_with_rolling(
+            let fn_insns = ir::Instruction::disassemble_with_ciphers(
                 bc,
                 &func.pack_meta.opcode_map,
                 Some(&func.block_map_plan),
@@ -228,6 +234,7 @@ fn handle_ir_command(
                 &func.layout_plan,
                 func.pack_meta.isa_mode,
                 func.pack_meta.rolling_cipher,
+                func.pack_meta.imm_cipher,
                 func.pack_meta.seed(),
             );
             println!(
@@ -264,6 +271,7 @@ fn handle_pack_command(
     rolling_cipher: bool,
     reg_encrypt: bool,
     superops: bool,
+    imm_cipher: bool,
 ) -> Result<()> {
     pack::pack_executable_l9(
         &input,
@@ -282,6 +290,7 @@ fn handle_pack_command(
         rolling_cipher,
         reg_encrypt,
         superops,
+        imm_cipher,
     )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())
