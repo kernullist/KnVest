@@ -95,6 +95,8 @@ pub struct PackResult {
     pub superops: bool,
     /// L10 position-keyed qword immediate cipher. Default off keeps the stub byte-identical.
     pub imm_cipher: bool,
+    /// L11 position-keyed register-index mask. Default off keeps the stub byte-identical.
+    pub reg_index: bool,
 }
 
 pub fn pack_function(
@@ -180,6 +182,7 @@ pub fn pack_functions_l8(
         false,
         false,
         false,
+        false,
     )
 }
 
@@ -199,6 +202,7 @@ pub fn pack_functions_l9(
     reg_encrypt: bool,
     superops: bool,
     imm_cipher: bool,
+    reg_index: bool,
 ) -> PEResult<PackResult> {
     if nested_vm && dispatch_mode == DispatchMode::Threaded {
         return Err(PEError::InvalidPE(
@@ -260,6 +264,7 @@ pub fn pack_functions_l9(
                 reg_encrypt,
                 superops,
                 imm_cipher,
+                reg_index,
             )?;
             let mut image = section_bytecode.stub;
             image.extend_from_slice(&section_bytecode.bytecode);
@@ -321,6 +326,7 @@ pub fn pack_functions_l9(
         reg_encrypt,
         superops,
         imm_cipher,
+        reg_index,
     })
 }
 
@@ -373,6 +379,7 @@ fn build_section_bytecode(
         false,
         false,
         false,
+        false,
     )
 }
 
@@ -394,6 +401,7 @@ fn build_section_bytecode_with_exit_mode(
     reg_encrypt: bool,
     superops: bool,
     imm_cipher: bool,
+    reg_index: bool,
 ) -> PEResult<SectionBytecode> {
     let knv5 = partial_plan.to_embedded_bytes();
     // Pass 1: finalize stub and capture L4a redirect plan from emitter labels (not read-back).
@@ -415,6 +423,7 @@ fn build_section_bytecode_with_exit_mode(
         reg_encrypt,
         superops,
         imm_cipher,
+        reg_index,
     );
     if nested_plan.enabled {
         block_map_plan.fill_nested_handler_tables(&handler_plan, &nested_plan.inner_map);
@@ -440,6 +449,7 @@ fn build_section_bytecode_with_exit_mode(
         reg_encrypt,
         superops,
         imm_cipher,
+        reg_index,
     );
     patch_knv6_in_stub(&mut vm_stub, knv6_offset, block_map_plan, nested_plan.enabled);
     patch_runtime_handler_table(&mut vm_stub, block_map_plan);
@@ -506,6 +516,18 @@ fn build_section_bytecode_with_exit_mode(
     }
     if imm_cipher {
         crate::vm::l10::apply_imm_cipher(
+            &mut section_bytecode,
+            rolling_seed,
+            opcode_map,
+            block_map_plan,
+            layout_plan,
+            dispatch_mode,
+            isa_mode,
+            rolling_cipher,
+        );
+    }
+    if reg_index {
+        crate::vm::l11::apply_reg_index_mask(
             &mut section_bytecode,
             rolling_seed,
             opcode_map,

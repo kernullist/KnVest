@@ -34,6 +34,7 @@ fn main() -> Result<()> {
             reg_encrypt,
             superops,
             imm_cipher,
+            reg_index,
         } => {
             let rva_values = cli::parse_rva_list(&rva, rvas.as_deref())?;
             let seed_value = if let Some(seed_str) = seed {
@@ -64,6 +65,7 @@ fn main() -> Result<()> {
                 reg_encrypt,
                 superops,
                 imm_cipher,
+                reg_index,
             )?;
         }
     }
@@ -178,6 +180,9 @@ fn handle_ir_command(
     if pack_meta.imm_cipher {
         println!("L10 imm_cipher=on seed={pack_seed:#x}");
     }
+    if pack_meta.reg_index {
+        println!("L11 reg_index=on seed={pack_seed:#x}");
+    }
 
     if pack_meta.nested_vm {
         let nested_plan = crate::vm::NestedVmPlan::from_seed(
@@ -200,6 +205,7 @@ fn handle_ir_command(
         pack_meta.isa_mode,
         pack_meta.rolling_cipher,
         pack_meta.imm_cipher,
+        pack_meta.reg_index,
         pack_seed,
     );
     let output = ir::Instruction::pretty_print_with_mba(&instructions, mba_level);
@@ -235,6 +241,7 @@ fn handle_ir_command(
                 func.pack_meta.isa_mode,
                 func.pack_meta.rolling_cipher,
                 func.pack_meta.imm_cipher,
+                func.pack_meta.reg_index,
                 func.pack_meta.seed(),
             );
             println!(
@@ -272,6 +279,7 @@ fn handle_pack_command(
     reg_encrypt: bool,
     superops: bool,
     imm_cipher: bool,
+    reg_index: bool,
 ) -> Result<()> {
     pack::pack_executable_l9(
         &input,
@@ -291,6 +299,7 @@ fn handle_pack_command(
         reg_encrypt,
         superops,
         imm_cipher,
+        reg_index,
     )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())

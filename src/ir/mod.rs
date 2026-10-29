@@ -40,6 +40,19 @@ impl fmt::Display for Operand {
     }
 }
 
+fn take_reg(bytecode: &[u8], offset: &mut usize, reg_index: bool, seed: u64) -> Option<u8> {
+    if *offset >= bytecode.len() {
+        return None;
+    }
+    let site = *offset;
+    let mut value = bytecode[site];
+    *offset += 1;
+    if reg_index {
+        value ^= crate::vm::l11::reg_index_mask(seed, site);
+    }
+    Some(value)
+}
+
 fn take_qword(bytecode: &[u8], offset: &mut usize, imm_cipher: bool, seed: u64) -> Option<u64> {
     if *offset + 8 > bytecode.len() {
         return None;
@@ -113,6 +126,7 @@ impl Instruction {
             isa_mode,
             false,
             false,
+            false,
             0,
         )
     }
@@ -137,11 +151,12 @@ impl Instruction {
             isa_mode,
             rolling,
             false,
+            false,
             seed,
         )
     }
 
-    /// Decrypt the opcode wire and qword immediates. Register-index bytes stay as stored.
+    /// Decrypt the opcode wire, qword immediates, and register-index bytes that are enabled.
     pub fn disassemble_with_ciphers(
         bytecode: &[u8],
         base_map: &OpcodeMap,
@@ -151,6 +166,7 @@ impl Instruction {
         isa_mode: IsaMode,
         rolling: bool,
         imm_cipher: bool,
+        reg_index: bool,
         seed: u64,
     ) -> Vec<Self> {
         let mut instructions = Vec::new();
@@ -229,9 +245,8 @@ impl Instruction {
                 OpCode::Nop | OpCode::SetBlockMap => {}
 
                 OpCode::LoadImm => {
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
                     if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
                         operands.push(Operand::Immediate(value));
@@ -239,22 +254,19 @@ impl Instruction {
                 }
 
                 OpCode::LoadMem | OpCode::StoreMem | OpCode::Move => {
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
                 }
 
                 OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Xor | OpCode::And => {
                     let count = operand_len_for(opcode, isa_mode);
                     for _ in 0..count {
-                        if offset < bytecode.len() {
-                            operands.push(Operand::Register(bytecode[offset]));
-                            offset += 1;
+                        if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                            operands.push(Operand::Register(reg));
                         }
                     }
                     if isa_mode.is_stack() && count == 1 {
@@ -265,9 +277,8 @@ impl Instruction {
                 OpCode::Cmp | OpCode::Cmp32 => {
                     let count = operand_len_for(opcode, isa_mode);
                     for _ in 0..count {
-                        if offset < bytecode.len() {
-                            operands.push(Operand::Register(bytecode[offset]));
-                            offset += 1;
+                        if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                            operands.push(Operand::Register(reg));
                         }
                     }
                     if isa_mode.is_stack() && count == 0 {
@@ -300,27 +311,23 @@ impl Instruction {
                 OpCode::Ret => {}
 
                 OpCode::Push | OpCode::Pop | OpCode::Exit => {
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
                 }
 
                 OpCode::LoadByte => {
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
                 }
 
                 OpCode::LoadStr => {
-                    if offset < bytecode.len() {
-                        operands.push(Operand::Register(bytecode[offset]));
-                        offset += 1;
+                    if let Some(reg) = take_reg(bytecode, &mut offset, reg_index, seed) {
+                        operands.push(Operand::Register(reg));
                     }
                     if let Some(value) = take_qword(bytecode, &mut offset, imm_cipher, seed) {
                         operands.push(Operand::Immediate(value));
@@ -986,6 +993,7 @@ mod tests {
             crate::vm::IsaMode::Reg,
             false,
             true,
+            false,
             seed,
         );
         match &hidden[0].operands[1] {
@@ -995,6 +1003,61 @@ mod tests {
         match &shown[0].operands[1] {
             Operand::Immediate(v) => assert_eq!(*v, 42),
             other => panic!("expected immediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reg_index_prints_the_plaintext_slot() {
+        use crate::vm::{BytecodeLayout, DispatchMode, OpCode};
+        let seed = 0x4C31_u64;
+        let map = OpcodeMap::from_seed(seed);
+        let mut bc = vec![map.encode(OpCode::LoadImm), 1];
+        bc.extend_from_slice(&42u64.to_le_bytes());
+        crate::vm::l11::apply_reg_index_mask(
+            &mut bc,
+            seed,
+            &map,
+            &crate::vm::BlockMapPlan::default(),
+            &BytecodeLayout::identity(),
+            DispatchMode::Table,
+            crate::vm::IsaMode::Reg,
+            false,
+        );
+        let hidden = Instruction::disassemble_with_ciphers(
+            &bc,
+            &map,
+            None,
+            DispatchMode::Table,
+            &BytecodeLayout::identity(),
+            crate::vm::IsaMode::Reg,
+            false,
+            false,
+            false,
+            seed,
+        );
+        let shown = Instruction::disassemble_with_ciphers(
+            &bc,
+            &map,
+            None,
+            DispatchMode::Table,
+            &BytecodeLayout::identity(),
+            crate::vm::IsaMode::Reg,
+            false,
+            false,
+            true,
+            seed,
+        );
+        match hidden[0].operands[0] {
+            Operand::Register(reg) => assert_ne!(reg, 1),
+            ref other => panic!("expected register, got {other:?}"),
+        }
+        match shown[0].operands[0] {
+            Operand::Register(reg) => assert_eq!(reg, 1),
+            ref other => panic!("expected register, got {other:?}"),
+        }
+        match shown[0].operands[1] {
+            Operand::Immediate(value) => assert_eq!(value, 42),
+            ref other => panic!("expected immediate, got {other:?}"),
         }
     }
 }

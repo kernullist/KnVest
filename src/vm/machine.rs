@@ -68,6 +68,9 @@ pub struct VirtualMachine {
     /// L10: XOR qword immediates with `imm_cipher_mask(seed, offset)` on read.
     imm_cipher: bool,
     imm_seed: u64,
+    /// L11: XOR register-index bytes with `reg_index_mask(seed, offset)` on read.
+    reg_index: bool,
+    reg_index_seed: u64,
     /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
     pub direct_calls: Vec<u32>,
     /// MXCSR. Reset value masks invalid/denormal/div0/overflow/underflow/precision.
@@ -105,6 +108,8 @@ impl VirtualMachine {
             reg_encrypt_seed: 0,
             imm_cipher: false,
             imm_seed: 0,
+            reg_index: false,
+            reg_index_seed: 0,
             direct_calls: Vec::new(),
             mxcsr: 0x1F80,
             native_sleds: Vec::new(),
@@ -142,6 +147,13 @@ impl VirtualMachine {
         for slot in 0..NUM_REGISTERS {
             self.registers[slot] = crate::vm::l9::reg_slot_key(seed, slot as u8);
         }
+        self
+    }
+
+    /// Decrypt register-index bytes while reading. The bytecode image stays ciphertext.
+    pub fn with_reg_index(mut self, seed: u64) -> Self {
+        self.reg_index = true;
+        self.reg_index_seed = seed;
         self
     }
 
@@ -334,6 +346,19 @@ impl VirtualMachine {
         Ok(value)
     }
 
+    fn read_reg(&mut self) -> VMResult<u8> {
+        if self.pc >= self.bytecode.len() {
+            return Err(VMError::PCOutOfBounds);
+        }
+        let offset = self.pc;
+        let mut value = self.bytecode[self.pc];
+        self.pc += 1;
+        if self.reg_index {
+            value ^= crate::vm::l11::reg_index_mask(self.reg_index_seed, offset);
+        }
+        Ok(value)
+    }
+
     fn read_u64(&mut self) -> VMResult<u64> {
         if self.pc + 8 > self.bytecode.len() {
             return Err(VMError::PCOutOfBounds);
@@ -465,14 +490,14 @@ impl VirtualMachine {
             }
 
             OpCode::LoadImm => {
-                let reg = self.read_u8()?;
+                let reg = self.read_reg()?;
                 let value = self.read_u64()?;
                 self.set_register(reg, value)?;
             }
 
             OpCode::LoadMem => {
-                let dst = self.read_u8()?;
-                let addr_reg = self.read_u8()?;
+                let dst = self.read_reg()?;
+                let addr_reg = self.read_reg()?;
                 let addr = self.get_register(addr_reg)? as usize;
                 if addr + 8 > MEMORY_SIZE {
                     return Err(VMError::MemoryViolation(addr));
@@ -483,8 +508,8 @@ impl VirtualMachine {
             }
 
             OpCode::StoreMem => {
-                let addr_reg = self.read_u8()?;
-                let src = self.read_u8()?;
+                let addr_reg = self.read_reg()?;
+                let src = self.read_reg()?;
                 let addr = self.get_register(addr_reg)? as usize;
                 let value = self.get_register(src)?;
                 if addr + 8 > MEMORY_SIZE {
@@ -494,22 +519,22 @@ impl VirtualMachine {
             }
 
             OpCode::Move => {
-                let dst = self.read_u8()?;
-                let src = self.read_u8()?;
+                let dst = self.read_reg()?;
+                let src = self.read_reg()?;
                 let value = self.get_register(src)?;
                 self.set_register(dst, value)?;
             }
 
             OpCode::Add => {
                 if self.isa_mode.is_stack() {
-                    let dst = self.read_u8()?;
+                    let dst = self.read_reg()?;
                     let val2 = self.pop_data_stack()?;
                     let val1 = self.pop_data_stack()?;
                     self.set_register(dst, val1.wrapping_add(val2))?;
                 } else {
-                    let dst = self.read_u8()?;
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let dst = self.read_reg()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     let val1 = self.get_register(src1)?;
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1.wrapping_add(val2))?;
@@ -518,14 +543,14 @@ impl VirtualMachine {
 
             OpCode::Sub => {
                 if self.isa_mode.is_stack() {
-                    let dst = self.read_u8()?;
+                    let dst = self.read_reg()?;
                     let val2 = self.pop_data_stack()?;
                     let val1 = self.pop_data_stack()?;
                     self.set_register(dst, val1.wrapping_sub(val2))?;
                 } else {
-                    let dst = self.read_u8()?;
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let dst = self.read_reg()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     let val1 = self.get_register(src1)?;
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1.wrapping_sub(val2))?;
@@ -534,14 +559,14 @@ impl VirtualMachine {
 
             OpCode::Mul => {
                 if self.isa_mode.is_stack() {
-                    let dst = self.read_u8()?;
+                    let dst = self.read_reg()?;
                     let val2 = self.pop_data_stack()?;
                     let val1 = self.pop_data_stack()?;
                     self.set_register(dst, val1.wrapping_mul(val2))?;
                 } else {
-                    let dst = self.read_u8()?;
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let dst = self.read_reg()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     let val1 = self.get_register(src1)?;
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1.wrapping_mul(val2))?;
@@ -550,14 +575,14 @@ impl VirtualMachine {
 
             OpCode::And => {
                 if self.isa_mode.is_stack() {
-                    let dst = self.read_u8()?;
+                    let dst = self.read_reg()?;
                     let val2 = self.pop_data_stack()?;
                     let val1 = self.pop_data_stack()?;
                     self.set_register(dst, val1 & val2)?;
                 } else {
-                    let dst = self.read_u8()?;
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let dst = self.read_reg()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     let val1 = self.get_register(src1)?;
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1 & val2)?;
@@ -566,14 +591,14 @@ impl VirtualMachine {
 
             OpCode::Xor => {
                 if self.isa_mode.is_stack() {
-                    let dst = self.read_u8()?;
+                    let dst = self.read_reg()?;
                     let val2 = self.pop_data_stack()?;
                     let val1 = self.pop_data_stack()?;
                     self.set_register(dst, val1 ^ val2)?;
                 } else {
-                    let dst = self.read_u8()?;
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let dst = self.read_reg()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     let val1 = self.get_register(src1)?;
                     let val2 = self.get_register(src2)?;
                     self.set_register(dst, val1 ^ val2)?;
@@ -584,8 +609,8 @@ impl VirtualMachine {
                 let (val1, val2) = if self.isa_mode.is_stack() {
                     (self.pop_data_stack()?, self.pop_data_stack()?)
                 } else {
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     (self.get_register(src1)?, self.get_register(src2)?)
                 };
                 let result = val1.wrapping_sub(val2);
@@ -603,8 +628,8 @@ impl VirtualMachine {
                 let (val1, val2) = if self.isa_mode.is_stack() {
                     (self.pop_data_stack()? as u32, self.pop_data_stack()? as u32)
                 } else {
-                    let src1 = self.read_u8()?;
-                    let src2 = self.read_u8()?;
+                    let src1 = self.read_reg()?;
+                    let src2 = self.read_reg()?;
                     (
                         self.get_register(src1)? as u32,
                         self.get_register(src2)? as u32,
@@ -721,7 +746,7 @@ impl VirtualMachine {
             }
 
             OpCode::Push => {
-                let reg = self.read_u8()?;
+                let reg = self.read_reg()?;
                 let value = self.get_register(reg)?;
                 if self.isa_mode.is_stack() {
                     self.push_data_stack(value)?;
@@ -731,7 +756,7 @@ impl VirtualMachine {
             }
 
             OpCode::Pop => {
-                let reg = self.read_u8()?;
+                let reg = self.read_reg()?;
                 let value = if self.isa_mode.is_stack() {
                     self.pop_data_stack()?
                 } else {
@@ -741,21 +766,21 @@ impl VirtualMachine {
             }
 
             OpCode::LoadByte => {
-                let dst = self.read_u8()?;
-                let addr_reg = self.read_u8()?;
+                let dst = self.read_reg()?;
+                let addr_reg = self.read_reg()?;
                 let addr = self.get_register(addr_reg)? as usize;
                 let byte_val = self.read_mem(addr, 1)?;
                 self.set_register(dst, byte_val)?;
             }
 
             OpCode::LoadStr => {
-                let dst = self.read_u8()?;
+                let dst = self.read_reg()?;
                 let offset = self.read_u64()? as usize;
                 self.set_register(dst, offset as u64)?;
             }
 
             OpCode::Exit => {
-                let code_reg = self.read_u8()?;
+                let code_reg = self.read_reg()?;
                 let code = self.get_register(code_reg)? as i32;
                 self.exit_code = Some(code);
             }

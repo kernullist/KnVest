@@ -10,6 +10,7 @@ pub mod nested_vm;
 pub mod l8;
 pub mod l9;
 pub mod l10;
+pub mod l11;
 
 pub use opcode::OpCode;
 pub use l8::{
@@ -18,6 +19,7 @@ pub use l8::{
 };
 pub use l9::{decode_madd, encode_madd, fuse_madd, reg_slot_key, NATIVE_CALL_MADD_BASE};
 pub use l10::{apply_imm_cipher, imm_cipher_key64, imm_cipher_mask};
+pub use l11::{apply_reg_index_mask, reg_index_key32, reg_index_mask};
 pub use dispatch::{DispatchMode, THREAD_TARGET_SIZE};
 pub use block_map::{
     BlockMapEntry, BlockMapPlan, ENTRY_PRED_BB, HandlerRedirectPlan, KNV6_MAGIC, META_OPERAND_LEN,

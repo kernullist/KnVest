@@ -8,8 +8,8 @@
 //! immediates with a position key and leaves the image ciphertext. Handlers
 //! recover the value in a register. They do not write it back.
 //!
-//! Canonical opcode count stays 21. Register-index bytes and the `jmp_if`
-//! condition byte stay plaintext.
+//! Canonical opcode count stays 21. The `jmp_if` condition byte stays plaintext.
+//! Register-index bytes are covered by L11.
 
 use super::block_map::BlockMapPlan;
 use super::layout::{enumerate_raw_instructions, enumerate_raw_instructions_masked, BytecodeLayout, RawInsnKind};

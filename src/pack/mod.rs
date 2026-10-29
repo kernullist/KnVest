@@ -128,6 +128,7 @@ pub fn pack_executable_l8<P: AsRef<Path>, Q: AsRef<Path>>(
         false,
         false,
         false,
+        false,
     )
 }
 
@@ -150,6 +151,7 @@ pub fn pack_executable_l9<P: AsRef<Path>, Q: AsRef<Path>>(
     reg_encrypt: bool,
     superops: bool,
     imm_cipher: bool,
+    reg_index: bool,
 ) -> Result<OpcodeMap> {
     let mut pe = PEFile::from_file(&input_path)
         .context("Failed to parse input PE file")?;
@@ -169,6 +171,7 @@ pub fn pack_executable_l9<P: AsRef<Path>, Q: AsRef<Path>>(
         reg_encrypt,
         superops,
         imm_cipher,
+        reg_index,
     )
         .context("Failed to pack function")?;
 
@@ -192,7 +195,7 @@ pub fn pack_executable_l9<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     eprintln!(
-        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={}, nested={}, strip_meta={}, reg_encrypt={}, superops={}, imm_cipher={})",
+        "Generated {} bytes of VM bytecode (L4a seed={}, dispatch={}, mba={}, isa={}, nested={}, strip_meta={}, reg_encrypt={}, superops={}, imm_cipher={}, reg_index={})",
         pack_result.bytecode.len(),
         pack_result.seed,
         pack_result.dispatch_mode,
@@ -203,6 +206,7 @@ pub fn pack_executable_l9<P: AsRef<Path>, Q: AsRef<Path>>(
         reg_encrypt,
         superops,
         imm_cipher,
+        reg_index,
     );
 
     pe.write_to_file(&output_path)
