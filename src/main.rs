@@ -35,6 +35,7 @@ fn main() -> Result<()> {
             superops,
             imm_cipher,
             reg_index,
+            ret_encrypt,
         } => {
             let rva_values = cli::parse_rva_list(&rva, rvas.as_deref())?;
             let seed_value = if let Some(seed_str) = seed {
@@ -66,6 +67,7 @@ fn main() -> Result<()> {
                 superops,
                 imm_cipher,
                 reg_index,
+                ret_encrypt,
             )?;
         }
     }
@@ -183,6 +185,9 @@ fn handle_ir_command(
     if pack_meta.reg_index {
         println!("L11 reg_index=on seed={pack_seed:#x}");
     }
+    if pack_meta.ret_encrypt {
+        println!("L12 ret_encrypt=on seed={pack_seed:#x}");
+    }
 
     if pack_meta.nested_vm {
         let nested_plan = crate::vm::NestedVmPlan::from_seed(
@@ -280,6 +285,7 @@ fn handle_pack_command(
     superops: bool,
     imm_cipher: bool,
     reg_index: bool,
+    ret_encrypt: bool,
 ) -> Result<()> {
     pack::pack_executable_l9(
         &input,
@@ -300,6 +306,7 @@ fn handle_pack_command(
         superops,
         imm_cipher,
         reg_index,
+        ret_encrypt,
     )?;
     println!("Successfully packed {} -> {}", input.display(), output.display());
     Ok(())

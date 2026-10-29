@@ -164,6 +164,7 @@ pub fn create_vm_interpreter_stub_l8(
         false,
         false,
         false,
+        false,
     )
 }
 
@@ -187,6 +188,7 @@ pub fn create_vm_interpreter_stub_l9(
     superops: bool,
     imm_cipher: bool,
     reg_index: bool,
+    ret_encrypt: bool,
 ) -> (Vec<u8>, usize, usize, HandlerRedirectPlan) {
     let mut e = StubEmitter::new(
         map,
@@ -203,6 +205,7 @@ pub fn create_vm_interpreter_stub_l9(
     e.set_l9(reg_encrypt, superops);
     e.set_imm_cipher(imm_cipher);
     e.set_reg_index(reg_index);
+    e.set_ret_encrypt(ret_encrypt);
     e.emit_prologue_and_api_resolve();
     e.emit_dispatch_loop();
     e.emit_handler_table_placeholder();
@@ -242,6 +245,9 @@ struct StubEmitter {
     /// L11 position-keyed register-index byte mask.
     reg_index: bool,
     reg_index_key32: u32,
+    /// L12 per-depth call-stack return record mask.
+    ret_encrypt: bool,
+    ret_key64: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -292,6 +298,8 @@ impl StubEmitter {
             imm_key64: 0,
             reg_index: false,
             reg_index_key32: 0,
+            ret_encrypt: false,
+            ret_key64: 0,
         }
     }
 
@@ -308,6 +316,11 @@ impl StubEmitter {
     fn set_reg_index(&mut self, enabled: bool) {
         self.reg_index = enabled;
         self.reg_index_key32 = crate::vm::l11::reg_index_key32(self.reg_seed);
+    }
+
+    fn set_ret_encrypt(&mut self, enabled: bool) {
+        self.ret_encrypt = enabled;
+        self.ret_key64 = crate::vm::l12::call_slot_key64(self.reg_seed);
     }
 
     fn set_rolling_cipher(&mut self, enabled: bool, seed: u64) {
@@ -412,6 +425,27 @@ impl StubEmitter {
             2 => self.emit(&[0x44, 0x30, 0xD2]), // xor dl, r10b
             _ => self.emit(&[0x44, 0x30, 0xD1]), // xor cl, r10b
         }
+    }
+
+    /// `rax ^= call_slot_mask(seed, rdx)`. Preserves rdx and r11. Clobbers r10 and rcx.
+    fn emit_xor_rax_call_slot(&mut self) {
+        if !self.ret_encrypt {
+            return;
+        }
+        // mov r10, rdx; mov ecx, golden; imul r10, rcx
+        self.emit(&[0x4C, 0x8B, 0xD2]);
+        self.emit(&[0xB9]);
+        self.emit(&crate::vm::l8::ROLLING_WIRE_GOLDEN.to_le_bytes());
+        self.emit(&[0x4C, 0x0F, 0xAF, 0xD1]);
+        // xor r10, key64
+        self.emit(&[0x48, 0xB9]);
+        self.emit(&self.ret_key64.to_le_bytes());
+        self.emit(&[0x49, 0x31, 0xCA]);
+        // mask = mixed ^ (mixed >> 32)
+        self.emit(&[0x4C, 0x89, 0xD1]);
+        self.emit(&[0x48, 0xC1, 0xE9, 0x20]);
+        self.emit(&[0x49, 0x31, 0xCA]);
+        self.emit(&[0x4C, 0x31, 0xD0]); // xor rax, r10
     }
 
     /// Decrypt r11, whose slot index is still in rcx. Clobbers rax.
@@ -1860,6 +1894,7 @@ impl StubEmitter {
                 self.emit_mov_reg_reg(0, 10); // mov rax, r10 — return index only (no L4e bb_id)
             }
         }
+        self.emit_xor_rax_call_slot();
         self.emit(&[0x48, 0x89, 0x84, 0xD5, 0x00, 0xFE, 0xFF, 0xFF]); // mov [rbp+rdx*8-0x200], rax
         self.emit(&[0x48, 0xFF, 0xC2]);
         self.emit(&[0x48, 0x89, 0x95, 0x38, 0xFF, 0xFF, 0xFF]);
@@ -1877,6 +1912,7 @@ impl StubEmitter {
         self.emit(&[0x48, 0x89, 0x85, 0x38, 0xFF, 0xFF, 0xFF]); // mov [rbp-0xC8], rax
         self.emit(&[0x48, 0x89, 0xC2]); // mov rdx, rax — ret frame index
         self.emit(&[0x48, 0x8B, 0x84, 0xC5, 0x00, 0xFE, 0xFF, 0xFF]); // mov rax, [rbp+rdx*8-0x200]
+        self.emit_xor_rax_call_slot();
         self.emit(&[0x48, 0x89, 0xC3]); // mov rbx, rax — packed ret words
         self.emit(&[0x48, 0xC1, 0xE8, 0x20]); // shr rax, 32
         self.emit(&[0x44, 0x0F, 0xB7, 0xC0]); // movzx r8d, eax — caller bb_id
@@ -2957,6 +2993,7 @@ impl StubEmitter {
             reg_encrypt: self.reg_encrypt,
             imm_cipher: self.imm_cipher,
             reg_index: self.reg_index,
+            ret_encrypt: self.ret_encrypt,
         };
         self.emit(&pack_meta.to_embedded_bytes());
         self.emit(knv5);
@@ -3061,6 +3098,7 @@ mod tests {
             superops,
             false,
             false,
+            false,
         );
         stub
     }
@@ -3118,6 +3156,7 @@ mod tests {
             false,
             false,
             imm_cipher,
+            false,
             false,
         );
         stub
@@ -3188,6 +3227,7 @@ mod tests {
             false,
             false,
             reg_index,
+            false,
         );
         stub
     }
@@ -3231,6 +3271,76 @@ mod tests {
                 || apply.op0_register() == Register::DL
                 || apply.op0_register() == Register::DIL
         );
+    }
+
+    fn l12_stub(ret_encrypt: bool) -> Vec<u8> {
+        let (stub, _, _, _) = super::create_vm_interpreter_stub_l9(
+            0,
+            0,
+            &crate::vm::OpcodeMap::from_seed(0x4C39_0001),
+            crate::vm::DispatchMode::Table,
+            0,
+            crate::vm::IsaMode::Reg,
+            &crate::vm::BytecodeLayout::identity(),
+            &[],
+            &crate::vm::BlockMapPlan::default(),
+            &[],
+            &[],
+            &crate::vm::NestedVmPlan::disabled(),
+            super::StubExitMode::ExitProcess,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ret_encrypt,
+        );
+        stub
+    }
+
+    #[test]
+    fn l12_ret_encrypt_off_matches_l11_and_on_decodes_slot_xor() {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+        assert_eq!(l12_stub(false), l11_stub(false));
+        let on = l12_stub(true);
+        assert!(on.len() > l11_stub(false).len());
+        let needle = [0xB9u8, 0xB9, 0x79, 0x37, 0x9E, 0x4C, 0x0F, 0xAF, 0xD1];
+        let at = on
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("mov ecx, golden; imul r10, rcx");
+        let mut dec = Decoder::with_ip(64, &on[at..], 0, DecoderOptions::NONE);
+        let mov_g = dec.decode();
+        assert_eq!(mov_g.mnemonic(), Mnemonic::Mov);
+        assert_eq!(mov_g.op0_register(), Register::ECX);
+        assert_eq!(mov_g.immediate32(), 0x9E37_79B9);
+        let imul = dec.decode();
+        assert_eq!(imul.mnemonic(), Mnemonic::Imul);
+        assert_eq!(imul.op0_register(), Register::R10);
+        assert_eq!(imul.op1_register(), Register::RCX);
+        let key = dec.decode();
+        assert_eq!(key.mnemonic(), Mnemonic::Mov);
+        assert_eq!(key.op0_register(), Register::RCX);
+        let xor_key = dec.decode();
+        assert_eq!(xor_key.mnemonic(), Mnemonic::Xor);
+        assert_eq!(xor_key.op0_register(), Register::R10);
+        assert_eq!(xor_key.op1_register(), Register::RCX);
+        let copy = dec.decode();
+        assert_eq!(copy.mnemonic(), Mnemonic::Mov);
+        assert_eq!(copy.op0_register(), Register::RCX);
+        assert_eq!(copy.op1_register(), Register::R10);
+        let shr = dec.decode();
+        assert_eq!(shr.mnemonic(), Mnemonic::Shr);
+        assert_eq!(shr.op0_register(), Register::RCX);
+        assert_eq!(shr.immediate8(), 32);
+        let fold = dec.decode();
+        assert_eq!(fold.mnemonic(), Mnemonic::Xor);
+        assert_eq!(fold.op0_register(), Register::R10);
+        assert_eq!(fold.op1_register(), Register::RCX);
+        let apply = dec.decode();
+        assert_eq!(apply.mnemonic(), Mnemonic::Xor);
+        assert_eq!(apply.op0_register(), Register::RAX);
+        assert_eq!(apply.op1_register(), Register::R10);
     }
 
     #[test]

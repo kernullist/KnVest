@@ -24,6 +24,8 @@ pub const KNV4_REG_ENCRYPT_FLAG: u8 = 0x04;
 pub const KNV4_IMM_CIPHER_FLAG: u8 = 0x08;
 /// L11: bit 4 of the KNV4 v5 flag byte. Register-index bytes are position-masked.
 pub const KNV4_REG_INDEX_FLAG: u8 = 0x10;
+/// L12: bit 5 of the KNV4 v5 flag byte. Call-stack return records are XOR-encoded.
+pub const KNV4_RET_ENCRYPT_FLAG: u8 = 0x20;
 pub const KNV4_MBA_FLAG_ENABLED: u8 = 0x01;
 pub const KNV4_MBA_LEVEL2: u8 = 0x02;
 
@@ -173,6 +175,7 @@ impl OpcodeMap {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         }
             .to_embedded_bytes()
     }
@@ -201,6 +204,8 @@ pub struct PackMetadata {
     pub imm_cipher: bool,
     /// L11: XOR each register-index byte with `reg_index_mask(seed, offset)`.
     pub reg_index: bool,
+    /// L12: XOR each call-stack return record with `call_slot_mask(seed, depth)`.
+    pub ret_encrypt: bool,
 }
 
 impl PackMetadata {
@@ -215,6 +220,7 @@ impl PackMetadata {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         }
     }
 
@@ -232,6 +238,7 @@ impl PackMetadata {
             || self.reg_encrypt
             || self.imm_cipher
             || self.reg_index
+            || self.ret_encrypt
         {
             let mut flags = 0u8;
             if self.nested_vm {
@@ -248,6 +255,9 @@ impl PackMetadata {
             }
             if self.reg_index {
                 flags |= KNV4_REG_INDEX_FLAG;
+            }
+            if self.ret_encrypt {
+                flags |= KNV4_RET_ENCRYPT_FLAG;
             }
             let mut out = Vec::with_capacity(KNV4_HEADER_SIZE_V5);
             out.extend_from_slice(KNV4_MAGIC);
@@ -314,6 +324,7 @@ impl PackMetadata {
                     reg_encrypt: false,
                     imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
                 })
             }
             KNV4_VERSION => {
@@ -337,6 +348,7 @@ impl PackMetadata {
                     reg_encrypt: false,
                     imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
                 })
             }
             KNV4_VERSION_V3 => {
@@ -361,6 +373,7 @@ impl PackMetadata {
                     reg_encrypt: false,
                     imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
                 })
             }
             KNV4_VERSION_V4 => {
@@ -386,6 +399,7 @@ impl PackMetadata {
                     reg_encrypt: false,
                     imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
                 })
             }
             KNV4_VERSION_V5 => {
@@ -400,6 +414,7 @@ impl PackMetadata {
                 let reg_encrypt = data[8] & KNV4_REG_ENCRYPT_FLAG != 0;
                 let imm_cipher = data[8] & KNV4_IMM_CIPHER_FLAG != 0;
                 let reg_index = data[8] & KNV4_REG_INDEX_FLAG != 0;
+                let ret_encrypt = data[8] & KNV4_RET_ENCRYPT_FLAG != 0;
                 let seed = u64::from_le_bytes(data[9..17].try_into().unwrap());
                 let mut wire = [0u8; CANONICAL_OPCODE_COUNT];
                 wire.copy_from_slice(&data[17..17 + CANONICAL_OPCODE_COUNT]);
@@ -416,6 +431,7 @@ impl PackMetadata {
                     reg_encrypt,
                     imm_cipher,
                     reg_index,
+                    ret_encrypt,
                 })
             }
             _ => None,
@@ -623,6 +639,7 @@ mod tests {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V3);
@@ -644,6 +661,7 @@ mod tests {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V5);
@@ -666,6 +684,7 @@ mod tests {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V5);
@@ -707,6 +726,19 @@ mod tests {
         assert_eq!(bytes[8], KNV4_REG_INDEX_FLAG);
         let parsed = PackMetadata::from_embedded(&bytes).unwrap();
         assert!(parsed.reg_index);
+        let ret = PackMetadata {
+            ret_encrypt: true,
+            reg_index: false,
+            imm_cipher: false,
+            rolling_cipher: false,
+            reg_encrypt: false,
+            nested_vm: false,
+            ..meta.clone()
+        };
+        let bytes = ret.to_embedded_bytes();
+        assert_eq!(bytes[8], KNV4_RET_ENCRYPT_FLAG);
+        let parsed = PackMetadata::from_embedded(&bytes).unwrap();
+        assert!(parsed.ret_encrypt);
         let both = PackMetadata {
             rolling_cipher: true,
             nested_vm: true,
@@ -731,6 +763,7 @@ mod tests {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[4], KNV4_VERSION_V4);
@@ -752,6 +785,7 @@ mod tests {
             reg_encrypt: false,
             imm_cipher: false,
             reg_index: false,
+            ret_encrypt: false,
         };
         let bytes = meta.to_embedded_bytes();
         assert_eq!(bytes[6], KNV4_MBA_FLAG_ENABLED | KNV4_MBA_LEVEL2);

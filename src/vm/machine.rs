@@ -71,6 +71,9 @@ pub struct VirtualMachine {
     /// L11: XOR register-index bytes with `reg_index_mask(seed, offset)` on read.
     reg_index: bool,
     reg_index_seed: u64,
+    /// L12: XOR call-stack return records with `call_slot_mask(seed, depth)`.
+    ret_encrypt: bool,
+    ret_seed: u64,
     /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
     pub direct_calls: Vec<u32>,
     /// MXCSR. Reset value masks invalid/denormal/div0/overflow/underflow/precision.
@@ -110,6 +113,8 @@ impl VirtualMachine {
             imm_seed: 0,
             reg_index: false,
             reg_index_seed: 0,
+            ret_encrypt: false,
+            ret_seed: 0,
             direct_calls: Vec::new(),
             mxcsr: 0x1F80,
             native_sleds: Vec::new(),
@@ -148,6 +153,17 @@ impl VirtualMachine {
             self.registers[slot] = crate::vm::l9::reg_slot_key(seed, slot as u8);
         }
         self
+    }
+
+    /// XOR call-stack return records. `ret` restores the plaintext index.
+    pub fn with_ret_encrypt(mut self, seed: u64) -> Self {
+        self.ret_encrypt = true;
+        self.ret_seed = seed;
+        self
+    }
+
+    pub(crate) fn call_stack_word(&self, index: usize) -> Option<u64> {
+        self.stack.get(index).copied()
     }
 
     /// Decrypt register-index bytes while reading. The bytecode image stays ciphertext.
@@ -681,19 +697,26 @@ impl VirtualMachine {
 
             OpCode::Call => {
                 let offset = self.read_u64()? as usize;
-                if self.block_map_plan.is_some() {
+                let mut record = if self.block_map_plan.is_some() {
                     let ret_pc = self.pc as u64;
                     let caller_bb = u64::from(self.current_bb_id);
-                    self.push_stack(ret_pc | (caller_bb << 32))?;
+                    ret_pc | (caller_bb << 32)
                 } else {
-                    self.push_stack(self.pc as u64)?;
+                    self.pc as u64
+                };
+                if self.ret_encrypt {
+                    record ^= crate::vm::l12::call_slot_mask(self.ret_seed, self.sp as u64);
                 }
+                self.push_stack(record)?;
                 self.pc = offset;
             }
 
             OpCode::Ret => {
+                let mut packed = self.pop_stack()?;
+                if self.ret_encrypt {
+                    packed ^= crate::vm::l12::call_slot_mask(self.ret_seed, self.sp as u64);
+                }
                 if self.block_map_plan.is_some() {
-                    let packed = self.pop_stack()?;
                     self.pc = (packed & 0xFFFF_FFFF) as usize;
                     let caller_bb = (packed >> 32) as u16;
                     if let Some(plan) = &self.block_map_plan {
@@ -706,8 +729,7 @@ impl VirtualMachine {
                         self.current_bb_id = caller_bb;
                     }
                 } else {
-                    let return_addr = self.pop_stack()? as usize;
-                    self.pc = return_addr;
+                    self.pc = packed as usize;
                 }
             }
 
