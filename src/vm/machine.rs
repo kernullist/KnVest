@@ -74,6 +74,9 @@ pub struct VirtualMachine {
     /// L12: XOR call-stack return records with `call_slot_mask(seed, depth)`.
     ret_encrypt: bool,
     ret_seed: u64,
+    /// L13: XOR data-stack qwords with `data_slot_mask(seed, depth)`.
+    stack_encrypt: bool,
+    stack_seed: u64,
     /// RVAs observed by L8 direct calls (`0x4_0000_0000 | rva`).
     pub direct_calls: Vec<u32>,
     /// MXCSR. Reset value masks invalid/denormal/div0/overflow/underflow/precision.
@@ -115,6 +118,8 @@ impl VirtualMachine {
             reg_index_seed: 0,
             ret_encrypt: false,
             ret_seed: 0,
+            stack_encrypt: false,
+            stack_seed: 0,
             direct_calls: Vec::new(),
             mxcsr: 0x1F80,
             native_sleds: Vec::new(),
@@ -164,6 +169,17 @@ impl VirtualMachine {
 
     pub(crate) fn call_stack_word(&self, index: usize) -> Option<u64> {
         self.stack.get(index).copied()
+    }
+
+    /// XOR data-stack qwords. `pop` and stack ALU restore the plaintext.
+    pub fn with_stack_encrypt(mut self, seed: u64) -> Self {
+        self.stack_encrypt = true;
+        self.stack_seed = seed;
+        self
+    }
+
+    pub(crate) fn data_stack_word(&self, index: usize) -> Option<u64> {
+        self.data_stack.get(index).copied()
     }
 
     /// Decrypt register-index bytes while reading. The bytecode image stays ciphertext.
@@ -411,10 +427,15 @@ impl VirtualMachine {
         if self.data_stack_depth >= STACK_SIZE {
             return Err(VMError::StackOverflow);
         }
-        if self.data_stack_depth == self.data_stack.len() {
-            self.data_stack.push(value);
+        let stored = if self.stack_encrypt {
+            value ^ crate::vm::l13::data_slot_mask(self.stack_seed, self.data_stack_depth as u64)
         } else {
-            self.data_stack[self.data_stack_depth] = value;
+            value
+        };
+        if self.data_stack_depth == self.data_stack.len() {
+            self.data_stack.push(stored);
+        } else {
+            self.data_stack[self.data_stack_depth] = stored;
         }
         self.data_stack_depth += 1;
         Ok(())
@@ -425,7 +446,11 @@ impl VirtualMachine {
             return Err(VMError::StackUnderflow);
         }
         self.data_stack_depth -= 1;
-        Ok(self.data_stack[self.data_stack_depth])
+        let mut value = self.data_stack[self.data_stack_depth];
+        if self.stack_encrypt {
+            value ^= crate::vm::l13::data_slot_mask(self.stack_seed, self.data_stack_depth as u64);
+        }
+        Ok(value)
     }
 
     fn skip_layout_pad_meta(&mut self) -> VMResult<()> {

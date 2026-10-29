@@ -21,7 +21,7 @@ This is an educational project, not a commercial protector. It does NOT include:
 - Full x64 ISA or packed SIMD coverage (L8 adds scalar SSE/SSE2 only: `movss`/`movsd`/`movq`/`movd`, `movaps`/`movups`, scalar add/sub/mul/div, `ucomi`/`comi`, `cvtsi2sd`/`cvtsi2ss`, `cvttsd2si`/`cvttss2si`, `cvtss2sd`/`cvtsd2ss`, `xorps`/`xorpd`)
 - Decompilation or LLVM/MLIR bitcode lifting
 
-## Architecture & Protection Layers (L1 – L12)
+## Architecture & Protection Layers (L1 – L13)
 
 | Layer | Feature | Trailer / Module | Summary |
 |-------|---------|------------------|---------|
@@ -42,6 +42,7 @@ This is an educational project, not a commercial protector. It does NOT include:
 | **L10** | Position-keyed qword immediate cipher | `l10.rs`, `vm_stub.rs`, `machine.rs`, `packer.rs`, `ir` | `--imm-cipher` XORs each 8-byte immediate with `imm_cipher_mask(seed, offset)` (`KNV4` v5 flag `0x08`). The offset is the bytecode index of that qword: `load_imm` / `load_str` / `jmp_if` constants and targets, `jmp` / `call` / `native_call` immediates, and both `run_native` / `bail_native` qwords. The `jmp_if` condition byte, threaded `rel32` handler targets, and layout padding stay plaintext. Handlers decrypt into a register and do not write the image back. The pass runs after layout diversification and threaded embedding, and after the L8 wire mask when both flags are on. It defaults off, and that stub is byte-identical to the L9 stub. The canonical opcode count stays 21 |
 | **L11** | Position-keyed register-index mask | `l11.rs`, `vm_stub.rs`, `machine.rs`, `packer.rs`, `ir` | `--reg-index` XORs each register-index operand byte with `reg_index_mask(seed, offset)` (`KNV4` v5 flag `0x10`). The mask is the L8 32-bit mix with a separate salt, so the same slot is a different byte at each offset. Stack ALU masks only the destination byte. The `jmp_if` condition, qword immediates, threaded `rel32` targets, and layout padding stay as stored. Handlers unmask the loaded index before they use it. The pass runs after the L10 immediate cipher. It defaults off, and that stub is byte-identical to the L10 stub. The canonical opcode count stays 21 |
 | **L12** | Per-depth call-stack return cipher | `l12.rs`, `vm_stub.rs`, `machine.rs`, `packer.rs` | `--ret-encrypt` XORs each call-stack return record with `call_slot_mask(seed, depth)` (`KNV4` v5 flag `0x20`). Depth is the slot index at the `call` store and again at the `ret` load, so a nested call uses the next slot. The record holds the return bytecode index and, on a block-map transition, the caller block id. `ret` restores that qword before it splits the index and the caller block. The VM data stack and register `push`/`pop` stay plaintext. The flag changes no bytecode image. It defaults off, and that stub is byte-identical to the L11 stub. The canonical opcode count stays 21 |
+| **L13** | Per-depth data-stack cipher | `l13.rs`, `vm_stub.rs`, `machine.rs`, `packer.rs` | `--stack-encrypt` XORs each data-stack qword with `data_slot_mask(seed, depth)` (`KNV4` v5 flag `0x40`). Depth is the slot index at the store and again at the load. Stack-ISA `push`, `pop`, and ALU use that stack. The stub applies the same mask on every data-stack store and load, including register-ISA `push`/`pop`, which the stub keeps on the data stack. Register-ISA `push`/`pop` in the reference VM stay on the call stack as plaintext. Call-stack return records stay on the L12 mask. The flag changes no bytecode image. It defaults off, and that stub is byte-identical to the L12 stub. The canonical opcode count stays 21 |
 
 ## Build
 
@@ -74,6 +75,7 @@ knvest pack input.exe -o output.exe
 | `--imm-cipher` | `false` | L10: XOR each qword immediate with a position key; handlers decrypt it in a register |
 | `--reg-index` | `false` | L11: XOR each register-index byte with a position key; handlers decrypt it before use |
 | `--ret-encrypt` | `false` | L12: XOR each call-stack return record with a per-depth key |
+| `--stack-encrypt` | `false` | L13: XOR each data-stack qword with a per-depth key |
 | `--seed <SEED>` | random per pack | 64-bit seed (hex `0x...` or decimal) controlling wire permutation, handler variants, layout padding, MBA catalog selection, and nested tables |
 | `--dispatch <MODE>` | `table` | Dispatch mode: `table` (256-entry handler table) or `threaded` (inline `rel32` handler targets) |
 | `--partial` | `false` | Enable L4d partial BB virtualization (`run_native` / `bail_native` sleds) |
@@ -111,6 +113,9 @@ knvest pack input.exe -o output.exe --seed 0x4c310001 --reg-index
 
 # L12: per-depth call-stack return records
 knvest pack input.exe -o output.exe --seed 0x4c310001 --ret-encrypt
+
+# L13: per-depth data-stack qwords
+knvest pack input.exe -o output.exe --seed 0x4c310001 --stack-encrypt --isa stack
 ```
 
 ### View IR
@@ -198,7 +203,7 @@ Eight MinGW-style C samples in `sample/`:
 cargo test
 ```
 
-The test suite (**323 tests** where the two Linux mmap harnesses are built: 317 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser). `cargo test` on Windows ran 315 library tests, 316 binary tests, and 6 integration tests. The suite runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L12 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `cdq`, `cqo`, `shr`, `sar`, `div`/`idiv` including `[base+disp]`, partial `[rbp+disp]` moves, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `comiss`/`ucomiss`, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & multi-function `.knvmap` sidecar roundtrips, reference-VM native sleds, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, multi-RVA trampolines, L9 per-slot register encoding, `madd` fusion, the L10 qword immediate cipher, the L11 register-index mask, and the L12 call-stack return cipher.
+The test suite (**326 tests** where the two Linux mmap harnesses are built: 320 library unit tests + 6 integration tests; the binary harness reruns those units plus the CLI RVA parser). `cargo test` on Windows ran 318 library tests, 319 binary tests, and 6 integration tests. The suite runs on Linux without requiring a Windows runtime (including native Linux x64 mmap execution harnesses for `vm_stub`) and covers PE/IAT parsing, CFG collection, L1–L13 lifting (`movzx`, `movsx`, `movsxd`, `cdqe`, `cdq`, `cqo`, `shr`, `sar`, `div`/`idiv` including `[base+disp]`, partial `[rbp+disp]` moves, scaled `lea`, `jmp reg`, switch tables, scalar SSE, `comiss`/`ucomiss`, `--strict`), 32-register spill/scratch isolation, metadata scrubbing & multi-function `.knvmap` sidecar roundtrips, reference-VM native sleds, MBA & automatic constant unfolding / opaque predicates, handler polymorphism (`add`, `sub`, `xor`, `and`, `mul`, `move`, `load_imm`, `cmp`), transition-keyed maps, layout padding, stack ISA, nested VM execution, `BytecodeCipher`, fetch-time rolling wire decryption, multi-RVA trampolines, L9 per-slot register encoding, `madd` fusion, the L10 qword immediate cipher, the L11 register-index mask, the L12 call-stack return cipher, and the L13 data-stack cipher.
 
 ## Project Structure
 
@@ -218,6 +223,7 @@ src/
 │   ├── l10.rs         - L10 position-keyed qword immediate cipher
 │   ├── l11.rs         - L11 position-keyed register-index mask
 │   ├── l12.rs         - L12 per-depth call-stack return cipher
+│   ├── l13.rs         - L13 per-depth data-stack cipher
 │   └── machine.rs     - Reference Rust VM interpreter
 ├── ir/                - Layout/transition/ISA-aware bytecode disassembler & printer
 ├── pe/

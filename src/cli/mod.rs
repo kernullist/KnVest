@@ -73,6 +73,11 @@ pub enum Commands {
             help = "L12: XOR each call-stack return record with a per-depth key"
         )]
         ret_encrypt: bool,
+        #[arg(
+            long,
+            help = "L13: XOR each data-stack qword with a per-depth key"
+        )]
+        stack_encrypt: bool,
         #[arg(long, help = "Opcode shuffle seed (u64); random per pack if omitted")]
         seed: Option<String>,
         #[arg(
